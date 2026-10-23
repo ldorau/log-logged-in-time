@@ -119,7 +119,8 @@ LogDirectory in file: $($raw.LogDirectory)
         $pollSeconds = [int]$raw.PollIntervalSeconds
     }
 
-    $updateEnabled = $true
+    # Opt-in: self-update is off unless explicitly enabled (remote code as SYSTEM).
+    $updateEnabled = $false
     if ($null -ne $raw.UpdateEnabled) {
         $updateEnabled = [bool]$raw.UpdateEnabled
     }
@@ -254,7 +255,9 @@ function Write-State {
         [Parameter(Mandatory)]$State
     )
     try {
-        ($State | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Path -Encoding UTF8
+        $tempPath = "$Path.tmp"
+        ($State | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Write-State failed for '{0}'" -f $Path)
@@ -322,19 +325,19 @@ function Write-DayRollover {
     }
 }
 
-# --- single-instance guard (survives self-restart after updates) ---
+# --- single-instance guard (survives scheduled-task restart after updates) ---
 $script:InstanceMutex = $null
 try {
     $script:InstanceMutex = New-Object System.Threading.Mutex($false, 'Global\LoginTimeLogger.Monitor')
-    # Wait briefly so a self-restarting instance can exit and release the mutex.
+    # Wait briefly so a restarting instance can exit and release the mutex.
     if (-not $script:InstanceMutex.WaitOne(15000, $false)) {
         Write-Host 'Another LoginTimeLogger instance is already running; exiting.'
         exit 0
     }
 }
 catch {
-    # If mutex creation fails, continue anyway rather than blocking monitoring.
-    Write-Host ("WARNING: could not acquire instance mutex: {0}" -f $_.Exception.Message)
+    Write-Host ("ERROR: could not acquire instance mutex: {0}" -f $_.Exception.Message)
+    throw
 }
 
 # --- main ---
@@ -435,8 +438,12 @@ while ($true) {
 
         if ($unlocked -ne $state.LastUnlocked) {
             $eventName = if ($unlocked) { 'UNLOCKED_ACTIVE' } else { 'LOCKED_OR_AWAY' }
-            $line = '{0:yyyy-MM-dd HH:mm:ss} | {1} | cumulative_today={2}' -f `
-                $nowLocal, $eventName, (Format-Duration $state.UnlockedSecondsToday)
+            $lockSource = '(unknown)'
+            $wtsFlags = -1
+            try { $lockSource = [SessionQuery]::LastLockSource } catch { }
+            try { $wtsFlags = [SessionQuery]::LastWtsSessionFlags } catch { }
+            $line = '{0:yyyy-MM-dd HH:mm:ss} | {1} | cumulative_today={2} | LockSource={3} | WtsFlags={4}' -f `
+                $nowLocal, $eventName, (Format-Duration $state.UnlockedSecondsToday), $lockSource, $wtsFlags
             Write-DailyLogLine -Path $dailyPath -Line $line
             Write-LoggerEvent $line
             $state.LastTransitionUtc = $nowUtc.ToString('o')

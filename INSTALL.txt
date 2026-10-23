@@ -20,7 +20,11 @@ Edit config\config.json and set TargetUsername to the account to measure:
     "TargetUsername": "jsmith",
     "AdministratorProfile": "C:\\Users\\Administrator",
     "LogDirectory": "",
-    "PollIntervalSeconds": 5
+    "PollIntervalSeconds": 5,
+    "UpdateEnabled": false,
+    "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
+    "UpdateBranch": "main",
+    "UpdateClonePath": ""
   }
 
 Accepted TargetUsername forms:
@@ -64,26 +68,30 @@ Prerequisite checks include:
   - TargetUsername set and account exists (local or domain)
   - Program Files write access
   - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
-  - Git for Windows (git.exe) for daily self-update from GitHub
-    (downloaded and installed silently by Install.ps1 if missing)
+  - Git for Windows (git.exe) only when UpdateEnabled is true
+    (downloaded, Authenticode-verified, and installed silently if missing)
 
 The startup task runs powershell.exe with -WindowStyle Hidden.
 
-Self-update (background monitor)
---------------------------------
-Once per day the monitor checks https://github.com/ldorau/log-logged-in-time
-for a newer commit (git ls-remote). If the tip differs from
+Self-update (background monitor; opt-in)
+----------------------------------------
+Disabled by default (UpdateEnabled=false). When enabled, once per day the
+monitor checks https://github.com/ldorau/log-logged-in-time for a newer
+commit (git ls-remote). Only that HTTPS GitHub repo URL is accepted.
+If the tip differs from
   C:\Program Files\LoginTimeLogger\installed-commit.txt
 it clones/pulls into
   <AdministratorProfile>\LoginTimeLogger\repo
-copies updated src files into Program Files, then restarts itself.
-If there is no internet connection, the check is postponed by 10 minutes.
-Disable with "UpdateEnabled": false in config.json.
+copies updated src files into Program Files, then restarts via the
+scheduled task (Start-ScheduledTask after exit) so monitoring stays under
+Task Scheduler. Offline checks are postponed by 10 minutes.
+Set "UpdateEnabled": true in config.json to enable.
 
 
 What the installer does
 -----------------------
-1. Reads settings from the template config\config.json in this project.
+1. Reads settings from the template config\config.json in this project
+   (the template file is not modified).
 2. Writes the runtime config to the Administrator profile:
      C:\Users\Administrator\LoginTimeLogger\config.json
    ACLs: Administrators + SYSTEM full control; target user Deny.
@@ -100,11 +108,13 @@ What the installer does
 
 Verify installation
 -------------------
-Check the task and today's totals (Administrator PowerShell):
+Check the task, monitor process/mutex, and today's totals (Administrator PowerShell):
   .\scripts\Status.ps1
 
 Test session / lock detection for the configured user:
   .\scripts\Test-Session.ps1
+  Tip: lock the target desktop (Win+L) from another session and re-run to
+  confirm LockSource / WtsSessionFlags on this host.
 
 Calibrate lock/unlock detection (interactive; uses Win+L):
   .\scripts\Test-LockCycle.ps1
@@ -188,7 +198,7 @@ Troubleshooting
 
 - Task not running:
     Start-ScheduledTask -TaskName LoginTimeLogger
-  or reboot.
+  or reboot. Status.ps1 also reports monitor mutex/process liveness.
 
 - Wrong user measured:
   Fix TargetUsername in config and re-run Install.ps1 -StartNow.

@@ -16,11 +16,33 @@ public static class SessionQuery
     private const uint DESKTOP_WRITEOBJECTS = 0x0080;
     private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
 
+    /// <summary>
+    /// WTS SessionFlags polarity. Docs: 0=Lock, 1=Unlock. Many builds reverse this.
+    /// Default treats flag==1 as locked; calibrated at runtime from SecurityLog/Desktop.
+    /// </summary>
+    private static bool s_wtsOneMeansLocked = true;
+    private static bool s_wtsPolarityCalibrated;
+
     /// <summary>Last non-fatal diagnostic from session/lock queries (for PowerShell debugging).</summary>
     public static string LastError { get; private set; }
 
     /// <summary>How the last lock decision was made (WTS / Desktop / SecurityLog / FailClosed).</summary>
     public static string LastLockSource { get; private set; }
+
+    /// <summary>Raw WTS SessionFlags from the last ResolveLocked call (-1 if unknown).</summary>
+    public static int LastWtsSessionFlags { get; private set; }
+
+    /// <summary>True after WTS polarity was calibrated against SecurityLog or Desktop.</summary>
+    public static bool WtsPolarityCalibrated
+    {
+        get { return s_wtsPolarityCalibrated; }
+    }
+
+    /// <summary>Current interpretation: whether WTS flag value 1 means locked.</summary>
+    public static bool WtsOneMeansLocked
+    {
+        get { return s_wtsOneMeansLocked; }
+    }
 
     private static void SetLastError(string message)
     {
@@ -136,7 +158,10 @@ public static class SessionQuery
                 string domainName = QueryString(info.SessionId, WTSDomainName);
                 int wtsFlags;
                 string lockSource;
-                bool isLocked = ResolveLocked(info.SessionId, userName, domainName, out lockSource, out wtsFlags);
+                // Use the session's WTS domain when present (NetBIOS); skip domain filter when empty.
+                bool sessionDomainRequired = !string.IsNullOrWhiteSpace(domainName);
+                bool isLocked = ResolveLocked(
+                    info.SessionId, userName, domainName, sessionDomainRequired, out lockSource, out wtsFlags);
 
                 bool isActive = info.State == WTS_CONNECTSTATE_CLASS.WTSActive;
 
@@ -175,6 +200,7 @@ public static class SessionQuery
             string[] upn = userName.Split(new[] { '@' }, 2);
             userName = upn[0];
             domainName = upn.Length > 1 ? upn[1] : string.Empty;
+            // UPN suffix is DNS-style and often does not match Security log NetBIOS TargetDomainName.
             domainRequired = false;
             return;
         }
@@ -200,7 +226,52 @@ public static class SessionQuery
             return true;
         }
 
-        return string.Equals(session.DomainName, domainName, StringComparison.OrdinalIgnoreCase);
+        return DomainNamesMatch(session.DomainName, domainName);
+    }
+
+    private static bool DomainNamesMatch(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return false;
+        }
+
+        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Compare first DNS label to NetBIOS-style short name (CONTOSO vs contoso.com).
+        string leftHead = left.Split('.')[0];
+        string rightHead = right.Split('.')[0];
+        return string.Equals(leftHead, rightHead, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static SessionStatus FindUserSession(string accountName)
+    {
+        if (string.IsNullOrWhiteSpace(accountName))
+        {
+            return null;
+        }
+
+        string userName;
+        string domainName;
+        bool domainRequired;
+        ParseAccountName(accountName, out userName, out domainName, out domainRequired);
+        if (string.IsNullOrWhiteSpace(userName))
+        {
+            return null;
+        }
+
+        foreach (var session in GetSessions())
+        {
+            if (SessionMatchesAccount(session, userName, domainName, domainRequired))
+            {
+                return session;
+            }
+        }
+
+        return null;
     }
 
     public static bool IsUserUnlocked(string accountName)
@@ -232,14 +303,27 @@ public static class SessionQuery
             throw;
         }
 
+        SessionStatus matched = null;
         foreach (var session in sessions)
         {
-            if (SessionMatchesAccount(session, userName, domainName, domainRequired)
-                && session.IsUnlockedActive)
+            if (!SessionMatchesAccount(session, userName, domainName, domainRequired))
+            {
+                continue;
+            }
+
+            matched = session;
+            if (session.IsUnlockedActive)
             {
                 LastLockSource = session.LockSource;
+                LastWtsSessionFlags = session.WtsSessionFlags;
                 return true;
             }
+        }
+
+        if (matched != null)
+        {
+            LastLockSource = matched.LockSource;
+            LastWtsSessionFlags = matched.WtsSessionFlags;
         }
 
         return false;
@@ -305,6 +389,54 @@ public static class SessionQuery
         return true;
     }
 
+    private static bool InterpretWtsFlags(int flags, out bool isLocked)
+    {
+        isLocked = false;
+        if (flags != WTS_SESSIONSTATE_LOCK && flags != WTS_SESSIONSTATE_UNLOCK)
+        {
+            return false;
+        }
+
+        // When s_wtsOneMeansLocked: flag 1 => locked, flag 0 => unlocked (common inverted builds).
+        // When false: flag 0 => locked, flag 1 => unlocked (MSDN).
+        if (s_wtsOneMeansLocked)
+        {
+            isLocked = (flags == WTS_SESSIONSTATE_UNLOCK);
+        }
+        else
+        {
+            isLocked = (flags == WTS_SESSIONSTATE_LOCK);
+        }
+        return true;
+    }
+
+    private static void CalibrateWtsPolarity(bool authoritativeLocked, int flags, string authority)
+    {
+        if (flags != WTS_SESSIONSTATE_LOCK && flags != WTS_SESSIONSTATE_UNLOCK)
+        {
+            return;
+        }
+
+        bool currentInterp;
+        if (!InterpretWtsFlags(flags, out currentInterp))
+        {
+            return;
+        }
+
+        if (currentInterp == authoritativeLocked)
+        {
+            s_wtsPolarityCalibrated = true;
+            return;
+        }
+
+        s_wtsOneMeansLocked = !s_wtsOneMeansLocked;
+        s_wtsPolarityCalibrated = true;
+        SetLastError(
+            "Calibrated WTS SessionFlags polarity from " + authority +
+            "; wtsFlags=" + flags + "; authoritativeLocked=" + authoritativeLocked +
+            "; wtsOneMeansLocked=" + s_wtsOneMeansLocked);
+    }
+
     private static bool TryGetLockedWts(int sessionId, out bool isLocked, out int flags)
     {
         isLocked = false;
@@ -327,10 +459,7 @@ public static class SessionQuery
             }
 
             flags = Marshal.ReadInt32(buffer, 12);
-            // Docs: 0=Lock, 1=Unlock. Many Windows builds reverse this; treat 0 as unlocked, 1 as locked.
-            bool known = flags == WTS_SESSIONSTATE_LOCK || flags == WTS_SESSIONSTATE_UNLOCK;
-            isLocked = flags == WTS_SESSIONSTATE_UNLOCK;
-            return known;
+            return InterpretWtsFlags(flags, out isLocked);
         }
         catch (Exception ex)
         {
@@ -349,8 +478,9 @@ public static class SessionQuery
     /// <summary>
     /// Uses Security audit events 4800 (locked) / 4801 (unlocked) when available.
     /// Works from SYSTEM for other sessions if "Audit Other Logon/Logoff Events" is enabled.
+    /// When domainRequired is false (SAM or UPN), domain filtering is skipped so NetBIOS vs DNS mismatch does not drop events.
     /// </summary>
-    private static bool TryGetLockedSecurityLog(string userName, string domainName, out bool isLocked)
+    private static bool TryGetLockedSecurityLog(string userName, string domainName, bool domainRequired, out bool isLocked)
     {
         isLocked = false;
         try
@@ -387,16 +517,14 @@ public static class SessionQuery
                             continue;
                         }
 
-                        if (!string.IsNullOrWhiteSpace(domainName)
+                        if (domainRequired
+                            && !string.IsNullOrWhiteSpace(domainName)
                             && !string.IsNullOrWhiteSpace(targetDomain)
-                            && !string.Equals(targetDomain, domainName, StringComparison.OrdinalIgnoreCase)
-                            && !string.Equals(targetDomain, ".", StringComparison.OrdinalIgnoreCase))
+                            && !string.Equals(targetDomain, ".", StringComparison.OrdinalIgnoreCase)
+                            && !DomainNamesMatch(targetDomain, domainName)
+                            && !string.Equals(targetDomain, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
                         {
-                            string machine = Environment.MachineName;
-                            if (!string.Equals(targetDomain, machine, StringComparison.OrdinalIgnoreCase))
-                            {
-                                continue;
-                            }
+                            continue;
                         }
 
                         isLocked = (rec.Id == 4800);
@@ -442,12 +570,14 @@ public static class SessionQuery
         int sessionId,
         string userName,
         string domainName,
+        bool domainRequired,
         out string lockSource,
         out int wtsFlags)
     {
         wtsFlags = -1;
         bool wtsLocked = false;
         bool wtsKnown = TryGetLockedWts(sessionId, out wtsLocked, out wtsFlags);
+        LastWtsSessionFlags = wtsFlags;
 
         bool desktopKnown = false;
         bool desktopLocked = false;
@@ -457,33 +587,45 @@ public static class SessionQuery
         }
 
         bool securityLocked = false;
-        bool securityKnown = TryGetLockedSecurityLog(userName, domainName, out securityLocked);
+        bool securityKnown = TryGetLockedSecurityLog(userName, domainName, domainRequired, out securityLocked);
 
         // Preference:
         // 1) Security audit (authoritative across sessions when enabled)
         // 2) Desktop probe for same-session callers
-        // 3) WTS SessionFlags
+        // 3) WTS SessionFlags (polarity calibrated from 1/2 when available)
         // 4) Fail closed (locked)
         if (securityKnown)
         {
+            if (wtsKnown)
+            {
+                CalibrateWtsPolarity(securityLocked, wtsFlags, "SecurityLog");
+                InterpretWtsFlags(wtsFlags, out wtsLocked);
+            }
             lockSource = "SecurityLog";
             LastLockSource = lockSource;
-            SetLastError(string.Empty);
+            if (string.IsNullOrEmpty(LastError) || LastError.IndexOf("Calibrated WTS", StringComparison.Ordinal) < 0)
+            {
+                SetLastError(string.Empty);
+            }
             return securityLocked;
         }
 
         if (desktopKnown)
         {
+            if (wtsKnown)
+            {
+                CalibrateWtsPolarity(desktopLocked, wtsFlags, "Desktop");
+                InterpretWtsFlags(wtsFlags, out wtsLocked);
+            }
             lockSource = "Desktop";
             LastLockSource = lockSource;
-            // If WTS disagrees, prefer Desktop for same-session accuracy.
-            if (wtsKnown && wtsLocked != desktopLocked)
+            if (wtsKnown && wtsLocked != desktopLocked && !s_wtsPolarityCalibrated)
             {
                 SetLastError(
                     "WTS/Desktop disagree; preferring Desktop. wtsLocked=" + wtsLocked +
                     "; desktopLocked=" + desktopLocked + "; wtsFlags=" + wtsFlags);
             }
-            else
+            else if (LastError == null || LastError.IndexOf("Calibrated WTS", StringComparison.Ordinal) < 0)
             {
                 SetLastError(string.Empty);
             }
@@ -494,7 +636,17 @@ public static class SessionQuery
         {
             lockSource = "WTS";
             LastLockSource = lockSource;
-            SetLastError(string.Empty);
+            if (!s_wtsPolarityCalibrated)
+            {
+                SetLastError(
+                    "Using WTS SessionFlags without SecurityLog/Desktop calibration; wtsFlags=" + wtsFlags +
+                    "; wtsOneMeansLocked=" + s_wtsOneMeansLocked +
+                    ". Verify with Test-Session.ps1 while locked from another session.");
+            }
+            else
+            {
+                SetLastError(string.Empty);
+            }
             return wtsLocked;
         }
 

@@ -97,12 +97,18 @@ Set the Windows logon name in TargetUsername, then retry.
 
     try {
         $sessions = [SessionQuery]::GetSessions()
-        $sessions | Format-Table SessionId, UserName, DomainName, State, IsLocked, IsActive, IsUnlockedActive -AutoSize
+        $sessions | Format-Table SessionId, UserName, DomainName, State, IsLocked, IsActive, IsUnlockedActive, LockSource, WtsSessionFlags -AutoSize
         $unlocked = [SessionQuery]::IsUserUnlocked($TargetUsername)
         Write-Host ('IsUserUnlocked({0}) = {1}' -f $TargetUsername, $unlocked)
+        Write-Host ('LastLockSource={0}; LastWtsSessionFlags={1}; WtsOneMeansLocked={2}; WtsPolarityCalibrated={3}' -f `
+                [SessionQuery]::LastLockSource,
+                [SessionQuery]::LastWtsSessionFlags,
+                [SessionQuery]::WtsOneMeansLocked,
+                [SessionQuery]::WtsPolarityCalibrated)
         if (-not [string]::IsNullOrWhiteSpace([SessionQuery]::LastError)) {
             Write-Host ("SessionQuery.LastError: {0}" -f [SessionQuery]::LastError) -ForegroundColor Yellow
         }
+        Write-Host 'Tip: from another elevated session, lock the target desktop (Win+L) and re-run to verify LockSource/WtsFlags.'
     }
     catch {
         $last = $null

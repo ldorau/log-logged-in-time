@@ -1,7 +1,14 @@
 # Update helper for LoginTimeLogger (dot-sourced by the monitor).
 # Once per day: if online, compare local installed commit to GitHub tip;
-# if different, git pull (or clone) and restart into the new files.
+# if different, git pull (or clone) and restart via the scheduled task.
 # If offline, postpone the check by 10 minutes.
+# Only https://github.com/ldorau/log-logged-in-time(.git) is accepted.
+
+$script:DefaultUpdateTaskName = 'LoginTimeLogger'
+$script:AllowedUpdateRepoPaths = @(
+    '/ldorau/log-logged-in-time'
+    '/ldorau/log-logged-in-time.git'
+)
 
 function Get-UpdateStatePath {
     param([Parameter(Mandatory)][string]$AdminAppDirectory)
@@ -11,6 +18,34 @@ function Get-UpdateStatePath {
 function Get-InstalledCommitPath {
     param([Parameter(Mandatory)][string]$InstallRoot)
     Join-Path $InstallRoot 'installed-commit.txt'
+}
+
+function Test-TrustedUpdateRepoUrl {
+    param([Parameter(Mandatory)][string]$RepoUrl)
+
+    if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
+        return $false
+    }
+
+    try {
+        $uri = [Uri]$RepoUrl
+    }
+    catch {
+        return $false
+    }
+
+    if (-not $uri.IsAbsoluteUri) {
+        return $false
+    }
+    if ($uri.Scheme -ne 'https') {
+        return $false
+    }
+    if (-not [string]::Equals($uri.Host, 'github.com', [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+    return $script:AllowedUpdateRepoPaths -contains $path
 }
 
 function Read-UpdateState {
@@ -57,7 +92,9 @@ function Write-UpdateState {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    ($State | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $Path -Encoding UTF8
+    $tempPath = "$Path.tmp"
+    ($State | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
 }
 
 function Get-InstalledCommit {
@@ -78,7 +115,9 @@ function Set-InstalledCommit {
         [Parameter(Mandatory)][string]$CommitSha
     )
     $path = Get-InstalledCommitPath -InstallRoot $InstallRoot
-    Set-Content -LiteralPath $path -Value $CommitSha.Trim().ToLowerInvariant() -Encoding ASCII
+    $tempPath = "$path.tmp"
+    Set-Content -LiteralPath $tempPath -Value $CommitSha.Trim().ToLowerInvariant() -Encoding ASCII
+    Move-Item -LiteralPath $tempPath -Destination $path -Force
 }
 
 function Test-InternetAvailable {
@@ -144,13 +183,7 @@ function Get-RemoteCommitSha {
         }
     }
 
-    # Some git versions return the line without requiring exact ref match filtering above.
-    $first = ("$($output | Select-Object -First 1)").Trim()
-    if ($first -match '^(?<sha>[0-9a-fA-F]{40})\b') {
-        return $Matches['sha'].ToLowerInvariant()
-    }
-
-    throw ("Could not parse remote commit from git ls-remote output: {0}" -f ($output | Out-String))
+    throw ("Could not parse remote commit for refs/heads/{0} from git ls-remote output: {1}" -f $Branch, ($output | Out-String))
 }
 
 function Sync-UpdateRepository {
@@ -174,7 +207,7 @@ function Sync-UpdateRepository {
         }
     }
     else {
-        Write-LoggerEvent ("git pull in {0}" -f $ClonePath)
+        Write-LoggerEvent ("git fetch/pull in {0}" -f $ClonePath)
         $fetchOut = & $GitExe -C $ClonePath fetch origin $Branch 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw ("git fetch failed (exit {0}): {1}" -f $LASTEXITCODE, ($fetchOut | Out-String))
@@ -227,22 +260,7 @@ function Publish-InstalledFilesFromRepo {
     }
 }
 
-function Restart-LoginTimeLoggerProcess {
-    param(
-        [Parameter(Mandatory)][string]$ConfigPath,
-        [Parameter(Mandatory)][string]$InstallRoot
-    )
-
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $scriptPath = Join-Path $InstallRoot 'src\LoginTimeLogger.ps1'
-    if (-not (Test-Path -LiteralPath $scriptPath)) {
-        throw "Updated script not found: $scriptPath"
-    }
-
-    $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}"' -f $scriptPath, $ConfigPath
-    Write-LoggerEvent ("Restarting LoginTimeLogger from updated files: {0}" -f $scriptPath)
-
-    # Release single-instance mutex before spawning the replacement process.
+function Release-InstanceMutex {
     if (Get-Variable -Name InstanceMutex -Scope Script -ErrorAction SilentlyContinue) {
         try {
             if ($script:InstanceMutex) {
@@ -255,7 +273,53 @@ function Restart-LoginTimeLoggerProcess {
             # continue with restart even if release fails
         }
     }
+}
 
+function Restart-LoginTimeLoggerProcess {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$TaskName = 'LoginTimeLogger'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        $TaskName = $script:DefaultUpdateTaskName
+    }
+
+    Release-InstanceMutex
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        # Exit this task instance cleanly, then start the same scheduled task again so
+        # monitoring stays under Task Scheduler (crash recovery / Status remain valid).
+        Write-LoggerEvent ("Restarting LoginTimeLogger via scheduled task '{0}' (delayed Start-ScheduledTask)." -f $TaskName)
+        $starter = @"
+Start-Sleep -Seconds 2
+try {
+    Start-ScheduledTask -TaskName '$TaskName' -ErrorAction Stop
+}
+catch {
+    Start-Process -FilePath '$env:SystemRoot\System32\schtasks.exe' -ArgumentList '/Run','/TN','$TaskName' -WindowStyle Hidden | Out-Null
+}
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($starter))
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        Start-Process -FilePath $windowsPowerShell -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded
+        ) -WindowStyle Hidden | Out-Null
+        Start-Sleep -Milliseconds 500
+        exit 0
+    }
+
+    # Dev / non-task fallback: spawn replacement process directly.
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $scriptPath = Join-Path $InstallRoot 'src\LoginTimeLogger.ps1'
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        throw "Updated script not found: $scriptPath"
+    }
+
+    $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}"' -f $scriptPath, $ConfigPath
+    Write-LoggerEvent -Level WARN -Message ("Scheduled task not found; falling back to direct process restart: {0}" -f $scriptPath)
     Start-Process -FilePath $windowsPowerShell -ArgumentList $arg -WindowStyle Hidden | Out-Null
     Start-Sleep -Seconds 1
     exit 0
@@ -265,7 +329,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][string]$AdminAppDirectory
+        [Parameter(Mandatory)][string]$AdminAppDirectory,
+        [string]$TaskName = 'LoginTimeLogger'
     )
 
     if (-not $Config.UpdateEnabled) {
@@ -288,6 +353,15 @@ function Invoke-LoginTimeLoggerUpdateCheck {
     }
 
     Write-LoggerEvent 'Update check starting...'
+
+    if (-not (Test-TrustedUpdateRepoUrl -RepoUrl $Config.UpdateRepoUrl)) {
+        $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
+        $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
+        $updateState.LastResult = 'untrusted-repo-url'
+        Write-UpdateState -Path $statePath -State $updateState
+        Write-LoggerEvent -Level ERROR -Message ("Update check blocked: UpdateRepoUrl is not an allowed HTTPS GitHub repo ({0})." -f $Config.UpdateRepoUrl)
+        return
+    }
 
     if (-not (Test-InternetAvailable)) {
         $postpone = [datetime]::UtcNow.AddMinutes(10)
@@ -334,9 +408,9 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
         $updateState.LastResult = 'updated-restarting'
         Write-UpdateState -Path $statePath -State $updateState
-        Write-LoggerEvent ("Updated installed files to commit {0}. Restarting." -f $newHead)
+        Write-LoggerEvent ("Updated installed files to commit {0}. Restarting via scheduled task." -f $newHead)
 
-        Restart-LoginTimeLoggerProcess -ConfigPath $Config.ConfigPath -InstallRoot $InstallRoot
+        Restart-LoginTimeLoggerProcess -ConfigPath $Config.ConfigPath -InstallRoot $InstallRoot -TaskName $TaskName
     }
     catch {
         # Network/GitHub failures: retry in 10 minutes (same as offline).

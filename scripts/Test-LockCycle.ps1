@@ -99,9 +99,26 @@ Sign in interactively as that user, unlock the desktop, then re-run:
 "@
         exit 1
     }
-    $s = [SessionQuery]::GetSessions() | Select-Object -First 1
-    Write-TestLine -Level PASS -Message (
-        "Phase 1 passed: unlocked-active (LockSource={0}; WtsFlags={1})." -f $s.LockSource, $s.WtsSessionFlags)
+    $s = $null
+    try { $s = [SessionQuery]::FindUserSession($User) } catch { $s = $null }
+    if (-not $s) {
+        $userPart = $User
+        if ($User -match '\\') { $userPart = ($User -split '\\')[-1] }
+        elseif ($User -match '@') { $userPart = ($User -split '@')[0] }
+        $s = [SessionQuery]::GetSessions() |
+            Where-Object { $_.UserName -eq $userPart } |
+            Select-Object -First 1
+    }
+    if ($s) {
+        Write-TestLine -Level PASS -Message (
+            "Phase 1 passed: unlocked-active (SessionId={0}; LockSource={1}; WtsFlags={2})." -f `
+                $s.SessionId, $s.LockSource, $s.WtsSessionFlags)
+    }
+    else {
+        Write-TestLine -Level PASS -Message (
+            "Phase 1 passed: unlocked-active (LockSource={0}; WtsFlags={1})." -f `
+                ([SessionQuery]::LastLockSource), ([SessionQuery]::LastWtsSessionFlags))
+    }
 
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $watcherArgs = @(

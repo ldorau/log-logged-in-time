@@ -134,10 +134,43 @@ function Update-ProcessPathFromMachine {
     }
 }
 
+function Test-GitInstallerAuthenticode {
+    param([Parameter(Mandatory)][string]$InstallerPath)
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
+    if ($signature.Status -ne 'Valid') {
+        throw ("Git installer Authenticode signature is not Valid (Status={0}; StatusMessage={1})." -f `
+                $signature.Status, $signature.StatusMessage)
+    }
+
+    $subject = ''
+    if ($signature.SignerCertificate) {
+        $subject = [string]$signature.SignerCertificate.Subject
+    }
+    $allowedPublisherPatterns = @(
+        'Johannes Schindelin'
+        'Git for Windows'
+        'GitHub, Inc'
+        'Microsoft Corporation'
+    )
+    $publisherOk = $false
+    foreach ($pattern in $allowedPublisherPatterns) {
+        if ($subject -like ("*{0}*" -f $pattern)) {
+            $publisherOk = $true
+            break
+        }
+    }
+    if (-not $publisherOk) {
+        throw ("Git installer is signed, but publisher is not allowed. Subject={0}" -f $subject)
+    }
+
+    Write-Host ("  Authenticode OK: {0}" -f $subject)
+}
+
 function Install-GitForWindows {
     <#
     .SYNOPSIS
-      Downloads the latest Git for Windows installer and runs a silent install.
+      Downloads the latest Git for Windows installer, verifies Authenticode, then silent-installs.
     #>
     Write-Host '  Git not found. Downloading and installing Git for Windows...'
 
@@ -190,6 +223,14 @@ function Install-GitForWindows {
 
     if (-not (Test-Path -LiteralPath $installerPath)) {
         throw ("Git installer download completed but file is missing: {0}" -f $installerPath)
+    }
+
+    try {
+        Test-GitInstallerAuthenticode -InstallerPath $installerPath
+    }
+    catch {
+        try { Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue } catch { }
+        throw
     }
 
     # Inno Setup silent flags; PathOption=Cmd adds git.exe to PATH for cmd/PowerShell.
@@ -391,44 +432,82 @@ function Test-InstallPrerequisites {
         }
     }
 
-    # --- git (required for daily self-update); install if missing ---
-    $gitPath = Find-GitExecutable
-    if (-not $gitPath) {
-        try {
-            $gitPath = Install-GitForWindows
-            Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail ("installed: {0}" -f $gitPath)
-        }
-        catch {
-            $gitDetails = Format-ErrorDetails -ErrorRecord $_ -Context 'Automatic Git for Windows install failed'
-            Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $false -Detail $gitDetails
-            $failures.Add(("git.exe is required for daily self-update. Automatic install failed.`r`n{0}" -f $gitDetails))
-        }
-    }
-    else {
-        Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail $gitPath
-    }
-
-    # --- Config content ---
+    # --- Config content (parsed before Git so UpdateEnabled can skip Git install) ---
     $raw = $null
     $configOk = $false
     $targetUsername = $null
+    $updateEnabled = $false
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $raw = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $targetUsername = [string]$raw.TargetUsername
             $configOk = -not [string]::IsNullOrWhiteSpace($targetUsername)
+            if ($null -ne $raw.UpdateEnabled) {
+                $updateEnabled = [bool]$raw.UpdateEnabled
+            }
             Write-CheckResult -Name 'Config TargetUsername' -Ok $configOk -Detail $(
                 if ($configOk) { $targetUsername } else { 'empty - set Windows logon name in config\config.json' }
             )
             if (-not $configOk) {
                 $failures.Add('config\config.json has an empty TargetUsername. Set the Windows logon name, then retry.')
             }
+            Write-CheckResult -Name 'Config UpdateEnabled' -Ok $true -Detail $(
+                if ($updateEnabled) { 'true (Git required)' } else { 'false (Git optional / skipped)' }
+            )
         }
         catch {
             $parseDetails = Format-ErrorDetails -ErrorRecord $_ -Context ("Parsing '{0}'" -f $TemplateConfigPath)
             Write-CheckResult -Name 'Config JSON parse' -Ok $false -Detail $parseDetails
             $failures.Add("config\config.json is not valid JSON.`r`n$parseDetails")
         }
+    }
+
+    # --- git + trusted UpdateRepoUrl (only when self-update is enabled) ---
+    if ($updateEnabled) {
+        $repoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
+        if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
+            $repoUrl = [string]$raw.UpdateRepoUrl
+        }
+        $repoTrusted = $false
+        try {
+            $uri = [Uri]$repoUrl
+            $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+            $repoTrusted = (
+                $uri.IsAbsoluteUri -and
+                $uri.Scheme -eq 'https' -and
+                [string]::Equals($uri.Host, 'github.com', [StringComparison]::OrdinalIgnoreCase) -and
+                (@('/ldorau/log-logged-in-time', '/ldorau/log-logged-in-time.git') -contains $path)
+            )
+        }
+        catch {
+            $repoTrusted = $false
+        }
+        Write-CheckResult -Name 'UpdateRepoUrl allowlist' -Ok $repoTrusted -Detail $repoUrl
+        if (-not $repoTrusted) {
+            $failures.Add(("UpdateRepoUrl must be https://github.com/ldorau/log-logged-in-time(.git). Got: {0}" -f $repoUrl))
+        }
+
+        $gitPath = Find-GitExecutable
+        if (-not $gitPath) {
+            try {
+                $gitPath = Install-GitForWindows
+                Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail ("installed: {0}" -f $gitPath)
+            }
+            catch {
+                $gitDetails = Format-ErrorDetails -ErrorRecord $_ -Context 'Automatic Git for Windows install failed'
+                Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $false -Detail $gitDetails
+                $failures.Add(("git.exe is required when UpdateEnabled=true. Automatic install failed.`r`n{0}" -f $gitDetails))
+            }
+        }
+        else {
+            Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail $gitPath
+        }
+    }
+    else {
+        $gitPath = Find-GitExecutable
+        Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail $(
+            if ($gitPath) { "present (not required): $gitPath" } else { 'skipped (UpdateEnabled=false)' }
+        )
     }
 
     if ($configOk) {
@@ -602,7 +681,7 @@ try {
         $pollSeconds = [int]$raw.PollIntervalSeconds
     }
 
-    $updateEnabled = $true
+    $updateEnabled = $false
     if ($null -ne $raw.UpdateEnabled) {
         $updateEnabled = [bool]$raw.UpdateEnabled
     }
@@ -650,14 +729,7 @@ SystemDrive: $env:SystemDrive
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 
-    try {
-        $configJson | Set-Content -LiteralPath $templateConfigPath -Encoding UTF8
-    }
-    catch {
-        $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Writing template config '{0}'" -f $templateConfigPath)
-        throw (New-Object System.Exception($details, $_.Exception))
-    }
-
+    # Write runtime config only; leave the project template config.json untouched.
     try {
         Set-ProtectedDirectory -Directory $adminAppDirectory -DeniedUsername $targetUsername
         $configJson | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8

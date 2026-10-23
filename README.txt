@@ -59,13 +59,12 @@ Error log (Administrator only; separate from daily time logs):
   C:\Users\Administrator\LoginTimeLogger\errors.log
   All script errors/warnings are printed to the screen and appended here.
 
-Self-update:
-  Once per day, if online, compares GitHub tip to
+Self-update (opt-in; UpdateEnabled=false by default):
+  When enabled and online, compares allowlisted GitHub tip to
   C:\Program Files\LoginTimeLogger\installed-commit.txt
-  If different: git pull into LoginTimeLogger\repo, refresh Program Files, restart.
-  If offline: retry in 10 minutes. Requires Git for Windows
-  (Install.ps1 downloads and installs it if missing).
-  Disable with UpdateEnabled=false in config.
+  If different: sync LoginTimeLogger\repo, refresh Program Files, restart
+  via the scheduled task. Offline: retry in 10 minutes.
+  Git for Windows is installed (Authenticode-checked) only if UpdateEnabled=true.
 
 
 Project layout

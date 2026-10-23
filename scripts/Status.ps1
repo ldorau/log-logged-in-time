@@ -83,10 +83,12 @@ try {
         $null = Write-ErrorMessage -Level WARN -Source 'Status' -Message "No config file available at '$configPath'."
     }
 
+    $taskState = $null
     try {
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($task) {
             $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+            $taskState = [string]$task.State
             Write-Host ("Task: {0} | State: {1} | LastResult: {2} | LastRun: {3}" -f `
                     $TaskName, $task.State, $info.LastTaskResult, $info.LastRunTime)
             if ($info.LastTaskResult -ne 0) {
@@ -102,6 +104,64 @@ try {
     catch {
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
             "Failed to query scheduled task '{0}'" -f $TaskName)
+    }
+
+    # Process / mutex liveness (task State alone can be Ready while a monitor still runs, or vice versa).
+    $monitorMutexHeld = $false
+    $monitorMutexPresent = $false
+    try {
+        $existing = [System.Threading.Mutex]::OpenExisting('Global\LoginTimeLogger.Monitor')
+        $monitorMutexPresent = $true
+        try {
+            if ($existing.WaitOne(0, $false)) {
+                $existing.ReleaseMutex()
+                $monitorMutexHeld = $false
+            }
+            else {
+                $monitorMutexHeld = $true
+            }
+        }
+        finally {
+            $existing.Dispose()
+        }
+    }
+    catch [System.Threading.WaitHandleCannotBeOpenedException] {
+        $monitorMutexPresent = $false
+        $monitorMutexHeld = $false
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $monitorMutexPresent = $true
+        $monitorMutexHeld = $false
+    }
+    catch {
+        Write-Verbose -Message ("Mutex probe failed: {0}" -f $_.Exception.Message)
+    }
+
+    $monitorProcesses = @()
+    try {
+        $monitorProcesses = @(
+            Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and ($_.CommandLine -match 'LoginTimeLogger\.ps1') } |
+                Select-Object ProcessId, CommandLine
+        )
+    }
+    catch {
+        Write-Verbose -Message ("Process probe failed: {0}" -f $_.Exception.Message)
+    }
+
+    $processRunning = $monitorProcesses.Count -gt 0
+    Write-Host ("Monitor mutex:   present={0}; held={1}" -f $monitorMutexPresent, $monitorMutexHeld)
+    Write-Host ("Monitor process: running={0}; count={1}" -f $processRunning, $monitorProcesses.Count)
+    if ($processRunning) {
+        foreach ($proc in $monitorProcesses) {
+            Write-Host ("  PID {0}" -f $proc.ProcessId)
+        }
+    }
+    if ($taskState -and ($taskState -ne 'Running') -and ($monitorMutexHeld -or $processRunning)) {
+        Write-Host 'Note: task State is not Running, but a monitor instance appears active (mutex/process).' -ForegroundColor Yellow
+    }
+    elseif ($taskState -eq 'Running' -and -not $monitorMutexHeld -and -not $processRunning) {
+        Write-Host 'Note: task State is Running, but no monitor mutex/process was detected yet.' -ForegroundColor Yellow
     }
 
     Write-Host "Config file:     $configPath"

@@ -26,17 +26,21 @@ Edit `config/config.json`:
   "TargetUsername": "jsmith",
   "AdministratorProfile": "C:\\Users\\Administrator",
   "LogDirectory": "",
-  "PollIntervalSeconds": 5
+  "PollIntervalSeconds": 5,
+  "UpdateEnabled": false,
+  "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
+  "UpdateBranch": "main",
+  "UpdateClonePath": ""
 }
 ```
 
 `TargetUsername` is required (`jsmith`, `CONTOSO\jsmith`, or `jsmith@contoso.com`). Leave `LogDirectory` empty to use `<AdministratorProfile>\LoginTimeLogs`.
 
-Unknown lock state is treated as **locked** (fail closed). The startup task uses `-WindowStyle Hidden`.
+Unknown lock state is treated as **locked** (fail closed). The startup task uses `-WindowStyle Hidden`. Verify lock detection with `Test-Session.ps1` while locked from another session when relying on WTS flags.
 
 ### Self-update
 
-Once per day the monitor compares the installed commit hash to the latest `main` tip on GitHub. If they differ, it `git pull`s into the Administrator clone directory, refreshes Program Files, and restarts. Offline checks are retried every 10 minutes. Requires Git for Windows (`Install.ps1` downloads and installs it if missing). Set `"UpdateEnabled": false` in config to disable.
+**Off by default** (`UpdateEnabled: false`). When enabled, once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) only when updates are enabled.
 
 ## Install
 
@@ -47,7 +51,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Install.ps1 -StartNow
 ```
 
-`Install.ps1` reads the project template `config/config.json`, then stores the runtime config under the Administrator profile and points the task at that path.
+`Install.ps1` reads the project template `config/config.json` (without modifying it), then stores the runtime config under the Administrator profile and points the task at that path.
 
 ## Verify lock detection
 
@@ -62,7 +66,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Status.ps1
 ```
 
-Log files (Administrator only):
+Log files (Administrator only), under `LogDirectory` (default `<AdministratorProfile>\LoginTimeLogs`):
 
 | File | Contents |
 |------|----------|
@@ -71,9 +75,11 @@ Log files (Administrator only):
 | `state.json` | Running total for the current day |
 | `service.log` | Monitor diagnostics |
 
-Errors from install/monitor/helpers are printed to the screen and appended to:
+**Error log** (install, monitor, and helper failures — separate from the daily time logs):
 
 `C:\Users\Administrator\LoginTimeLogger\errors.log`
+
+That is `<AdministratorProfile>\LoginTimeLogger\errors.log`. If `AdministratorProfile` in config points elsewhere, the error log follows that path. Errors are also printed to the screen. If the Administrator path is not writable, a fallback is used: `%TEMP%\LoginTimeLogger\errors.log`.
 
 ## Uninstall
 
