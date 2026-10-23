@@ -6,5 +6,12 @@
   "UpdateEnabled": false,
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
-  "UpdateClonePath": ""
+  "UpdateClonePath": "",
+  "ScpOnLockEnabled": false,
+  "ScpHost": "",
+  "ScpUser": "",
+  "ScpRemoteDirectory": "",
+  "ScpPort": 22,
+  "ScpIdentityFile": "",
+  "ScpKnownHostsFile": ""
 }

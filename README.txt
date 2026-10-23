@@ -23,6 +23,10 @@ Requirements
 - PowerShell 5.1 or later (included with Windows)
 - An Administrator account to install and view logs
 - TargetUsername set in config\config.json before install
+- OpenSSH Client (scp.exe) when ScpOnLockEnabled=true
+  (Install.ps1 installs the Windows capability if missing)
+- Git for Windows when UpdateEnabled=true
+  (Install.ps1 downloads and installs it if missing)
 
 
 Installation
@@ -66,6 +70,11 @@ Self-update (opt-in; UpdateEnabled=false by default):
   via the scheduled task. Offline: retry in 10 minutes.
   Git for Windows is installed (Authenticode-checked) only if UpdateEnabled=true.
 
+SCP on lock (opt-in; ScpOnLockEnabled=false by default):
+  When enabled, on each lock copies today's unlocked-time log and errors.log
+  via OpenSSH scp to ScpUser@ScpHost:ScpRemoteDirectory/ using an SSH key
+  (default <AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519).
+
 
 Project layout
 --------------
@@ -73,6 +82,7 @@ Project layout
   src\LoginTimeLogger.ps1     - background monitor (reads runtime config)
   src\SessionQuery.cs         - session/lock detection helpers
   src\Update-Check.ps1        - daily GitHub self-update helper
+  src\Scp-OnLock.ps1          - copy time + error logs via scp on lock
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total

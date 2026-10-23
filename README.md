@@ -16,6 +16,8 @@ Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run
 - PowerShell 5.1+ (built in)
 - An Administrator account to install
 - `TargetUsername` set in `config/config.json` before install
+- OpenSSH Client (`scp.exe`) when `ScpOnLockEnabled` is true — `Install.ps1` installs the Windows OpenSSH Client capability if missing
+- Git for Windows when `UpdateEnabled` is true — `Install.ps1` downloads and installs it if missing
 
 ## Configure
 
@@ -30,7 +32,14 @@ Edit `config/config.json`:
   "UpdateEnabled": false,
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
-  "UpdateClonePath": ""
+  "UpdateClonePath": "",
+  "ScpOnLockEnabled": false,
+  "ScpHost": "",
+  "ScpUser": "",
+  "ScpRemoteDirectory": "",
+  "ScpPort": 22,
+  "ScpIdentityFile": "",
+  "ScpKnownHostsFile": ""
 }
 ```
 
@@ -41,6 +50,20 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 ### Self-update
 
 **Off by default** (`UpdateEnabled: false`). When enabled, once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) only when updates are enabled.
+
+### SCP on lock
+
+**Off by default** (`ScpOnLockEnabled: false`). When enabled, each time the target session leaves unlocked-active (screen lock / away), the monitor runs `scp` to copy:
+
+- today’s `unlocked-time-YYYY-MM-DD.log`
+- `errors.log`
+
+to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`). Defaults for empty key paths:
+
+- `ScpIdentityFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519`
+- `ScpKnownHostsFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\known_hosts`
+
+Place a private key readable by `SYSTEM` at that path (and the matching public key on the remote). `Install.ps1` installs OpenSSH Client if `scp.exe` is missing.
 
 ## Install
 

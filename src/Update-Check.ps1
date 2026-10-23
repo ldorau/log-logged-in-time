@@ -250,6 +250,7 @@ function Publish-InstalledFilesFromRepo {
         'SessionQuery.cs'
         'Common-Error.ps1'
         'Update-Check.ps1'
+        'Scp-OnLock.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name

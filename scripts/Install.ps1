@@ -266,6 +266,47 @@ function Install-GitForWindows {
     return $gitPath
 }
 
+function Find-ScpExecutable {
+    $cmd = Get-Command scp.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:SystemRoot 'System32\OpenSSH\scp.exe')
+        (Join-Path $env:SystemRoot 'Sysnative\OpenSSH\scp.exe')
+        (Join-Path $env:ProgramFiles 'OpenSSH\scp.exe')
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+function Install-OpenSshClient {
+    <#
+    .SYNOPSIS
+      Installs the Windows OpenSSH Client optional feature (provides scp.exe).
+    #>
+    Write-Host '  OpenSSH Client not found. Installing Windows capability OpenSSH.Client...'
+
+    $capabilityName = 'OpenSSH.Client~~~~0.0.1.0'
+    try {
+        $result = Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop
+        Write-Verbose -Message ("Add-WindowsCapability State={0}; RestartNeeded={1}" -f $result.State, $result.RestartNeeded)
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Add-WindowsCapability -Name {0}" -f $capabilityName)
+        throw (New-Object System.Exception(
+                ("Could not install OpenSSH Client capability.`r`n{0}" -f $details), $_.Exception))
+    }
+
+    Update-ProcessPathFromMachine
+    $scpPath = Find-ScpExecutable
+    if (-not $scpPath) {
+        throw 'OpenSSH Client capability install finished, but scp.exe was not found afterward. A reboot may be required.'
+    }
+    return $scpPath
+}
+
 function Test-InstallPrerequisites {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
@@ -423,6 +464,7 @@ function Test-InstallPrerequisites {
         'SessionQuery.cs'  = $CsPath
         'Common-Error.ps1' = (Join-Path $RepoRoot 'src\Common-Error.ps1')
         'Update-Check.ps1' = (Join-Path $RepoRoot 'src\Update-Check.ps1')
+        'Scp-OnLock.ps1'   = (Join-Path $RepoRoot 'src\Scp-OnLock.ps1')
     }
     foreach ($entry in $requiredFiles.GetEnumerator()) {
         $exists = Test-Path -LiteralPath $entry.Value
@@ -508,6 +550,64 @@ function Test-InstallPrerequisites {
         Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail $(
             if ($gitPath) { "present (not required): $gitPath" } else { 'skipped (UpdateEnabled=false)' }
         )
+    }
+
+    # --- OpenSSH scp (only when SCP-on-lock is enabled) ---
+    $scpOnLockEnabled = $false
+    if ($raw -and $null -ne $raw.ScpOnLockEnabled) {
+        $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
+    }
+    if ($scpOnLockEnabled) {
+        $scpPath = Find-ScpExecutable
+        if (-not $scpPath) {
+            try {
+                $scpPath = Install-OpenSshClient
+                Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail ("installed: {0}" -f $scpPath)
+            }
+            catch {
+                $scpDetails = Format-ErrorDetails -ErrorRecord $_ -Context 'Automatic OpenSSH Client install failed'
+                Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $false -Detail $scpDetails
+                $failures.Add(("scp.exe is required when ScpOnLockEnabled=true. Automatic OpenSSH Client install failed.`r`n{0}" -f $scpDetails))
+            }
+        }
+        else {
+            Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail $scpPath
+        }
+
+        $scpHostOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)
+        $scpUserOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)
+        $scpDirOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)
+        Write-CheckResult -Name 'SCP remote host/user/directory' -Ok ($scpHostOk -and $scpUserOk -and $scpDirOk) -Detail $(
+            if ($scpHostOk -and $scpUserOk -and $scpDirOk) {
+                '{0}@{1}:{2}' -f $raw.ScpUser, $raw.ScpHost, $raw.ScpRemoteDirectory
+            }
+            else {
+                'set ScpHost, ScpUser, and ScpRemoteDirectory in config\config.json'
+            }
+        )
+        if (-not ($scpHostOk -and $scpUserOk -and $scpDirOk)) {
+            $failures.Add('ScpOnLockEnabled=true requires ScpHost, ScpUser, and ScpRemoteDirectory in config\config.json.')
+        }
+
+        $identityPath = $null
+        if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
+            $identityPath = [string]$raw.ScpIdentityFile
+        }
+        else {
+            $adminForKey = Join-Path $env:SystemDrive 'Users\Administrator'
+            if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
+                $adminForKey = [string]$raw.AdministratorProfile
+            }
+            $identityPath = Join-Path $adminForKey 'LoginTimeLogger\ssh\id_ed25519'
+        }
+        $identityOk = Test-Path -LiteralPath $identityPath
+        Write-CheckResult -Name 'SCP identity file (private key)' -Ok $identityOk -Detail $identityPath
+        if (-not $identityOk) {
+            $failures.Add(("ScpOnLockEnabled=true requires an SSH private key at '{0}' (or set ScpIdentityFile)." -f $identityPath))
+        }
+    }
+    else {
+        Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail 'skipped (ScpOnLockEnabled=false)'
     }
 
     if ($configOk) {
@@ -662,6 +762,7 @@ try {
     $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
     $commonErrorSrc = Join-Path $repoRoot 'src\Common-Error.ps1'
     $updateCheckSrc = Join-Path $repoRoot 'src\Update-Check.ps1'
+    $scpOnLockSrc = Join-Path $repoRoot 'src\Scp-OnLock.ps1'
 
     $raw = Test-InstallPrerequisites `
         -RepoRoot $repoRoot `
@@ -698,6 +799,41 @@ try {
         $updateClonePath = [string]$raw.UpdateClonePath
     }
 
+    $scpOnLockEnabledRuntime = $false
+    if ($null -ne $raw.ScpOnLockEnabled) {
+        $scpOnLockEnabledRuntime = [bool]$raw.ScpOnLockEnabled
+    }
+    $scpHost = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)) {
+        $scpHost = [string]$raw.ScpHost
+    }
+    $scpUser = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)) {
+        $scpUser = [string]$raw.ScpUser
+    }
+    $scpRemoteDirectory = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)) {
+        $scpRemoteDirectory = [string]$raw.ScpRemoteDirectory
+    }
+    $scpPort = 22
+    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
+        $scpPort = [int]$raw.ScpPort
+    }
+    $scpIdentityFile = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
+        $scpIdentityFile = [string]$raw.ScpIdentityFile
+    }
+    elseif ($scpOnLockEnabledRuntime) {
+        $scpIdentityFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
+    }
+    $scpKnownHostsFile = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpKnownHostsFile)) {
+        $scpKnownHostsFile = [string]$raw.ScpKnownHostsFile
+    }
+    elseif ($scpOnLockEnabledRuntime) {
+        $scpKnownHostsFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\known_hosts'
+    }
+
     $null = Initialize-ErrorLog -AdministratorProfile $administratorProfile
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
 
@@ -726,6 +862,13 @@ SystemDrive: $env:SystemDrive
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
         UpdateClonePath      = $updateClonePath
+        ScpOnLockEnabled     = $scpOnLockEnabledRuntime
+        ScpHost              = $scpHost
+        ScpUser              = $scpUser
+        ScpRemoteDirectory   = $scpRemoteDirectory
+        ScpPort              = $scpPort
+        ScpIdentityFile      = $scpIdentityFile
+        ScpKnownHostsFile    = $scpKnownHostsFile
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 
@@ -751,6 +894,7 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $csPath -Destination (Join-Path $installSrc 'SessionQuery.cs') -Force
         Copy-Item -LiteralPath $commonErrorSrc -Destination (Join-Path $installSrc 'Common-Error.ps1') -Force
         Copy-Item -LiteralPath $updateCheckSrc -Destination (Join-Path $installSrc 'Update-Check.ps1') -Force
+        Copy-Item -LiteralPath $scpOnLockSrc -Destination (Join-Path $installSrc 'Scp-OnLock.ps1') -Force
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (

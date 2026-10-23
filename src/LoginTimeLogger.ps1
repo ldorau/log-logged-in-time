@@ -140,6 +140,47 @@ LogDirectory in file: $($raw.LogDirectory)
         $updateClonePath = [string]$raw.UpdateClonePath
     }
 
+    $scpOnLockEnabled = $false
+    if ($null -ne $raw.ScpOnLockEnabled) {
+        $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
+    }
+
+    $scpHost = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)) {
+        $scpHost = [string]$raw.ScpHost
+    }
+
+    $scpUser = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)) {
+        $scpUser = [string]$raw.ScpUser
+    }
+
+    $scpRemoteDirectory = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)) {
+        $scpRemoteDirectory = [string]$raw.ScpRemoteDirectory
+    }
+
+    $scpPort = 22
+    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
+        $scpPort = [int]$raw.ScpPort
+    }
+
+    $scpIdentityFile = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
+        $scpIdentityFile = [string]$raw.ScpIdentityFile
+    }
+    elseif ($scpOnLockEnabled) {
+        $scpIdentityFile = Join-Path $adminHome 'LoginTimeLogger\ssh\id_ed25519'
+    }
+
+    $scpKnownHostsFile = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpKnownHostsFile)) {
+        $scpKnownHostsFile = [string]$raw.ScpKnownHostsFile
+    }
+    elseif ($scpOnLockEnabled) {
+        $scpKnownHostsFile = Join-Path $adminHome 'LoginTimeLogger\ssh\known_hosts'
+    }
+
     [pscustomobject]@{
         TargetUsername       = [string]$raw.TargetUsername
         AdministratorProfile = $adminHome
@@ -150,6 +191,13 @@ LogDirectory in file: $($raw.LogDirectory)
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
         UpdateClonePath      = $updateClonePath
+        ScpOnLockEnabled     = $scpOnLockEnabled
+        ScpHost              = $scpHost
+        ScpUser              = $scpUser
+        ScpRemoteDirectory   = $scpRemoteDirectory
+        ScpPort              = $scpPort
+        ScpIdentityFile      = $scpIdentityFile
+        ScpKnownHostsFile    = $scpKnownHostsFile
     }
 }
 
@@ -352,6 +400,12 @@ try {
     }
     . $updateHelper
 
+    $scpHelper = Join-Path $scriptDir 'Scp-OnLock.ps1'
+    if (-not (Test-Path -LiteralPath $scpHelper)) {
+        throw "Scp-OnLock.ps1 missing at '$scpHelper'."
+    }
+    . $scpHelper
+
     $csPath = Join-Path $scriptDir 'SessionQuery.cs'
     Import-SessionQueryType -SourcePath $csPath
 
@@ -371,8 +425,8 @@ try {
     }
     $adminAppDirectory = Join-Path $config.AdministratorProfile 'LoginTimeLogger'
 
-    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}" -f `
-            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled)
+    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}" -f `
+            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
@@ -448,6 +502,20 @@ while ($true) {
             Write-LoggerEvent $line
             $state.LastTransitionUtc = $nowUtc.ToString('o')
             $state.LastUnlocked = $unlocked
+
+            # On lock (or leaving unlocked-active), push today's time log + error log via scp.
+            if (-not $unlocked) {
+                Write-State -Path $statePath -State $state
+                try {
+                    Invoke-ScpLogCopyOnLock `
+                        -Config $config `
+                        -TimeLogPath $dailyPath `
+                        -ErrorLogPath (Get-ErrorLogPath)
+                }
+                catch {
+                    $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpOnLock' -Context 'Unexpected SCP-on-lock failure'
+                }
+            }
         }
 
         # Periodic heartbeat once every 15 minutes.

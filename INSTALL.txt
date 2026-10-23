@@ -24,7 +24,14 @@ Edit config\config.json and set TargetUsername to the account to measure:
     "UpdateEnabled": false,
     "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
     "UpdateBranch": "main",
-    "UpdateClonePath": ""
+    "UpdateClonePath": "",
+    "ScpOnLockEnabled": false,
+    "ScpHost": "",
+    "ScpUser": "",
+    "ScpRemoteDirectory": "",
+    "ScpPort": 22,
+    "ScpIdentityFile": "",
+    "ScpKnownHostsFile": ""
   }
 
 Accepted TargetUsername forms:
@@ -70,6 +77,8 @@ Prerequisite checks include:
   - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
   - Git for Windows (git.exe) only when UpdateEnabled is true
     (downloaded, Authenticode-verified, and installed silently if missing)
+  - OpenSSH Client (scp.exe) only when ScpOnLockEnabled is true
+    (installed via Windows capability if missing)
 
 The startup task runs powershell.exe with -WindowStyle Hidden.
 
@@ -86,6 +95,21 @@ copies updated src files into Program Files, then restarts via the
 scheduled task (Start-ScheduledTask after exit) so monitoring stays under
 Task Scheduler. Offline checks are postponed by 10 minutes.
 Set "UpdateEnabled": true in config.json to enable.
+
+SCP on lock (optional)
+----------------------
+Disabled by default (ScpOnLockEnabled=false). When enabled, on every lock
+(or leaving unlocked-active) the monitor copies via OpenSSH scp:
+  - today's unlocked-time-YYYY-MM-DD.log
+  - errors.log
+to ScpUser@ScpHost:ScpRemoteDirectory/ using key-based auth only.
+Default identity file (if ScpIdentityFile is empty):
+  <AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519
+Default known_hosts (if ScpKnownHostsFile is empty):
+  <AdministratorProfile>\LoginTimeLogger\ssh\known_hosts
+Requires OpenSSH Client (scp.exe) and a private key readable by SYSTEM.
+Install.ps1 installs OpenSSH Client if missing, then validates scp.exe,
+host/user/directory, and the identity file when ScpOnLockEnabled is true.
 
 
 What the installer does
