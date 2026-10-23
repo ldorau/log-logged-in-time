@@ -65,6 +65,7 @@ Prerequisite checks include:
   - Program Files write access
   - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
   - Git for Windows (git.exe) for daily self-update from GitHub
+    (downloaded and installed silently by Install.ps1 if missing)
 
 The startup task runs powershell.exe with -WindowStyle Hidden.
 

@@ -36,7 +36,7 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 
 ### Self-update
 
-Once per day the monitor compares the installed commit hash to the latest `main` tip on GitHub. If they differ, it `git pull`s into the Administrator clone directory, refreshes Program Files, and restarts. Offline checks are retried every 10 minutes. Requires Git for Windows. Set `"UpdateEnabled": false` in config to disable.
+Once per day the monitor compares the installed commit hash to the latest `main` tip on GitHub. If they differ, it `git pull`s into the Administrator clone directory, refreshes Program Files, and restarts. Offline checks are retried every 10 minutes. Requires Git for Windows (`Install.ps1` downloads and installs it if missing). Set `"UpdateEnabled": false` in config to disable.
 
 ## Install
 

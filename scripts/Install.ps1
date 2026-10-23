@@ -105,6 +105,126 @@ function Test-AccountExists {
     }
 }
 
+function Find-GitExecutable {
+    $cmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe')
+        (Join-Path $env:LocalAppData 'Programs\Git\cmd\git.exe')
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+function Update-ProcessPathFromMachine {
+    # Git's installer updates the Machine PATH; refresh this process so Get-Command can see it.
+    try {
+        $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($machine -or $user) {
+            $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+        }
+    }
+    catch {
+        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context 'Refreshing process PATH after Git install failed')
+    }
+}
+
+function Install-GitForWindows {
+    <#
+    .SYNOPSIS
+      Downloads the latest Git for Windows installer and runs a silent install.
+    #>
+    Write-Host '  Git not found. Downloading and installing Git for Windows...'
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    catch {
+        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context 'Enabling TLS 1.2 for Git download')
+    }
+
+    $archTag = if ([Environment]::Is64BitOperatingSystem) { '64-bit' } else { '32-bit' }
+    $apiUrl = 'https://api.github.com/repos/git-for-windows/git/releases/latest'
+    $headers = @{
+        'Accept'     = 'application/vnd.github+json'
+        'User-Agent' = 'LoginTimeLogger-Install'
+    }
+
+    try {
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -UseBasicParsing
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context ("GET {0}" -f $apiUrl)
+        throw (New-Object System.Exception(
+                ("Could not query Git for Windows releases.`r`n{0}" -f $details), $_.Exception))
+    }
+
+    $asset = @(
+        $release.assets |
+            Where-Object { $_.name -match ("^Git-.+-{0}\.exe$" -f [regex]::Escape($archTag)) } |
+            Select-Object -First 1
+    )[0]
+    if (-not $asset) {
+        throw ("No Git for Windows {0} installer found in the latest GitHub release." -f $archTag)
+    }
+
+    $downloadUrl = [string]$asset.browser_download_url
+    $installerName = [string]$asset.name
+    $installerPath = Join-Path $env:TEMP $installerName
+    Write-Host ("  Downloading {0}..." -f $installerName)
+
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Download {0}" -f $downloadUrl)
+        throw (New-Object System.Exception(
+                ("Could not download Git for Windows installer.`r`n{0}" -f $details), $_.Exception))
+    }
+
+    if (-not (Test-Path -LiteralPath $installerPath)) {
+        throw ("Git installer download completed but file is missing: {0}" -f $installerPath)
+    }
+
+    # Inno Setup silent flags; PathOption=Cmd adds git.exe to PATH for cmd/PowerShell.
+    $installArgs = @(
+        '/VERYSILENT'
+        '/NORESTART'
+        '/NOCANCEL'
+        '/SP-'
+        '/CLOSEAPPLICATIONS'
+        '/RESTARTAPPLICATIONS'
+        '/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh'
+        '/o:PathOption=Cmd'
+    )
+    Write-Host '  Running silent Git for Windows installer (may take a minute)...'
+    $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        throw ("Git for Windows installer exited with code {0}." -f $proc.ExitCode)
+    }
+
+    try {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
+                "Cleanup of Git installer '{0}' failed" -f $installerPath))
+    }
+
+    Update-ProcessPathFromMachine
+    $gitPath = Find-GitExecutable
+    if (-not $gitPath) {
+        throw 'Git for Windows installer finished, but git.exe was not found afterward.'
+    }
+    return $gitPath
+}
+
 function Test-InstallPrerequisites {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
@@ -271,27 +391,21 @@ function Test-InstallPrerequisites {
         }
     }
 
-    # --- git (required for daily self-update) ---
-    $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
-    $gitPath = $null
-    if ($gitCmd) {
-        $gitPath = $gitCmd.Source
-    }
-    else {
-        foreach ($candidate in @(
-                (Join-Path $env:ProgramFiles 'Git\cmd\git.exe'),
-                (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe')
-            )) {
-            if ($candidate -and (Test-Path -LiteralPath $candidate)) {
-                $gitPath = $candidate
-                break
-            }
+    # --- git (required for daily self-update); install if missing ---
+    $gitPath = Find-GitExecutable
+    if (-not $gitPath) {
+        try {
+            $gitPath = Install-GitForWindows
+            Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail ("installed: {0}" -f $gitPath)
+        }
+        catch {
+            $gitDetails = Format-ErrorDetails -ErrorRecord $_ -Context 'Automatic Git for Windows install failed'
+            Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $false -Detail $gitDetails
+            $failures.Add(("git.exe is required for daily self-update. Automatic install failed.`r`n{0}" -f $gitDetails))
         }
     }
-    $gitOk = -not [string]::IsNullOrWhiteSpace($gitPath)
-    Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $gitOk -Detail $(if ($gitOk) { $gitPath } else { 'not found' })
-    if (-not $gitOk) {
-        $failures.Add('git.exe is required for daily self-update against GitHub. Install Git for Windows, then retry.')
+    else {
+        Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $true -Detail $gitPath
     }
 
     # --- Config content ---
@@ -575,9 +689,9 @@ SystemDrive: $env:SystemDrive
     # Record currently installed commit hash for daily update comparisons.
     $installedCommit = $null
     try {
-        $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
-        if ($gitCmd) {
-            $installedCommit = (& $gitCmd.Source -C $repoRoot rev-parse HEAD 2>$null)
+        $gitExe = Find-GitExecutable
+        if ($gitExe) {
+            $installedCommit = (& $gitExe -C $repoRoot rev-parse HEAD 2>$null)
             if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$installedCommit")) {
                 $installedCommit = ("$installedCommit").Trim().ToLowerInvariant()
                 Set-Content -LiteralPath (Join-Path $installRoot 'installed-commit.txt') -Value $installedCommit -Encoding ASCII

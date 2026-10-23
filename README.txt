@@ -63,7 +63,8 @@ Self-update:
   Once per day, if online, compares GitHub tip to
   C:\Program Files\LoginTimeLogger\installed-commit.txt
   If different: git pull into LoginTimeLogger\repo, refresh Program Files, restart.
-  If offline: retry in 10 minutes. Requires Git for Windows.
+  If offline: retry in 10 minutes. Requires Git for Windows
+  (Install.ps1 downloads and installs it if missing).
   Disable with UpdateEnabled=false in config.
 
 
