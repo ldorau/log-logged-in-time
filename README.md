@@ -66,7 +66,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Status.ps1
 ```
 
-Log files (Administrator only), under `LogDirectory` (default `<AdministratorProfile>\LoginTimeLogs`):
+**Unlocked-time logs** (when the target user was logged in with the screen unlocked):
+
+`C:\Users\Administrator\LoginTimeLogs\`
+
+That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` when `LogDirectory` is empty. If `AdministratorProfile` / `LogDirectory` point elsewhere, the time logs follow those paths.
 
 | File | Contents |
 |------|----------|
