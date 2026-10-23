@@ -34,6 +34,10 @@ Edit `config/config.json`:
 
 Unknown lock state is treated as **locked** (fail closed). The startup task uses `-WindowStyle Hidden`.
 
+### Self-update
+
+Once per day the monitor compares the installed commit hash to the latest `main` tip on GitHub. If they differ, it `git pull`s into the Administrator clone directory, refreshes Program Files, and restarts. Offline checks are retried every 10 minutes. Requires Git for Windows. Set `"UpdateEnabled": false` in config to disable.
+
 ## Install
 
 Open an **elevated** PowerShell prompt in this folder:
@@ -89,4 +93,5 @@ Gaps larger than a short cap (sleep/hibernate) are not credited as unlocked time
 
 - Use a real account id (SAM / `DOMAIN\user` / UPN), not a display name.
 - Standard users cannot change the scheduled task or the log ACL without Administrator rights.
+- Supported on **Windows 11 Home**. Caveat: the default path is `C:\Users\Administrator\...`, but that profile often does not exist on Home until the built-in Administrator account is enabled. Before install, set `AdministratorProfile` in `config/config.json` to a real administrator user’s profile (for example `C:\Users\YourAdminName`).
 - See `INSTALL.txt` for a full plain-text install guide.

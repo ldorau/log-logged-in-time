@@ -2,5 +2,9 @@
   "TargetUsername": "",
   "AdministratorProfile": "C:\\Users\\Administrator",
   "LogDirectory": "",
-  "PollIntervalSeconds": 5
+  "PollIntervalSeconds": 5,
+  "UpdateEnabled": true,
+  "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
+  "UpdateBranch": "main",
+  "UpdateClonePath": ""
 }

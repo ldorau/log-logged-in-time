@@ -119,12 +119,36 @@ LogDirectory in file: $($raw.LogDirectory)
         $pollSeconds = [int]$raw.PollIntervalSeconds
     }
 
+    $updateEnabled = $true
+    if ($null -ne $raw.UpdateEnabled) {
+        $updateEnabled = [bool]$raw.UpdateEnabled
+    }
+
+    $updateRepoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
+        $updateRepoUrl = [string]$raw.UpdateRepoUrl
+    }
+
+    $updateBranch = 'main'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateBranch)) {
+        $updateBranch = [string]$raw.UpdateBranch
+    }
+
+    $updateClonePath = Join-Path $adminHome 'LoginTimeLogger\repo'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateClonePath)) {
+        $updateClonePath = [string]$raw.UpdateClonePath
+    }
+
     [pscustomobject]@{
         TargetUsername       = [string]$raw.TargetUsername
         AdministratorProfile = $adminHome
         LogDirectory         = $logDirectory
         PollIntervalSeconds  = $pollSeconds
         ConfigPath           = $Path
+        UpdateEnabled        = $updateEnabled
+        UpdateRepoUrl        = $updateRepoUrl
+        UpdateBranch         = $updateBranch
+        UpdateClonePath      = $updateClonePath
     }
 }
 
@@ -298,11 +322,32 @@ function Write-DayRollover {
     }
 }
 
+# --- single-instance guard (survives self-restart after updates) ---
+$script:InstanceMutex = $null
+try {
+    $script:InstanceMutex = New-Object System.Threading.Mutex($false, 'Global\LoginTimeLogger.Monitor')
+    # Wait briefly so a self-restarting instance can exit and release the mutex.
+    if (-not $script:InstanceMutex.WaitOne(15000, $false)) {
+        Write-Host 'Another LoginTimeLogger instance is already running; exiting.'
+        exit 0
+    }
+}
+catch {
+    # If mutex creation fails, continue anyway rather than blocking monitoring.
+    Write-Host ("WARNING: could not acquire instance mutex: {0}" -f $_.Exception.Message)
+}
+
 # --- main ---
 try {
     $config = Get-Config -Path $ConfigPath
     $null = Initialize-ErrorLog -AdministratorProfile $config.AdministratorProfile
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
+
+    $updateHelper = Join-Path $scriptDir 'Update-Check.ps1'
+    if (-not (Test-Path -LiteralPath $updateHelper)) {
+        throw "Update-Check.ps1 missing at '$updateHelper'."
+    }
+    . $updateHelper
 
     $csPath = Join-Path $scriptDir 'SessionQuery.cs'
     Import-SessionQueryType -SourcePath $csPath
@@ -313,8 +358,18 @@ try {
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory
     $state = Read-State -Path $statePath
 
-    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}" -f `
-            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath))
+    $installedSrc = Join-Path $env:ProgramFiles 'LoginTimeLogger\src'
+    if ([string]::Equals($scriptDir, $installedSrc, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
+    }
+    else {
+        # Dev/fallback: parent of src/
+        $installRoot = Split-Path -Parent $scriptDir
+    }
+    $adminAppDirectory = Join-Path $config.AdministratorProfile 'LoginTimeLogger'
+
+    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}" -f `
+            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
@@ -326,6 +381,14 @@ $lastHeartbeatSlot = $null
 
 while ($true) {
     try {
+        # Daily (or postponed) self-update against GitHub tip.
+        try {
+            Invoke-LoginTimeLoggerUpdateCheck -Config $config -InstallRoot $installRoot -AdminAppDirectory $adminAppDirectory
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context 'Unexpected update-check failure'
+        }
+
         $nowLocal = Get-Date
         $nowUtc = [datetime]::UtcNow
         $today = $nowLocal.ToString('yyyy-MM-dd')

@@ -59,12 +59,20 @@ Error log (Administrator only; separate from daily time logs):
   C:\Users\Administrator\LoginTimeLogger\errors.log
   All script errors/warnings are printed to the screen and appended here.
 
+Self-update:
+  Once per day, if online, compares GitHub tip to
+  C:\Program Files\LoginTimeLogger\installed-commit.txt
+  If different: git pull into LoginTimeLogger\repo, refresh Program Files, restart.
+  If offline: retry in 10 minutes. Requires Git for Windows.
+  Disable with UpdateEnabled=false in config.
+
 
 Project layout
 --------------
   config\config.json          - install template (edit TargetUsername here)
   src\LoginTimeLogger.ps1     - background monitor (reads runtime config)
   src\SessionQuery.cs         - session/lock detection helpers
+  src\Update-Check.ps1        - daily GitHub self-update helper
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total
@@ -80,7 +88,12 @@ Notes
 - TargetUsername: local SAM, DOMAIN\user, or user@upn.domain
   (not the display name). Unknown lock state is treated as locked
   (fail closed — time is not counted).
-- If the Administrator profile path differs on your PC, set
-  AdministratorProfile in config\config.json before installing.
+- Supported on Windows 11 Home. Caveat: the default path is
+  C:\Users\Administrator\... but that profile often does not exist on
+  Home until the built-in Administrator account is enabled. Before
+  install, set AdministratorProfile in config\config.json to a real
+  administrator user's profile (for example C:\Users\YourAdminName).
+- If the Administrator profile path differs on your PC for any reason,
+  set AdministratorProfile in config\config.json before installing.
 - Standard users cannot change the scheduled task or the log ACL without
   Administrator rights.

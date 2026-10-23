@@ -64,8 +64,20 @@ Prerequisite checks include:
   - TargetUsername set and account exists (local or domain)
   - Program Files write access
   - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
+  - Git for Windows (git.exe) for daily self-update from GitHub
 
 The startup task runs powershell.exe with -WindowStyle Hidden.
+
+Self-update (background monitor)
+--------------------------------
+Once per day the monitor checks https://github.com/ldorau/log-logged-in-time
+for a newer commit (git ls-remote). If the tip differs from
+  C:\Program Files\LoginTimeLogger\installed-commit.txt
+it clones/pulls into
+  <AdministratorProfile>\LoginTimeLogger\repo
+copies updated src files into Program Files, then restarts itself.
+If there is no internet connection, the check is postponed by 10 minutes.
+Disable with "UpdateEnabled": false in config.json.
 
 
 What the installer does

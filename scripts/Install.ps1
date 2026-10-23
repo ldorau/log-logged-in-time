@@ -260,6 +260,8 @@ function Test-InstallPrerequisites {
         'Monitor script'   = $MonitorScript
         'Config template'  = $TemplateConfigPath
         'SessionQuery.cs'  = $CsPath
+        'Common-Error.ps1' = (Join-Path $RepoRoot 'src\Common-Error.ps1')
+        'Update-Check.ps1' = (Join-Path $RepoRoot 'src\Update-Check.ps1')
     }
     foreach ($entry in $requiredFiles.GetEnumerator()) {
         $exists = Test-Path -LiteralPath $entry.Value
@@ -267,6 +269,29 @@ function Test-InstallPrerequisites {
         if (-not $exists) {
             $failures.Add("Required file missing: $($entry.Value)")
         }
+    }
+
+    # --- git (required for daily self-update) ---
+    $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    $gitPath = $null
+    if ($gitCmd) {
+        $gitPath = $gitCmd.Source
+    }
+    else {
+        foreach ($candidate in @(
+                (Join-Path $env:ProgramFiles 'Git\cmd\git.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe')
+            )) {
+            if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+                $gitPath = $candidate
+                break
+            }
+        }
+    }
+    $gitOk = -not [string]::IsNullOrWhiteSpace($gitPath)
+    Write-CheckResult -Name 'Git (git.exe) for self-update' -Ok $gitOk -Detail $(if ($gitOk) { $gitPath } else { 'not found' })
+    if (-not $gitOk) {
+        $failures.Add('git.exe is required for daily self-update against GitHub. Install Git for Windows, then retry.')
     }
 
     # --- Config content ---
@@ -443,6 +468,7 @@ try {
     $templateConfigPath = Join-Path $repoRoot 'config\config.json'
     $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
     $commonErrorSrc = Join-Path $repoRoot 'src\Common-Error.ps1'
+    $updateCheckSrc = Join-Path $repoRoot 'src\Update-Check.ps1'
 
     $raw = Test-InstallPrerequisites `
         -RepoRoot $repoRoot `
@@ -460,6 +486,23 @@ try {
     $pollSeconds = 5
     if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
         $pollSeconds = [int]$raw.PollIntervalSeconds
+    }
+
+    $updateEnabled = $true
+    if ($null -ne $raw.UpdateEnabled) {
+        $updateEnabled = [bool]$raw.UpdateEnabled
+    }
+    $updateRepoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
+        $updateRepoUrl = [string]$raw.UpdateRepoUrl
+    }
+    $updateBranch = 'main'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateBranch)) {
+        $updateBranch = [string]$raw.UpdateBranch
+    }
+    $updateClonePath = Join-Path $administratorProfile 'LoginTimeLogger\repo'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateClonePath)) {
+        $updateClonePath = [string]$raw.UpdateClonePath
     }
 
     $null = Initialize-ErrorLog -AdministratorProfile $administratorProfile
@@ -486,6 +529,10 @@ SystemDrive: $env:SystemDrive
         AdministratorProfile = $administratorProfile
         LogDirectory         = $logDirectory
         PollIntervalSeconds  = $pollSeconds
+        UpdateEnabled        = $updateEnabled
+        UpdateRepoUrl        = $updateRepoUrl
+        UpdateBranch         = $updateBranch
+        UpdateClonePath      = $updateClonePath
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 
@@ -517,11 +564,29 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $monitorScript -Destination (Join-Path $installSrc 'LoginTimeLogger.ps1') -Force
         Copy-Item -LiteralPath $csPath -Destination (Join-Path $installSrc 'SessionQuery.cs') -Force
         Copy-Item -LiteralPath $commonErrorSrc -Destination (Join-Path $installSrc 'Common-Error.ps1') -Force
+        Copy-Item -LiteralPath $updateCheckSrc -Destination (Join-Path $installSrc 'Update-Check.ps1') -Force
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
             "Copying monitor files to Program Files failed; installRoot='{0}'" -f $installRoot)
         throw (New-Object System.Exception($details, $_.Exception))
+    }
+
+    # Record currently installed commit hash for daily update comparisons.
+    $installedCommit = $null
+    try {
+        $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
+        if ($gitCmd) {
+            $installedCommit = (& $gitCmd.Source -C $repoRoot rev-parse HEAD 2>$null)
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$installedCommit")) {
+                $installedCommit = ("$installedCommit").Trim().ToLowerInvariant()
+                Set-Content -LiteralPath (Join-Path $installRoot 'installed-commit.txt') -Value $installedCommit -Encoding ASCII
+                Write-Host "Installed commit: $installedCommit"
+            }
+        }
+    }
+    catch {
+        Write-Warning ("Could not record installed commit hash: {0}" -f $_.Exception.Message)
     }
 
     try {
