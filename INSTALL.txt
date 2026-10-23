@@ -1,0 +1,188 @@
+Login Time Logger - Installation
+================================
+
+Prerequisites
+-------------
+1. Sign in with an account that has Administrator rights.
+2. Know the Windows logon name of the account to measure (SAM account name,
+   not the display name).
+3. Confirm the Administrator profile folder exists, usually:
+     C:\Users\Administrator
+   If it does not, set AdministratorProfile in config\config.json to a real
+   Administrator profile path.
+
+
+Step 1 - Set the target username in config
+------------------------------------------
+Edit config\config.json and set TargetUsername to the account to measure:
+
+  {
+    "TargetUsername": "jsmith",
+    "AdministratorProfile": "C:\\Users\\Administrator",
+    "LogDirectory": "",
+    "PollIntervalSeconds": 5
+  }
+
+Accepted TargetUsername forms:
+  - Local SAM:     jsmith
+  - Domain:        CONTOSO\jsmith
+  - UPN:           jsmith@contoso.com
+
+TargetUsername is required. Leave LogDirectory empty to use:
+  <AdministratorProfile>\LoginTimeLogs
+
+
+Step 2 - Install
+----------------
+1. Open PowerShell as Administrator.
+   (Right-click Start -> Terminal (Admin) / Windows PowerShell (Admin))
+
+2. Change to the folder that contains this project, for example:
+     cd C:\Path\To\log-logged-in-time
+
+3. Allow scripts for this session only:
+     Set-ExecutionPolicy -Scope Process Bypass
+
+4. Install and start immediately:
+     .\scripts\Install.ps1 -StartNow
+
+   Or install only (starts automatically at next boot):
+     .\scripts\Install.ps1
+
+Install.ps1 first checks required software/components, then reads
+TargetUsername and paths from config\config.json.
+If any check fails (or TargetUsername is empty), install stops with an error.
+
+Prerequisite checks include:
+  - Windows 10/11
+  - Administrator elevation
+  - PowerShell 5.1+ and Windows PowerShell (powershell.exe)
+  - .NET ACL APIs
+  - wtsapi32.dll (session lock detection)
+  - ScheduledTasks module and required cmdlets
+  - Project files present
+  - TargetUsername set and account exists (local or domain)
+  - Program Files write access
+  - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
+
+The startup task runs powershell.exe with -WindowStyle Hidden.
+
+
+What the installer does
+-----------------------
+1. Reads settings from the template config\config.json in this project.
+2. Writes the runtime config to the Administrator profile:
+     C:\Users\Administrator\LoginTimeLogger\config.json
+   ACLs: Administrators + SYSTEM full control; target user Deny.
+3. Creates the log directory under the Administrator profile with the same ACLs:
+     C:\Users\Administrator\LoginTimeLogs
+4. Copies monitor scripts (not the config) into:
+     C:\Program Files\LoginTimeLogger
+5. Registers scheduled task "LoginTimeLogger" pointing at the Administrator
+   config path:
+     - Trigger: At system startup
+     - Principal: NT AUTHORITY\SYSTEM
+     - Run level: Highest
+
+
+Verify installation
+-------------------
+Check the task and today's totals (Administrator PowerShell):
+  .\scripts\Status.ps1
+
+Test session / lock detection for the configured user:
+  .\scripts\Test-Session.ps1
+
+Calibrate lock/unlock detection (interactive; uses Win+L):
+  .\scripts\Test-LockCycle.ps1
+  Uses the current Windows user ($env:USERNAME) by default.
+  Optional: .\scripts\Test-LockCycle.ps1 -TargetUsername someoneelse
+  Does not use Administrator files.
+  Starts scripts\LockCycleWatcher.ps1 (hidden STA); events go to:
+    %TEMP%\LockCycle-<username>\session-switch.log
+  1) Script confirms the current user is unlocked
+  2) Press Win+L, then unlock as that user
+  3) Return to the window and press Enter
+  4) Script checks the TEMP event file for SessionLock + SessionUnlock
+  (Same-session polling cannot observe Win+L; the process freezes.)
+
+Optional: open Task Scheduler and confirm task "LoginTimeLogger" exists
+and is Ready/Running.
+
+
+View logs
+---------
+As Administrator, open the LogDirectory from config (default):
+  C:\Users\Administrator\LoginTimeLogs
+
+Files:
+  unlocked-time-YYYY-MM-DD.log  - daily event log
+  unlocked-time-summary.csv     - completed-day totals
+  state.json                    - current-day running total
+  service.log                   - diagnostics
+
+
+Change the monitored user later
+-------------------------------
+1. Edit TargetUsername in this project's config\config.json
+2. Re-run:
+     .\scripts\Install.ps1 -StartNow
+   This refreshes C:\Users\Administrator\LoginTimeLogger\config.json
+
+Or edit the runtime file directly as Administrator:
+  C:\Users\Administrator\LoginTimeLogger\config.json
+then restart the task:
+  Restart-ScheduledTask -TaskName LoginTimeLogger
+  (or Stop then Start the task)
+
+
+Uninstall
+---------
+In an Administrator PowerShell from this project folder:
+
+  Set-ExecutionPolicy -Scope Process Bypass
+  .\scripts\Uninstall.ps1
+
+To also delete log files:
+  .\scripts\Uninstall.ps1 -RemoveLogs
+
+If you used a custom AdministratorProfile in config.json, pass the same path:
+  .\scripts\Uninstall.ps1 -AdministratorProfile "C:\Users\Admin" -RemoveLogs
+
+
+Troubleshooting
+---------------
+- Prerequisite check failed:
+  Read the [FAIL] lines from Install.ps1, fix each item, then retry.
+
+- Any script error:
+  Failures print a detailed ERROR DETAILS block to the screen and append
+  the same text to a separate Administrator error log:
+    C:\Users\Administrator\LoginTimeLogger\errors.log
+  Monitor operational messages also go to LoginTimeLogs\service.log.
+  If the Administrator path is not writable, a TEMP fallback is used:
+    %TEMP%\LoginTimeLogger\errors.log
+
+- Install says TargetUsername is empty:
+  Edit config\config.json and set the Windows logon name, then retry.
+
+- Account was not found:
+  Use local SAM, DOMAIN\user, or user@upn.domain — not the display name.
+
+- Lock-cycle test fails on Phase 2 (never sees lock):
+  Re-run .\scripts\Test-Session.ps1 while locked (from another session
+  if needed). Confirm SessionFlags interpretation on this host.
+
+- Task not running:
+    Start-ScheduledTask -TaskName LoginTimeLogger
+  or reboot.
+
+- Wrong user measured:
+  Fix TargetUsername in config and re-run Install.ps1 -StartNow.
+
+- Log folder missing / access denied for Administrator:
+  Confirm AdministratorProfile in config.json points at a real profile directory.
+
+- Monitored user can still see logs:
+  Re-run Install.ps1 so ACLs are reapplied; confirm you are checking
+  the LoginTimeLogs folder under the Administrator profile.

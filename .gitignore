@@ -1,0 +1,17 @@
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local test / temp artifacts
+scripts/_*.ps1
+*.log
+*.bak
+
+# Do not commit machine-specific resolved runtime copies if placed here by mistake
+**/LoginTimeLogs/
+**/LoginTimeLogger/config.json
