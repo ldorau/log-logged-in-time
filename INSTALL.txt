@@ -155,6 +155,8 @@ Verify installation
 -------------------
 Check the task, monitor process/mutex, and today's totals (Administrator PowerShell):
   .\scripts\Status.ps1
+  LastResult 267009 (0x41301) while State=Running means the monitor is still running
+  (normal). Status treats that as healthy and does not treat it as a failure.
 
 Test session / lock detection for the configured user:
   .\scripts\Test-Session.ps1

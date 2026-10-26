@@ -426,11 +426,33 @@ function Write-DayRollover {
 # --- single-instance guard (survives scheduled-task restart after updates) ---
 $script:InstanceMutex = $null
 try {
-    $script:InstanceMutex = New-Object System.Threading.Mutex($false, 'Global\LoginTimeLogger.Monitor')
+    $createdNew = $false
+    $script:InstanceMutex = New-Object System.Threading.Mutex(
+        $false,
+        'Global\LoginTimeLogger.Monitor',
+        [ref]$createdNew)
     # Wait briefly so a restarting instance can exit and release the mutex.
     if (-not $script:InstanceMutex.WaitOne(15000, $false)) {
         Write-Host 'Another LoginTimeLogger instance is already running; exiting.'
         exit 0
+    }
+    # Allow Administrators + SYSTEM to open the Global mutex so Status.ps1 (elevated)
+    # can probe it. Default SYSTEM-created DACLs often deny other admins (access denied).
+    # Refresh after acquire so a task restart repairs an older restrictive ACL.
+    try {
+        if ($script:InstanceMutex.PSObject.Methods.Name -contains 'SetAccessControl') {
+            $mutexSecurity = New-Object System.Security.AccessControl.MutexSecurity
+            $mutexRights = [System.Security.AccessControl.MutexRights]::FullControl
+            foreach ($sidValue in @('S-1-5-18', 'S-1-5-32-544')) {
+                $sid = New-Object System.Security.Principal.SecurityIdentifier($sidValue)
+                $mutexSecurity.AddAccessRule((New-Object System.Security.AccessControl.MutexAccessRule(
+                            $sid, $mutexRights, [System.Security.AccessControl.AccessControlType]::Allow)))
+            }
+            $script:InstanceMutex.SetAccessControl($mutexSecurity)
+        }
+    }
+    catch {
+        Write-Host ("WARNING: could not set monitor mutex ACL (Status may not see it): {0}" -f $_.Exception.Message)
     }
 }
 catch {
