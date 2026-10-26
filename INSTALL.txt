@@ -158,6 +158,12 @@ Check the task, monitor process/mutex, and today's totals (Administrator PowerSh
   LastResult 267009 (0x41301) while State=Running means the monitor is still running
   (normal). Status treats that as healthy and does not treat it as a failure.
 
+Estimate locked/away time from existing daily logs (transition timestamps):
+  .\scripts\Get-LockedTime.ps1
+  .\scripts\Get-LockedTime.ps1 -Date 2026-10-26
+  .\scripts\Get-LockedTime.ps1 -AllDays
+  LOCKED_OR_AWAY means not unlocked-active (screen lock or away).
+
 Test session / lock detection for the configured user:
   .\scripts\Test-Session.ps1
   Tip: lock the target desktop (Win+L) from another session and re-run to
@@ -188,6 +194,7 @@ As Administrator, open the LogDirectory from config (example):
 Files:
   unlocked-time-YYYY-MM-DD.log  - daily event log
   unlocked-time-summary.csv     - completed-day totals
+  Use .\scripts\Get-LockedTime.ps1 to estimate locked/away time from log transitions.
   state.json                    - current-day running total
   service.log                   - diagnostics
 

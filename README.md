@@ -104,6 +104,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 .\scripts\Status.ps1
+.\scripts\Get-LockedTime.ps1          # estimate locked/away time from log transitions
+.\scripts\Get-LockedTime.ps1 -AllDays
 ```
 
 **Unlocked-time logs** (when the target user was logged in with the screen unlocked):

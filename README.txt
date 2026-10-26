@@ -93,6 +93,7 @@ Project layout
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total
+  scripts\Get-LockedTime.ps1  - estimate locked/away time from daily logs
   scripts\Test-Session.ps1    - list sessions / test unlock detection
   scripts\Test-LockCycle.ps1  - lock/unlock calibration for current user
   src\Common-Error.ps1        - screen + Administrator errors.log helper
