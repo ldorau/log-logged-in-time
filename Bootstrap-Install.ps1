@@ -166,6 +166,33 @@ function Test-TrustedRepoUrl {
     return (@('/ldorau/log-logged-in-time', '/ldorau/log-logged-in-time.git') -contains $path)
 }
 
+function Invoke-Git {
+    <#
+    .SYNOPSIS
+      Runs git without treating stderr progress ("From https://...") as a terminating error
+      under $ErrorActionPreference = 'Stop'.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $GitExe @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = $output
+    }
+}
+
 function Set-BootstrapConfigValues {
     param(
         [Parameter(Mandatory)][string]$ConfigPath,
@@ -228,21 +255,21 @@ try {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
         }
         Write-Host ("Cloning {0} (branch {1})..." -f $RepoUrl, $Branch)
-        $cloneOut = & $gitExe clone --branch $Branch --single-branch $RepoUrl $ClonePath 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw ("git clone failed (exit {0}): {1}" -f $LASTEXITCODE, ($cloneOut | Out-String))
+        $clone = Invoke-Git -GitExe $gitExe -Arguments @('clone', '--branch', $Branch, '--single-branch', $RepoUrl, $ClonePath)
+        if ($clone.ExitCode -ne 0) {
+            throw ("git clone failed (exit {0}): {1}" -f $clone.ExitCode, ($clone.Output | Out-String))
         }
     }
     else {
         Write-Host ("Repository already present at {0}; fetching latest {1}..." -f $ClonePath, $Branch)
-        $fetchOut = & $gitExe -C $ClonePath fetch origin $Branch 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw ("git fetch failed (exit {0}): {1}" -f $LASTEXITCODE, ($fetchOut | Out-String))
+        $fetch = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'fetch', 'origin', $Branch)
+        if ($fetch.ExitCode -ne 0) {
+            throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, ($fetch.Output | Out-String))
         }
-        $null = & $gitExe -C $ClonePath checkout $Branch 2>&1
-        $pullOut = & $gitExe -C $ClonePath pull --ff-only origin $Branch 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host ("Warning: git pull --ff-only failed; continuing with local tree. Detail: {0}" -f ($pullOut | Out-String)) -ForegroundColor Yellow
+        $null = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'checkout', $Branch)
+        $pull = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'pull', '--ff-only', 'origin', $Branch)
+        if ($pull.ExitCode -ne 0) {
+            Write-Host ("Warning: git pull --ff-only failed; continuing with local tree. Detail: {0}" -f ($pull.Output | Out-String)) -ForegroundColor Yellow
         }
     }
 
