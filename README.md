@@ -98,6 +98,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```powershell
 .\scripts\Test-Session.ps1
 .\scripts\Test-LockCycle.ps1   # interactive for current user; no Admin files
+.\scripts\Test-WtsLockProbe.ps1  # one-account WTS probe (Win+L; no second session)
 ```
 
 ## Status / logs

@@ -174,6 +174,12 @@ Calibrate lock/unlock detection (interactive; uses Win+L):
   Uses the current Windows user ($env:USERNAME) by default.
   Optional: .\scripts\Test-LockCycle.ps1 -TargetUsername someoneelse
   Does not use Administrator files.
+
+One-account WTS lock probe (same SessionQuery path as the monitor):
+  .\scripts\Test-WtsLockProbe.ps1
+  Starts a background probe, then Win+L for 15-30+ seconds, unlock, Enter.
+  Passes if any sample shows unlocked=False. No second account needed.
+  Worker: scripts\WtsLockProbe.ps1 (TEMP log under %TEMP%\WtsLockProbe-*).
   Starts scripts\LockCycleWatcher.ps1 (hidden STA); events go to:
     %TEMP%\LockCycle-<username>\session-switch.log
   1) Script confirms the current user is unlocked

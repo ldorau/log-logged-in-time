@@ -96,6 +96,8 @@ Project layout
   scripts\Get-LockedTime.ps1  - estimate locked/away time from daily logs
   scripts\Test-Session.ps1    - list sessions / test unlock detection
   scripts\Test-LockCycle.ps1  - lock/unlock calibration for current user
+  scripts\Test-WtsLockProbe.ps1 - one-account WTS lock probe (Win+L)
+  scripts\WtsLockProbe.ps1    - background worker for Test-WtsLockProbe
   src\Common-Error.ps1        - screen + Administrator errors.log helper
   INSTALL.txt                 - installation guide
   README.txt                  - this file
