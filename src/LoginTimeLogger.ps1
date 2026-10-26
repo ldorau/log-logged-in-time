@@ -190,7 +190,13 @@ LogDirectory in file: $($raw.LogDirectory)
         $scpKnownHostsFile = Join-Path $adminHome 'LoginTimeLogger\ssh\known_hosts'
     }
 
+    $adminUsername = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdminUsername)) {
+        $adminUsername = [string]$raw.AdminUsername
+    }
+
     [pscustomobject]@{
+        AdminUsername        = $adminUsername
         TargetUsername       = [string]$raw.TargetUsername
         AdministratorProfile = $adminHome
         LogDirectory         = $logDirectory
@@ -210,39 +216,12 @@ LogDirectory in file: $($raw.LogDirectory)
     }
 }
 
-function Resolve-LocalAccountSid {
-    param([Parameter(Mandatory)][string]$UserName)
-
-    $nameCandidates = New-Object System.Collections.Generic.List[string]
-    $trimmed = $UserName.Trim()
-    $nameCandidates.Add($trimmed)
-    $leaf = $trimmed
-    if ($trimmed -match '^(?<domain>[^\\]+)\\(?<user>.+)$') { $leaf = $Matches['user'] }
-    elseif ($trimmed -match '^(?<user>[^@]+)@') { $leaf = $Matches['user'] }
-    if ($leaf -ne $trimmed) { $nameCandidates.Add($leaf) }
-    if ($leaf -notmatch '[\\@]') {
-        # Prefer concatenation over -f inside .Add(...): PowerShell parses
-        # Add(fmt -f a, b) as Add((fmt -f a), b), which breaks {1} placeholders.
-        $nameCandidates.Add('.\' + $leaf)
-        if ($env:COMPUTERNAME) { $nameCandidates.Add($env:COMPUTERNAME + '\' + $leaf) }
-        if ($env:USERDOMAIN) { $nameCandidates.Add($env:USERDOMAIN + '\' + $leaf) }
-    }
-
-    foreach ($name in $nameCandidates) {
-        try {
-            return (New-Object System.Security.Principal.NTAccount($name)).Translate(
-                [System.Security.Principal.SecurityIdentifier])
-        }
-        catch { }
-    }
-    return $null
-}
-
 function Initialize-SecureLogDirectory {
     param(
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$DeniedUsername,
-        [Parameter(Mandatory)][string]$AdministratorProfile
+        [Parameter(Mandatory)][string]$AdministratorProfile,
+        [string]$AdminUsername = ''
     )
 
     try {
@@ -257,14 +236,20 @@ function Initialize-SecureLogDirectory {
             $null = $acl.RemoveAccessRule($rule)
         }
 
-        # Allow the AdministratorProfile account (e.g. AdminName) + SYSTEM.
-        # Do not require BUILTIN\Administrators.
+        # Allow the admin account + SYSTEM. Prefer AdminUsername (DOMAIN\user / UPN);
+        # fall back to ProfileList match on AdministratorProfile (works under SYSTEM).
         $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-        $adminLeaf = Split-Path -Leaf ($AdministratorProfile.Trim().TrimEnd('\', '/'))
-        $allowedAdminSid = Resolve-LocalAccountSid -UserName $adminLeaf
+        $allowedAdminSid = $null
+        if (-not [string]::IsNullOrWhiteSpace($AdminUsername)) {
+            $allowedAdminSid = Resolve-WindowsAccountSid -UserName $AdminUsername -ProfilePath $AdministratorProfile
+        }
         if (-not $allowedAdminSid) {
-            throw ("Could not resolve administrator account '{0}' from AdministratorProfile '{1}' for ACL Allow." -f `
-                    $adminLeaf, $AdministratorProfile)
+            $allowedAdminSid = Resolve-WindowsAccountSid -UserName $AdministratorProfile -ProfilePath $AdministratorProfile
+        }
+        if (-not $allowedAdminSid) {
+            $adminLeaf = Split-Path -Leaf (Get-NormalizedProfilePath -Path $AdministratorProfile)
+            throw ("Could not resolve administrator account for ACL Allow. AdminUsername='{0}'; profile='{1}'; leaf='{2}'. Tried NTAccount and ProfileList." -f `
+                    $AdminUsername, $AdministratorProfile, $adminLeaf)
         }
 
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
@@ -272,7 +257,7 @@ function Initialize-SecureLogDirectory {
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                     $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
 
-        $deniedSid = Resolve-LocalAccountSid -UserName $DeniedUsername
+        $deniedSid = Resolve-WindowsAccountSid -UserName $DeniedUsername -ProfilePath $AdministratorProfile
         if ($deniedSid) {
             if ($deniedSid.Value -eq $allowedAdminSid.Value) {
                 # Allowed for testing when admin and measured user are the same account.
@@ -472,7 +457,8 @@ try {
 
     Initialize-SecureLogDirectory -Directory $config.LogDirectory `
         -DeniedUsername $config.TargetUsername `
-        -AdministratorProfile $config.AdministratorProfile
+        -AdministratorProfile $config.AdministratorProfile `
+        -AdminUsername $config.AdminUsername
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory

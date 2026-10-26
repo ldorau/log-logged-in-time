@@ -18,6 +18,7 @@ AdminUsername and TargetUsername are passed on the command line (required).
 Optional settings remain in config\config.json (poll interval, SCP, updates):
 
   {
+    "AdminUsername": "",
     "TargetUsername": "",
     "AdministratorProfile": "",
     "LogDirectory": "",
@@ -248,7 +249,10 @@ Troubleshooting
   Re-run Install.ps1 with the correct -TargetUsername and -StartNow.
 
 - Log folder missing / access denied for admin:
-  Confirm -AdminUsername matches a real local profile under C:\Users\.
+  Confirm -AdminUsername matches a real account (prefer DOMAIN\user or UPN) with a
+  profile under C:\Users\. Install stores AdminUsername in the runtime config and
+  resolves ACLs via NTAccount and ProfileList (works for Entra/Microsoft accounts
+  when the SYSTEM task runs).
 
 - Monitored user can still see logs:
   Re-run Install.ps1 so ACLs are reapplied; confirm you are checking

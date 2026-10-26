@@ -75,72 +75,32 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-AccountSamLeaf {
-    param([Parameter(Mandatory)][string]$UserName)
-
-    $sam = $UserName.Trim()
-    if ($sam -match '^(?<domain>[^\\]+)\\(?<user>.+)$') {
-        return $Matches['user']
-    }
-    if ($sam -match '^(?<user>[^@]+)@') {
-        return $Matches['user']
-    }
-    return $sam
-}
-
 function Resolve-AccountSid {
     <#
     .SYNOPSIS
-      Resolves TargetUsername to a SecurityIdentifier for ACL Deny ACEs.
-      Accepts: user | DOMAIN\user | user@upn.domain | .\user
+      Resolves an account name or profile path to a SecurityIdentifier for ACLs.
+      Accepts: user | DOMAIN\user | user@upn.domain | .\user | C:\Users\...
     #>
-    param([Parameter(Mandatory)][string]$UserName)
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [string]$ProfilePath = ''
+    )
 
-    $candidates = New-Object System.Collections.Generic.List[string]
-    $trimmed = $UserName.Trim()
-    $candidates.Add($trimmed)
-
-    $sam = Get-AccountSamLeaf -UserName $trimmed
-    if ($sam -ne $trimmed) {
-        $candidates.Add($sam)
-    }
-    if ($sam -notmatch '[\\@]') {
-        # Prefer concatenation over -f inside .Add(...): PowerShell parses
-        # Add(fmt -f a, b) as Add((fmt -f a), b), which breaks {1} placeholders.
-        $candidates.Add('.\' + $sam)
-        if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
-            $candidates.Add($env:COMPUTERNAME + '\' + $sam)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
-            $candidates.Add($env:USERDOMAIN + '\' + $sam)
-        }
-    }
-
-    foreach ($name in $candidates) {
-        try {
-            $ntAccount = New-Object System.Security.Principal.NTAccount($name)
-            $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
-            Write-Verbose -Message ("Resolved '{0}' (via '{1}') -> SID {2}" -f $UserName, $name, $sid.Value)
-            return $sid
-        }
-        catch {
-            Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
-                    "NTAccount.Translate failed for '{0}'" -f $name))
-        }
-    }
-
-    return $null
+    return (Resolve-WindowsAccountSid -UserName $UserName -ProfilePath $ProfilePath)
 }
 
 function Test-AccountExists {
     <#
     .SYNOPSIS
-      Returns true if TargetUsername resolves to a Windows account SID (ACL-usable).
-      Accepts: user | DOMAIN\user | user@upn.domain
+      Returns true if the account resolves to a Windows account SID (ACL-usable).
+      Accepts: user | DOMAIN\user | user@upn.domain | profile path
     #>
-    param([Parameter(Mandatory)][string]$UserName)
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [string]$ProfilePath = ''
+    )
 
-    $sid = Resolve-AccountSid -UserName $UserName
+    $sid = Resolve-AccountSid -UserName $UserName -ProfilePath $ProfilePath
     return ($null -ne $sid)
 }
 
@@ -164,7 +124,7 @@ function Get-AccountNameFromProfilePath {
     #>
     param([Parameter(Mandatory)][string]$ProfilePath)
 
-    $normalized = $ProfilePath.Trim().TrimEnd('\', '/')
+    $normalized = Get-NormalizedProfilePath -Path $ProfilePath
     if ([string]::IsNullOrWhiteSpace($normalized)) {
         return $null
     }
@@ -174,11 +134,25 @@ function Get-AccountNameFromProfilePath {
 function Get-ProfilePathForAccount {
     <#
     .SYNOPSIS
-      Builds C:\Users\<sam> for an account name (local SAM, DOMAIN\user, or UPN).
+      Resolves the local profile folder for an account name, UPN, DOMAIN\user, or path.
+      Prefers ProfileList when the account SID is known; otherwise C:\Users\<sam>.
     #>
     param([Parameter(Mandatory)][string]$AccountName)
 
-    $leaf = Get-AccountSamLeaf -UserName $AccountName
+    $trimmed = $AccountName.Trim()
+    if (Test-LooksLikeFilePath -Value $trimmed) {
+        return (Get-NormalizedProfilePath -Path $trimmed)
+    }
+
+    $sid = Resolve-AccountSid -UserName $trimmed
+    if ($sid) {
+        $fromReg = Get-ProfilePathForSid -Sid $sid
+        if (-not [string]::IsNullOrWhiteSpace($fromReg)) {
+            return $fromReg
+        }
+    }
+
+    $leaf = Get-AccountSamLeaf -UserName $trimmed
     if ([string]::IsNullOrWhiteSpace($leaf)) {
         throw ("Could not derive profile folder name from account '{0}'." -f $AccountName)
     }
@@ -190,13 +164,18 @@ function Resolve-AdministratorAccountSid {
     .SYNOPSIS
       Resolves the admin account that owns AdministratorProfile (not BUILTIN\Administrators).
     #>
-    param([Parameter(Mandatory)][string]$AdministratorProfile)
+    param(
+        [Parameter(Mandatory)][string]$AdministratorProfile,
+        [string]$AdminUsername = ''
+    )
 
-    $accountName = Get-AccountNameFromProfilePath -ProfilePath $AdministratorProfile
-    if ([string]::IsNullOrWhiteSpace($accountName)) {
-        return $null
+    if (-not [string]::IsNullOrWhiteSpace($AdminUsername)) {
+        $sid = Resolve-AccountSid -UserName $AdminUsername -ProfilePath $AdministratorProfile
+        if ($sid) {
+            return $sid
+        }
     }
-    return (Resolve-AccountSid -UserName $accountName)
+    return (Resolve-AccountSid -UserName $AdministratorProfile -ProfilePath $AdministratorProfile)
 }
 
 function Find-GitExecutable {
@@ -620,10 +599,12 @@ function Test-InstallPrerequisites {
     }
 
     if ($adminOk) {
-        $adminExists = Test-AccountExists -UserName $AdminUsername
-        Write-CheckResult -Name ("Admin account exists '{0}'" -f $AdminUsername) -Ok $adminExists
+        $adminExists = Test-AccountExists -UserName $AdminUsername -ProfilePath $administratorProfile
+        Write-CheckResult -Name ("Admin account exists '{0}'" -f $AdminUsername) -Ok $adminExists -Detail $(
+            if ($adminExists) { $administratorProfile } else { 'NTAccount/ProfileList failed' }
+        )
         if (-not $adminExists) {
-            $failures.Add("AdminUsername '$AdminUsername' was not found. Use local SAM, DOMAIN\user, or user@upn.domain.")
+            $failures.Add("AdminUsername '$AdminUsername' was not found. Use DOMAIN\user, UPN, local SAM, or a profile path under Users\.")
             $configOk = $false
         }
     }
@@ -731,10 +712,11 @@ function Test-InstallPrerequisites {
     }
 
     if ($targetOk) {
-        $userExists = Test-AccountExists -UserName $TargetUsername
+        $targetProfileGuess = Join-Path $env:SystemDrive ('Users\{0}' -f (Get-AccountSamLeaf -UserName $TargetUsername))
+        $userExists = Test-AccountExists -UserName $TargetUsername -ProfilePath $targetProfileGuess
         Write-CheckResult -Name ("Measured account exists '{0}'" -f $TargetUsername) -Ok $userExists
         if (-not $userExists) {
-            $failures.Add("TargetUsername '$TargetUsername' was not found. Use local SAM, DOMAIN\user, or user@upn.domain.")
+            $failures.Add("TargetUsername '$TargetUsername' was not found. Use DOMAIN\user, UPN, local SAM, or ensure the profile exists under Users\.")
             $configOk = $false
         }
     }
@@ -833,7 +815,8 @@ function Set-ProtectedDirectory {
     param(
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$DeniedUsername,
-        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$AllowedAdminSid
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$AllowedAdminSid,
+        [string]$AdministratorProfile = ''
     )
 
     if (-not (Test-Path -LiteralPath $Directory)) {
@@ -862,7 +845,7 @@ function Set-ProtectedDirectory {
                 -PropagationFlags None `
                 -AccessControlType Allow))
 
-    $deniedSid = Resolve-AccountSid -UserName $DeniedUsername
+    $deniedSid = Resolve-AccountSid -UserName $DeniedUsername -ProfilePath $AdministratorProfile
     if ($deniedSid) {
         if ($deniedSid.Value -eq $AllowedAdminSid.Value) {
             # Allowed for testing when AdminUsername == TargetUsername.
@@ -954,14 +937,22 @@ try {
     $targetUsername = [string]$TargetUsername
     $administratorProfile = Get-ProfilePathForAccount -AccountName $AdminUsername
 
-    $adminAccountName = Get-AccountSamLeaf -UserName $AdminUsername
-    $allowedAdminSid = Resolve-AccountSid -UserName $AdminUsername
+    $adminAccountName = if (Test-LooksLikeFilePath -Value $AdminUsername) {
+        Get-AccountNameFromProfilePath -ProfilePath $administratorProfile
+    }
+    else {
+        Get-AccountSamLeaf -UserName $AdminUsername
+    }
+    $allowedAdminSid = Resolve-AdministratorAccountSid `
+        -AdministratorProfile $administratorProfile `
+        -AdminUsername $AdminUsername
     if (-not $allowedAdminSid) {
-        throw ("Could not resolve AdminUsername '{0}' to a SID for ACLs." -f $AdminUsername)
+        throw ("Could not resolve AdminUsername '{0}' (profile '{1}') to a SID for ACLs. Tried NTAccount and ProfileList." -f `
+                $AdminUsername, $administratorProfile)
     }
     Write-Host ("Administrator account for ACLs: {0} (profile {1}; SID {2})" -f `
             $adminAccountName, $administratorProfile, $allowedAdminSid.Value)
-    $targetSid = Resolve-AccountSid -UserName $targetUsername
+    $targetSid = Resolve-AccountSid -UserName $targetUsername -ProfilePath $administratorProfile
     if ($targetSid -and ($targetSid.Value -eq $allowedAdminSid.Value)) {
         Write-Host 'Note: AdminUsername and TargetUsername resolve to the same account (supported for testing).' -ForegroundColor Yellow
     }
@@ -1043,6 +1034,7 @@ SystemDrive: $env:SystemDrive
     }
 
     $config = [ordered]@{
+        AdminUsername        = [string]$AdminUsername
         TargetUsername       = $targetUsername
         AdministratorProfile = $administratorProfile
         LogDirectory         = $logDirectory
@@ -1063,9 +1055,11 @@ SystemDrive: $env:SystemDrive
 
     # Write runtime config only; leave the project template config.json untouched.
     try {
-        Set-ProtectedDirectory -Directory $adminAppDirectory -DeniedUsername $targetUsername -AllowedAdminSid $allowedAdminSid
+        Set-ProtectedDirectory -Directory $adminAppDirectory -DeniedUsername $targetUsername `
+            -AllowedAdminSid $allowedAdminSid -AdministratorProfile $administratorProfile
         $configJson | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
-        Set-ProtectedDirectory -Directory $logDirectory -DeniedUsername $targetUsername -AllowedAdminSid $allowedAdminSid
+        Set-ProtectedDirectory -Directory $logDirectory -DeniedUsername $targetUsername `
+            -AllowedAdminSid $allowedAdminSid -AdministratorProfile $administratorProfile
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (

@@ -25,6 +25,7 @@ Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run
 
 ```json
 {
+  "AdminUsername": "",
   "TargetUsername": "",
   "AdministratorProfile": "",
   "LogDirectory": "",

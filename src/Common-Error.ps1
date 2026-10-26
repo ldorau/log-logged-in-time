@@ -302,3 +302,155 @@ function New-VerboseException {
     $details = Format-ErrorDetails -ErrorRecord $ErrorRecord -Context $Context
     return (New-Object System.Exception(("{0}`r`n{1}" -f $Message, $details), $ErrorRecord.Exception))
 }
+
+function Get-NormalizedProfilePath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim()).TrimEnd('\', '/')
+    return $expanded
+}
+
+function Test-LooksLikeFilePath {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $v = $Value.Trim()
+    return ($v -match '^[A-Za-z]:\\' -or $v.StartsWith('\\'))
+}
+
+function Get-AccountSamLeaf {
+    param([Parameter(Mandatory)][string]$UserName)
+
+    $sam = $UserName.Trim()
+    if ($sam -match '^(?<domain>[^\\]+)\\(?<user>.+)$') {
+        return $Matches['user']
+    }
+    if ($sam -match '^(?<user>[^@]+)@') {
+        return $Matches['user']
+    }
+    return $sam
+}
+
+function Resolve-SidFromProfilePath {
+    <#
+    .SYNOPSIS
+      Finds the account SID whose ProfileList ProfileImagePath matches the given profile folder.
+      Works under SYSTEM when NTAccount name translation fails (Microsoft / Entra accounts).
+    #>
+    param([Parameter(Mandatory)][string]$ProfilePath)
+
+    $want = Get-NormalizedProfilePath -Path $ProfilePath
+    if ([string]::IsNullOrWhiteSpace($want)) {
+        return $null
+    }
+
+    $profileList = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    if (-not (Test-Path -LiteralPath $profileList)) {
+        return $null
+    }
+
+    foreach ($key in @(Get-ChildItem -LiteralPath $profileList -ErrorAction SilentlyContinue)) {
+        try {
+            $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+            $image = [string]$props.ProfileImagePath
+            if ([string]::IsNullOrWhiteSpace($image)) {
+                continue
+            }
+            $have = Get-NormalizedProfilePath -Path $image
+            if ([string]::Equals($have, $want, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return (New-Object System.Security.Principal.SecurityIdentifier($key.PSChildName))
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Get-ProfilePathForSid {
+    param([Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$Sid)
+
+    $keyPath = Join-Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' $Sid.Value
+    if (-not (Test-Path -LiteralPath $keyPath)) {
+        return $null
+    }
+    try {
+        $image = [string](Get-ItemProperty -LiteralPath $keyPath -ErrorAction Stop).ProfileImagePath
+        if ([string]::IsNullOrWhiteSpace($image)) {
+            return $null
+        }
+        return (Get-NormalizedProfilePath -Path $image)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-WindowsAccountSid {
+    <#
+    .SYNOPSIS
+      Resolves a Windows account to a SID for ACLs.
+      Accepts: user | DOMAIN\user | user@upn | .\user | profile path (C:\Users\...).
+      Falls back to ProfileList when NTAccount translation fails.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [string]$ProfilePath = ''
+    )
+
+    $trimmed = $UserName.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $null
+    }
+
+    if (Test-LooksLikeFilePath -Value $trimmed) {
+        $sidFromPath = Resolve-SidFromProfilePath -ProfilePath $trimmed
+        if ($sidFromPath) {
+            return $sidFromPath
+        }
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($trimmed)
+
+    $sam = Get-AccountSamLeaf -UserName $trimmed
+    if ($sam -ne $trimmed -and -not (Test-LooksLikeFilePath -Value $trimmed)) {
+        $candidates.Add($sam)
+    }
+    if ($sam -notmatch '[\\@]' -and -not (Test-LooksLikeFilePath -Value $sam)) {
+        # Prefer concatenation over -f inside .Add(...): PowerShell parses
+        # Add(fmt -f a, b) as Add((fmt -f a), b), which breaks {1} placeholders.
+        $candidates.Add('.\' + $sam)
+        if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+            $candidates.Add($env:COMPUTERNAME + '\' + $sam)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+            $candidates.Add($env:USERDOMAIN + '\' + $sam)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
+            $candidates.Add($env:USERDNSDOMAIN + '\' + $sam)
+        }
+    }
+
+    foreach ($name in $candidates) {
+        try {
+            $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+            return $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+        }
+        catch { }
+    }
+
+    $profileCandidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($ProfilePath)) {
+        $profileCandidates.Add($ProfilePath)
+    }
+    if (-not (Test-LooksLikeFilePath -Value $trimmed) -and -not [string]::IsNullOrWhiteSpace($sam)) {
+        $profileCandidates.Add((Join-Path $env:SystemDrive ('Users\{0}' -f $sam)))
+    }
+    foreach ($p in $profileCandidates) {
+        $sid = Resolve-SidFromProfilePath -ProfilePath $p
+        if ($sid) {
+            return $sid
+        }
+    }
+
+    return $null
+}
