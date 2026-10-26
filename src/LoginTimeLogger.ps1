@@ -14,6 +14,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Initialize before any Write-LoggerEvent call (StrictMode forbids reading unset script vars).
+$script:ServiceLogPath = $null
+$script:InstanceMutex = $null
+
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path (Split-Path -Parent $scriptDir) 'config\config.json'
@@ -38,7 +42,7 @@ function Write-LoggerEvent {
     )
     $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Message
     Write-Output $line
-    if ($script:ServiceLogPath) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:ServiceLogPath)) {
         try {
             Add-Content -LiteralPath $script:ServiceLogPath -Value $line -Encoding UTF8
         }
