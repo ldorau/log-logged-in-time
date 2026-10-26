@@ -8,7 +8,15 @@
 [CmdletBinding()]
 param(
     [string]$TaskName = 'LoginTimeLogger',
-    [string]$AdministratorProfile = (Join-Path $env:SystemDrive 'Users\Administrator'),
+    [string]$AdministratorProfile = $(
+        if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+            ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+            $env:USERPROFILE
+        }
+        else {
+            Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
+        }
+    ),
     [string]$TemplateConfigPath,
     [switch]$RemoveLogs
 )

@@ -8,6 +8,15 @@
 $script:LoginTimeErrorLogPath = $null
 
 function Get-DefaultAdministratorProfile {
+    # Prefer the current interactive/elevated user's profile (e.g. C:\Users\AdminName).
+    # Do not require the built-in Administrator account.
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+        ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+        return $env:USERPROFILE
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERNAME) -and ($env:USERNAME -ne 'SYSTEM')) {
+        return (Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME))
+    }
     return (Join-Path $env:SystemDrive 'Users\Administrator')
 }
 

@@ -54,55 +54,112 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-AccountSamLeaf {
+    param([Parameter(Mandatory)][string]$UserName)
+
+    $sam = $UserName.Trim()
+    if ($sam -match '^(?<domain>[^\\]+)\\(?<user>.+)$') {
+        return $Matches['user']
+    }
+    if ($sam -match '^(?<user>[^@]+)@') {
+        return $Matches['user']
+    }
+    return $sam
+}
+
+function Resolve-AccountSid {
+    <#
+    .SYNOPSIS
+      Resolves TargetUsername to a SecurityIdentifier for ACL Deny ACEs.
+      Accepts: user | DOMAIN\user | user@upn.domain | .\user
+    #>
+    param([Parameter(Mandatory)][string]$UserName)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $trimmed = $UserName.Trim()
+    $candidates.Add($trimmed)
+
+    $sam = Get-AccountSamLeaf -UserName $trimmed
+    if ($sam -ne $trimmed) {
+        $candidates.Add($sam)
+    }
+    if ($sam -notmatch '[\\@]') {
+        $candidates.Add('.\{0}' -f $sam)
+        if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+            $candidates.Add('{0}\{1}' -f $env:COMPUTERNAME, $sam)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+            $candidates.Add('{0}\{1}' -f $env:USERDOMAIN, $sam)
+        }
+    }
+
+    foreach ($name in $candidates) {
+        try {
+            $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+            $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+            Write-Verbose -Message ("Resolved '{0}' (via '{1}') -> SID {2}" -f $UserName, $name, $sid.Value)
+            return $sid
+        }
+        catch {
+            Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
+                    "NTAccount.Translate failed for '{0}'" -f $name))
+        }
+    }
+
+    return $null
+}
+
 function Test-AccountExists {
     <#
     .SYNOPSIS
-      Returns true if TargetUsername resolves to a Windows account (local or domain).
+      Returns true if TargetUsername resolves to a Windows account SID (ACL-usable).
       Accepts: user | DOMAIN\user | user@upn.domain
     #>
     param([Parameter(Mandatory)][string]$UserName)
 
-    try {
-        $ntAccount = New-Object System.Security.Principal.NTAccount($UserName)
-        $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
-        Write-Verbose -Message ("Resolved '{0}' -> SID {1}" -f $UserName, $sid.Value)
-        return $true
-    }
-    catch {
-        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
-                "NTAccount.Translate failed for '{0}'" -f $UserName))
-    }
+    $sid = Resolve-AccountSid -UserName $UserName
+    return ($null -ne $sid)
+}
 
-    # Local SAM fallback when only the short name was supplied.
-    $sam = $UserName
-    if ($sam -match '^(?<domain>[^\\]+)\\(?<user>.+)$') {
-        $sam = $Matches['user']
-    }
-    elseif ($sam -match '^(?<user>[^@]+)@') {
-        $sam = $Matches['user']
-    }
+function New-SidFileSystemAccessRule {
+    param(
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$Sid,
+        [Parameter(Mandatory)][string]$Rights,
+        [Parameter(Mandatory)][string]$InheritanceFlags,
+        [Parameter(Mandatory)][string]$PropagationFlags,
+        [Parameter(Mandatory)][string]$AccessControlType
+    )
 
-    try {
-        if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
-            $null = Get-LocalUser -Name $sam -ErrorAction Stop
-            return $true
-        }
-    }
-    catch {
-        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
-                "Get-LocalUser lookup failed for '{0}'" -f $sam))
-    }
+    return New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $Sid, $Rights, $InheritanceFlags, $PropagationFlags, $AccessControlType)
+}
 
-    try {
-        $account = [ADSI]"WinNT://./$sam,user"
-        $null = $account.Name
-        return $true
+function Get-AccountNameFromProfilePath {
+    <#
+    .SYNOPSIS
+      Derives the Windows account name from a profile path (C:\Users\AdminName -> AdminName).
+    #>
+    param([Parameter(Mandatory)][string]$ProfilePath)
+
+    $normalized = $ProfilePath.Trim().TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $null
     }
-    catch {
-        Write-Verbose -Message (Format-ErrorDetails -ErrorRecord $_ -Context (
-                "ADSI WinNT user lookup failed for '{0}'" -f $sam))
-        return $false
+    return (Split-Path -Leaf $normalized)
+}
+
+function Resolve-AdministratorAccountSid {
+    <#
+    .SYNOPSIS
+      Resolves the admin account that owns AdministratorProfile (not BUILTIN\Administrators).
+    #>
+    param([Parameter(Mandatory)][string]$AdministratorProfile)
+
+    $accountName = Get-AccountNameFromProfilePath -ProfilePath $AdministratorProfile
+    if ([string]::IsNullOrWhiteSpace($accountName)) {
+        return $null
     }
+    return (Resolve-AccountSid -UserName $accountName)
 }
 
 function Find-GitExecutable {
@@ -594,7 +651,13 @@ function Test-InstallPrerequisites {
             $identityPath = [string]$raw.ScpIdentityFile
         }
         else {
-            $adminForKey = Join-Path $env:SystemDrive 'Users\Administrator'
+            $adminForKey = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+                ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+                $env:USERPROFILE
+            }
+            else {
+                Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
+            }
             if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
                 $adminForKey = [string]$raw.AdministratorProfile
             }
@@ -711,29 +774,63 @@ Write-Output ('compiled; sessions=' + `$sessions.Count)
 function Set-ProtectedDirectory {
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$DeniedUsername
+        [Parameter(Mandatory)][string]$DeniedUsername,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$AllowedAdminSid
     )
 
     if (-not (Test-Path -LiteralPath $Directory)) {
         New-Item -ItemType Directory -Path $Directory -Force | Out-Null
     }
 
+    # Allow the configured admin profile account + SYSTEM only.
+    # Do not require BUILTIN\Administrators (missing/unusable on some Home setups).
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+
     $acl = Get-Acl -LiteralPath $Directory
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) {
         $null = $acl.RemoveAccessRule($rule)
     }
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                'BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                'NT AUTHORITY\SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    try {
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                    $DeniedUsername, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+    $acl.AddAccessRule((New-SidFileSystemAccessRule `
+                -Sid $AllowedAdminSid `
+                -Rights FullControl `
+                -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                -PropagationFlags None `
+                -AccessControlType Allow))
+    $acl.AddAccessRule((New-SidFileSystemAccessRule `
+                -Sid $sidSystem `
+                -Rights FullControl `
+                -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                -PropagationFlags None `
+                -AccessControlType Allow))
+
+    $deniedSid = Resolve-AccountSid -UserName $DeniedUsername
+    if ($deniedSid) {
+        if ($deniedSid.Value -eq $AllowedAdminSid.Value) {
+            $null = Write-ErrorMessage -Level WARN -Source 'Install' -Message (
+                "TargetUsername '{0}' is the same account as AdministratorProfile; skipping Deny ACE on '{1}'." -f `
+                    $DeniedUsername, $Directory)
+        }
+        else {
+            try {
+                $acl.AddAccessRule((New-SidFileSystemAccessRule `
+                            -Sid $deniedSid `
+                            -Rights FullControl `
+                            -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                            -PropagationFlags None `
+                            -AccessControlType Deny))
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Install' -Context (
+                    "Could not add Deny ACE; user='{0}'; sid='{1}'; directory='{2}'" -f `
+                        $DeniedUsername, $deniedSid.Value, $Directory)
+            }
+        }
     }
-    catch {
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Install' -Context (
-            "Could not add Deny ACE; user='{0}'; directory='{1}'" -f $DeniedUsername, $Directory)
+    else {
+        $null = Write-ErrorMessage -Level WARN -Source 'Install' -Message (
+            "Could not resolve '{0}' to a SID for Deny ACE on '{1}'. Directory is still admin-profile + SYSTEM only." -f `
+                $DeniedUsername, $Directory)
     }
 
     try {
@@ -772,10 +869,26 @@ try {
 
     $targetUsername = [string]$raw.TargetUsername
 
+    # Prefer the elevating admin's profile (e.g. C:\Users\AdminName). Do not require
+    # the built-in Administrator account or BUILTIN\Administrators.
     $administratorProfile = [string]$raw.AdministratorProfile
     if ([string]::IsNullOrWhiteSpace($administratorProfile)) {
-        $administratorProfile = Join-Path $env:SystemDrive 'Users\Administrator'
+        if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+            ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+            $administratorProfile = $env:USERPROFILE
+        }
+        else {
+            $administratorProfile = Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
+        }
     }
+
+    $adminAccountName = Get-AccountNameFromProfilePath -ProfilePath $administratorProfile
+    $allowedAdminSid = Resolve-AdministratorAccountSid -AdministratorProfile $administratorProfile
+    if (-not $allowedAdminSid) {
+        throw ("Could not resolve administrator account from AdministratorProfile '{0}' (account name '{1}'). Set AdministratorProfile to a real user profile such as C:\Users\AdminName." -f `
+                $administratorProfile, $adminAccountName)
+    }
+    Write-Host ("Administrator account for ACLs: {0} (SID {1})" -f $adminAccountName, $allowedAdminSid.Value)
 
     $pollSeconds = 5
     if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
@@ -874,9 +987,9 @@ SystemDrive: $env:SystemDrive
 
     # Write runtime config only; leave the project template config.json untouched.
     try {
-        Set-ProtectedDirectory -Directory $adminAppDirectory -DeniedUsername $targetUsername
+        Set-ProtectedDirectory -Directory $adminAppDirectory -DeniedUsername $targetUsername -AllowedAdminSid $allowedAdminSid
         $configJson | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
-        Set-ProtectedDirectory -Directory $logDirectory -DeniedUsername $targetUsername
+        Set-ProtectedDirectory -Directory $logDirectory -DeniedUsername $targetUsername -AllowedAdminSid $allowedAdminSid
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
@@ -925,12 +1038,26 @@ SystemDrive: $env:SystemDrive
         foreach ($rule in @($installedAcl.Access)) {
             $null = $installedAcl.RemoveAccessRule($rule)
         }
-        $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                    'BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-        $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                    'NT AUTHORITY\SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-        $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                    'BUILTIN\Users', 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $allowedAdminSid `
+                    -Rights FullControl `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
+        $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $sidSystem `
+                    -Rights FullControl `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
+        $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $sidUsers `
+                    -Rights ReadAndExecute `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
         Set-Acl -LiteralPath $installRoot -AclObject $installedAcl
     }
     catch {

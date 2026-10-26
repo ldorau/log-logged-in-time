@@ -1,6 +1,6 @@
 {
   "TargetUsername": "",
-  "AdministratorProfile": "C:\\Users\\Administrator",
+  "AdministratorProfile": "",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
   "UpdateEnabled": false,

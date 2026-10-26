@@ -6,10 +6,11 @@ Prerequisites
 1. Sign in with an account that has Administrator rights.
 2. Know the Windows logon name of the account to measure (SAM account name,
    not the display name).
-3. Confirm the Administrator profile folder exists, usually:
-     C:\Users\Administrator
-   If it does not, set AdministratorProfile in config\config.json to a real
-   Administrator profile path.
+3. Set AdministratorProfile in config\config.json to the admin account that
+   installs and manages the monitor (any elevated user profile), for example:
+     C:\Users\AdminName
+   Leave it empty to use the profile of the account that runs Install.ps1.
+   The built-in Administrator account / BUILTIN\Administrators group is not required.
 
 
 Step 1 - Set the target username in config
@@ -18,7 +19,7 @@ Edit config\config.json and set TargetUsername to the account to measure:
 
   {
     "TargetUsername": "jsmith",
-    "AdministratorProfile": "C:\\Users\\Administrator",
+    "AdministratorProfile": "C:\\Users\\AdminName",
     "LogDirectory": "",
     "PollIntervalSeconds": 5,
     "UpdateEnabled": false,
@@ -116,14 +117,15 @@ What the installer does
 -----------------------
 1. Reads settings from the template config\config.json in this project
    (the template file is not modified).
-2. Writes the runtime config to the Administrator profile:
-     C:\Users\Administrator\LoginTimeLogger\config.json
-   ACLs: Administrators + SYSTEM full control; target user Deny.
-3. Creates the log directory under the Administrator profile with the same ACLs:
-     C:\Users\Administrator\LoginTimeLogs
+2. Writes the runtime config under AdministratorProfile (example):
+     C:\Users\AdminName\LoginTimeLogger\config.json
+   ACLs: AdministratorProfile account + SYSTEM full control; target user Deny.
+   (Does not require BUILTIN\Administrators.)
+3. Creates the log directory under AdministratorProfile with the same ACLs:
+     C:\Users\AdminName\LoginTimeLogs
 4. Copies monitor scripts (not the config) into:
      C:\Program Files\LoginTimeLogger
-5. Registers scheduled task "LoginTimeLogger" pointing at the Administrator
+5. Registers scheduled task "LoginTimeLogger" pointing at that runtime
    config path:
      - Trigger: At system startup
      - Principal: NT AUTHORITY\SYSTEM
@@ -159,8 +161,8 @@ and is Ready/Running.
 
 View logs
 ---------
-As Administrator, open the LogDirectory from config (default):
-  C:\Users\Administrator\LoginTimeLogs
+As Administrator, open the LogDirectory from config (example):
+  C:\Users\AdminName\LoginTimeLogs
 
 Files:
   unlocked-time-YYYY-MM-DD.log  - daily event log
@@ -174,10 +176,10 @@ Change the monitored user later
 1. Edit TargetUsername in this project's config\config.json
 2. Re-run:
      .\scripts\Install.ps1 -StartNow
-   This refreshes C:\Users\Administrator\LoginTimeLogger\config.json
+   This refreshes <AdministratorProfile>\LoginTimeLogger\config.json
 
-Or edit the runtime file directly as Administrator:
-  C:\Users\Administrator\LoginTimeLogger\config.json
+Or edit the runtime file directly as that admin user:
+  C:\Users\AdminName\LoginTimeLogger\config.json
 then restart the task:
   Restart-ScheduledTask -TaskName LoginTimeLogger
   (or Stop then Start the task)
@@ -205,9 +207,9 @@ Troubleshooting
 - Any script error:
   Failures print a detailed ERROR DETAILS block to the screen and append
   the same text to a separate Administrator error log:
-    C:\Users\Administrator\LoginTimeLogger\errors.log
+    <AdministratorProfile>\LoginTimeLogger\errors.log
   Monitor operational messages also go to LoginTimeLogs\service.log.
-  If the Administrator path is not writable, a TEMP fallback is used:
+  If the admin profile path is not writable, a TEMP fallback is used:
     %TEMP%\LoginTimeLogger\errors.log
 
 - Install says TargetUsername is empty:

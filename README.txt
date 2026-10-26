@@ -7,9 +7,9 @@ in with the screen unlocked. Time while logged in but the screen is locked
 
 Set TargetUsername (Windows logon / SAM name) in this project's
 config\config.json before install. The installer copies the runtime config to
-the Administrator profile:
-  C:\Users\Administrator\LoginTimeLogger\config.json
-That file is ACL-protected like the logs; the scheduled task reads from there.
+the admin profile from AdministratorProfile (e.g. C:\Users\AdminName):
+  C:\Users\AdminName\LoginTimeLogger\config.json
+ACL: that admin account + SYSTEM (not BUILTIN\Administrators); task reads from there.
 
 The monitor starts at system startup with elevated privileges (Scheduled Task
 running as SYSTEM, Run level Highest). Log files are stored under the
@@ -49,18 +49,18 @@ Gaps caused by sleep or hibernate are capped so they are not credited as
 unlocked time.
 
 
-Log files (Administrator only)
+Log files (admin profile only)
 ------------------------------
-Default location:
-  C:\Users\Administrator\LoginTimeLogs
+Default location (example AdministratorProfile=C:\Users\AdminName):
+  C:\Users\AdminName\LoginTimeLogs
 
   unlocked-time-YYYY-MM-DD.log  - lock/unlock transitions, heartbeats, day total
   unlocked-time-summary.csv     - one row per completed day
   state.json                    - running total for the current day
   service.log                   - monitor diagnostics
 
-Error log (Administrator only; separate from daily time logs):
-  C:\Users\Administrator\LoginTimeLogger\errors.log
+Error log (same admin profile; separate from daily time logs):
+  C:\Users\AdminName\LoginTimeLogger\errors.log
   All script errors/warnings are printed to the screen and appended here.
 
 Self-update (opt-in; UpdateEnabled=false by default):
@@ -98,12 +98,9 @@ Notes
 - TargetUsername: local SAM, DOMAIN\user, or user@upn.domain
   (not the display name). Unknown lock state is treated as locked
   (fail closed — time is not counted).
-- Supported on Windows 11 Home. Caveat: the default path is
-  C:\Users\Administrator\... but that profile often does not exist on
-  Home until the built-in Administrator account is enabled. Before
-  install, set AdministratorProfile in config\config.json to a real
-  administrator user's profile (for example C:\Users\YourAdminName).
-- If the Administrator profile path differs on your PC for any reason,
-  set AdministratorProfile in config\config.json before installing.
+- Supported on Windows 11 Home. Set AdministratorProfile to a real
+  elevated user's profile (for example C:\Users\AdminName), or leave it
+  empty so install uses the account that runs Install.ps1. The built-in
+  Administrator account / BUILTIN\Administrators group is not required.
 - Standard users cannot change the scheduled task or the log ACL without
   Administrator rights.

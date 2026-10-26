@@ -4,9 +4,9 @@ Background monitor that tracks how long a configured Windows account is logged i
 
 Set the account to measure in the project template `config/config.json` as `TargetUsername` (`user`, `DOMAIN\user`, or `user@upn.domain`). On install, the runtime config is written to the **Administrator** profile:
 
-`C:\Users\Administrator\LoginTimeLogger\config.json`
+`<AdministratorProfile>\LoginTimeLogger\config.json` (for example `C:\Users\AdminName\LoginTimeLogger\config.json`)
 
-That file (and the logs) are ACL-locked so the monitored user cannot read or modify them. The startup task reads the Administrator copy.
+That file (and the logs) are ACL-locked to the **AdministratorProfile account + SYSTEM** (not `BUILTIN\Administrators`) so the monitored user cannot read or modify them. The startup task reads that copy.
 
 Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run level Highest).
 
@@ -26,7 +26,7 @@ Edit `config/config.json`:
 ```json
 {
   "TargetUsername": "jsmith",
-  "AdministratorProfile": "C:\\Users\\Administrator",
+  "AdministratorProfile": "C:\\Users\\AdminName",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
   "UpdateEnabled": false,
@@ -91,9 +91,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 **Unlocked-time logs** (when the target user was logged in with the screen unlocked):
 
-`C:\Users\Administrator\LoginTimeLogs\`
+`C:\Users\AdminName\LoginTimeLogs\` (example when `AdministratorProfile` is `C:\Users\AdminName`)
 
-That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` when `LogDirectory` is empty. If `AdministratorProfile` / `LogDirectory` point elsewhere, the time logs follow those paths.
+That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` when `LogDirectory` is empty.
 
 | File | Contents |
 |------|----------|
@@ -104,9 +104,9 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 
 **Error log** (install, monitor, and helper failures — separate from the daily time logs):
 
-`C:\Users\Administrator\LoginTimeLogger\errors.log`
+`<AdministratorProfile>\LoginTimeLogger\errors.log` (example: `C:\Users\AdminName\LoginTimeLogger\errors.log`)
 
-That is `<AdministratorProfile>\LoginTimeLogger\errors.log`. If `AdministratorProfile` in config points elsewhere, the error log follows that path. Errors are also printed to the screen. If the Administrator path is not writable, a fallback is used: `%TEMP%\LoginTimeLogger\errors.log`.
+Errors are also printed to the screen. If that path is not writable, a fallback is used: `%TEMP%\LoginTimeLogger\errors.log`.
 
 ## Uninstall
 
@@ -126,5 +126,5 @@ Gaps larger than a short cap (sleep/hibernate) are not credited as unlocked time
 
 - Use a real account id (SAM / `DOMAIN\user` / UPN), not a display name.
 - Standard users cannot change the scheduled task or the log ACL without Administrator rights.
-- Supported on **Windows 11 Home**. Caveat: the default path is `C:\Users\Administrator\...`, but that profile often does not exist on Home until the built-in Administrator account is enabled. Before install, set `AdministratorProfile` in `config/config.json` to a real administrator user’s profile (for example `C:\Users\YourAdminName`).
+- Supported on **Windows 11 Home**. Set `AdministratorProfile` to a real elevated user’s profile (for example `C:\Users\AdminName`), or leave it empty so install uses the account that runs `Install.ps1`. The built-in Administrator account is not required.
 - See `INSTALL.txt` for a full plain-text install guide.

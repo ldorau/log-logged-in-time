@@ -32,7 +32,13 @@ Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
 
 try {
     if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
-        $administratorProfile = Join-Path $env:SystemDrive 'Users\Administrator'
+        $administratorProfile = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+            ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+            $env:USERPROFILE
+        }
+        else {
+            Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
+        }
         if (Test-Path -LiteralPath $TemplateConfigPath) {
             try {
                 $template = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json

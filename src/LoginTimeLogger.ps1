@@ -104,9 +104,18 @@ LogDirectory in file: $($raw.LogDirectory)
 "@
     }
 
-    $adminHome = Join-Path $env:SystemDrive 'Users\Administrator'
+    # Prefer configured admin profile (e.g. C:\Users\AdminName). Fall back to the
+    # elevating user's profile when possible — do not require built-in Administrator.
+    $adminHome = $null
     if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
         $adminHome = [string]$raw.AdministratorProfile
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
+        ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
+        $adminHome = $env:USERPROFILE
+    }
+    else {
+        $adminHome = Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
     }
 
     $logDirectory = Join-Path $adminHome 'LoginTimeLogs'
@@ -201,10 +210,37 @@ LogDirectory in file: $($raw.LogDirectory)
     }
 }
 
+function Resolve-LocalAccountSid {
+    param([Parameter(Mandatory)][string]$UserName)
+
+    $nameCandidates = New-Object System.Collections.Generic.List[string]
+    $trimmed = $UserName.Trim()
+    $nameCandidates.Add($trimmed)
+    $leaf = $trimmed
+    if ($trimmed -match '^(?<domain>[^\\]+)\\(?<user>.+)$') { $leaf = $Matches['user'] }
+    elseif ($trimmed -match '^(?<user>[^@]+)@') { $leaf = $Matches['user'] }
+    if ($leaf -ne $trimmed) { $nameCandidates.Add($leaf) }
+    if ($leaf -notmatch '[\\@]') {
+        $nameCandidates.Add('.\{0}' -f $leaf)
+        if ($env:COMPUTERNAME) { $nameCandidates.Add('{0}\{1}' -f $env:COMPUTERNAME, $leaf) }
+        if ($env:USERDOMAIN) { $nameCandidates.Add('{0}\{1}' -f $env:USERDOMAIN, $leaf) }
+    }
+
+    foreach ($name in $nameCandidates) {
+        try {
+            return (New-Object System.Security.Principal.NTAccount($name)).Translate(
+                [System.Security.Principal.SecurityIdentifier])
+        }
+        catch { }
+    }
+    return $null
+}
+
 function Initialize-SecureLogDirectory {
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$DeniedUsername
+        [Parameter(Mandatory)][string]$DeniedUsername,
+        [Parameter(Mandatory)][string]$AdministratorProfile
     )
 
     try {
@@ -219,22 +255,44 @@ function Initialize-SecureLogDirectory {
             $null = $acl.RemoveAccessRule($rule)
         }
 
-        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            'BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            'NT AUTHORITY\SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($adminRule)
-        $acl.AddAccessRule($systemRule)
-
-        try {
-            $denyRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $DeniedUsername, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')
-            $acl.AddAccessRule($denyRule)
+        # Allow the AdministratorProfile account (e.g. AdminName) + SYSTEM.
+        # Do not require BUILTIN\Administrators.
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $adminLeaf = Split-Path -Leaf ($AdministratorProfile.Trim().TrimEnd('\', '/'))
+        $allowedAdminSid = Resolve-LocalAccountSid -UserName $adminLeaf
+        if (-not $allowedAdminSid) {
+            throw ("Could not resolve administrator account '{0}' from AdministratorProfile '{1}' for ACL Allow." -f `
+                    $adminLeaf, $AdministratorProfile)
         }
-        catch {
-            $details = Format-ErrorDetails -ErrorRecord $_ -Context (
-                "Adding Deny ACE failed; user='{0}'; directory='{1}'" -f $DeniedUsername, $Directory)
-            Write-LoggerEvent -Level WARN -Message $details
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $allowedAdminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+
+        $deniedSid = Resolve-LocalAccountSid -UserName $DeniedUsername
+        if ($deniedSid) {
+            if ($deniedSid.Value -eq $allowedAdminSid.Value) {
+                Write-LoggerEvent -Level WARN -Message (
+                    "TargetUsername '{0}' matches AdministratorProfile account; skipping Deny ACE on '{1}'." -f `
+                        $DeniedUsername, $Directory)
+            }
+            else {
+                try {
+                    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                $deniedSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+                }
+                catch {
+                    $details = Format-ErrorDetails -ErrorRecord $_ -Context (
+                        "Adding Deny ACE failed; user='{0}'; sid='{1}'; directory='{2}'" -f `
+                            $DeniedUsername, $deniedSid.Value, $Directory)
+                    Write-LoggerEvent -Level WARN -Message $details
+                }
+            }
+        }
+        else {
+            Write-LoggerEvent -Level WARN -Message (
+                "Could not resolve '{0}' to a SID for Deny ACE on '{1}'." -f $DeniedUsername, $Directory)
         }
 
         Set-Acl -LiteralPath $Directory -AclObject $acl
@@ -409,7 +467,9 @@ try {
     $csPath = Join-Path $scriptDir 'SessionQuery.cs'
     Import-SessionQueryType -SourcePath $csPath
 
-    Initialize-SecureLogDirectory -Directory $config.LogDirectory -DeniedUsername $config.TargetUsername
+    Initialize-SecureLogDirectory -Directory $config.LogDirectory `
+        -DeniedUsername $config.TargetUsername `
+        -AdministratorProfile $config.AdministratorProfile
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory
