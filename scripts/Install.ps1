@@ -84,12 +84,14 @@ function Resolve-AccountSid {
         $candidates.Add($sam)
     }
     if ($sam -notmatch '[\\@]') {
-        $candidates.Add('.\{0}' -f $sam)
+        # Prefer concatenation over -f inside .Add(...): PowerShell parses
+        # Add(fmt -f a, b) as Add((fmt -f a), b), which breaks {1} placeholders.
+        $candidates.Add('.\' + $sam)
         if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
-            $candidates.Add('{0}\{1}' -f $env:COMPUTERNAME, $sam)
+            $candidates.Add($env:COMPUTERNAME + '\' + $sam)
         }
         if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
-            $candidates.Add('{0}\{1}' -f $env:USERDOMAIN, $sam)
+            $candidates.Add($env:USERDOMAIN + '\' + $sam)
         }
     }
 

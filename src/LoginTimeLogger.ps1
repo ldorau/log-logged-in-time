@@ -221,9 +221,11 @@ function Resolve-LocalAccountSid {
     elseif ($trimmed -match '^(?<user>[^@]+)@') { $leaf = $Matches['user'] }
     if ($leaf -ne $trimmed) { $nameCandidates.Add($leaf) }
     if ($leaf -notmatch '[\\@]') {
-        $nameCandidates.Add('.\{0}' -f $leaf)
-        if ($env:COMPUTERNAME) { $nameCandidates.Add('{0}\{1}' -f $env:COMPUTERNAME, $leaf) }
-        if ($env:USERDOMAIN) { $nameCandidates.Add('{0}\{1}' -f $env:USERDOMAIN, $leaf) }
+        # Prefer concatenation over -f inside .Add(...): PowerShell parses
+        # Add(fmt -f a, b) as Add((fmt -f a), b), which breaks {1} placeholders.
+        $nameCandidates.Add('.\' + $leaf)
+        if ($env:COMPUTERNAME) { $nameCandidates.Add($env:COMPUTERNAME + '\' + $leaf) }
+        if ($env:USERDOMAIN) { $nameCandidates.Add($env:USERDOMAIN + '\' + $leaf) }
     }
 
     foreach ($name in $nameCandidates) {
