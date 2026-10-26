@@ -31,6 +31,14 @@ Requirements
 
 Installation
 ------------
+One-file bootstrap (download only Bootstrap-Install.ps1 from GitHub):
+  Elevated PowerShell:
+    Set-ExecutionPolicy -Scope Process Bypass
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" -OutFile "$env:TEMP\Bootstrap-Install.ps1"
+    & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+  Installs Git if needed, clones the repo, runs scripts\Install.ps1.
+
+From an existing clone:
 1. Edit config\config.json and set TargetUsername
    (local SAM, DOMAIN\user, or user@upn.domain).
 2. Follow INSTALL.txt for install, status, and uninstall steps.
@@ -78,6 +86,7 @@ SCP on lock (opt-in; ScpOnLockEnabled=false by default):
 
 Project layout
 --------------
+  Bootstrap-Install.ps1       - one-file bootstrap (Git + clone + Install.ps1)
   config\config.json          - install template (edit TargetUsername here)
   src\LoginTimeLogger.ps1     - background monitor (reads runtime config)
   src\SessionQuery.cs         - session/lock detection helpers

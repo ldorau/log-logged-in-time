@@ -46,6 +46,23 @@ TargetUsername is required. Leave LogDirectory empty to use:
 
 Step 2 - Install
 ----------------
+Option A - One-file bootstrap (download only Bootstrap-Install.ps1)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Open PowerShell as Administrator.
+2. Allow scripts for this session only:
+     Set-ExecutionPolicy -Scope Process Bypass
+3. Download and run the bootstrap (replace jsmith with the account to measure):
+     Invoke-WebRequest `
+       -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" `
+       -OutFile "$env:TEMP\Bootstrap-Install.ps1"
+     & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+
+   The bootstrap installs Git if missing, clones to %USERPROFILE%\log-logged-in-time,
+   writes TargetUsername into config\config.json, then runs scripts\Install.ps1.
+   Optional: -AdministratorProfile "C:\Users\AdminName"  -ClonePath "D:\src\log-logged-in-time"  -Force
+
+Option B - From an existing project folder
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 1. Open PowerShell as Administrator.
    (Right-click Start -> Terminal (Admin) / Windows PowerShell (Admin))
 

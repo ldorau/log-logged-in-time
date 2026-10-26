@@ -67,6 +67,22 @@ Place a private key readable by `SYSTEM` at that path (and the matching public k
 
 ## Install
 
+### One-file bootstrap (download only `Bootstrap-Install.ps1`)
+
+From an **elevated** PowerShell prompt (no prior clone needed):
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+Invoke-WebRequest `
+  -Uri 'https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1' `
+  -OutFile "$env:TEMP\Bootstrap-Install.ps1"
+& "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+```
+
+The bootstrap installs Git for Windows if missing, clones the repo to `%USERPROFILE%\log-logged-in-time`, writes `TargetUsername` into `config\config.json`, then runs `scripts\Install.ps1`. Optional: `-AdministratorProfile 'C:\Users\AdminName'`, `-ClonePath`, `-Force`.
+
+### From an existing clone
+
 Open an **elevated** PowerShell prompt in this folder:
 
 ```powershell
