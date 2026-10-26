@@ -35,7 +35,7 @@ One-file bootstrap (download only Bootstrap-Install.ps1 from GitHub):
   Elevated PowerShell:
     Set-ExecutionPolicy -Scope Process Bypass
     Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-    & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+    & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
   Installs Git if needed, clones the repo, runs scripts\Install.ps1.
 
 From an existing clone:

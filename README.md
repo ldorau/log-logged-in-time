@@ -25,7 +25,7 @@ Edit `config/config.json`:
 
 ```json
 {
-  "TargetUsername": "jsmith",
+  "TargetUsername": "<user-name>",
   "AdministratorProfile": "C:\\Users\\AdminName",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
@@ -43,7 +43,7 @@ Edit `config/config.json`:
 }
 ```
 
-`TargetUsername` is required (`jsmith`, `CONTOSO\jsmith`, or `jsmith@contoso.com`). Leave `LogDirectory` empty to use `<AdministratorProfile>\LoginTimeLogs`.
+`TargetUsername` is required (`<user-name>`, `CONTOSO\<user-name>`, or `<user-name>@contoso.com`). Leave `LogDirectory` empty to use `<AdministratorProfile>\LoginTimeLogs`.
 
 Unknown lock state is treated as **locked** (fail closed). The startup task uses `-WindowStyle Hidden`. Verify lock detection with `Test-Session.ps1` while locked from another session when relying on WTS flags.
 
@@ -76,7 +76,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 Invoke-WebRequest `
   -Uri 'https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1' `
   -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-& "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+& "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
 ```
 
 The bootstrap installs Git for Windows if missing, clones the repo to `%USERPROFILE%\log-logged-in-time`, writes `TargetUsername` into `config\config.json`, then runs `scripts\Install.ps1`. Optional: `-AdministratorProfile 'C:\Users\AdminName'`, `-ClonePath`, `-Force`.

@@ -18,7 +18,7 @@ Step 1 - Set the target username in config
 Edit config\config.json and set TargetUsername to the account to measure:
 
   {
-    "TargetUsername": "jsmith",
+    "TargetUsername": "<user-name>",
     "AdministratorProfile": "C:\\Users\\AdminName",
     "LogDirectory": "",
     "PollIntervalSeconds": 5,
@@ -36,9 +36,9 @@ Edit config\config.json and set TargetUsername to the account to measure:
   }
 
 Accepted TargetUsername forms:
-  - Local SAM:     jsmith
-  - Domain:        CONTOSO\jsmith
-  - UPN:           jsmith@contoso.com
+  - Local SAM:     <user-name>
+  - Domain:        CONTOSO\<user-name>
+  - UPN:           <user-name>@contoso.com
 
 TargetUsername is required. Leave LogDirectory empty to use:
   <AdministratorProfile>\LoginTimeLogs
@@ -51,11 +51,11 @@ Option A - One-file bootstrap (download only Bootstrap-Install.ps1)
 1. Open PowerShell as Administrator.
 2. Allow scripts for this session only:
      Set-ExecutionPolicy -Scope Process Bypass
-3. Download and run the bootstrap (replace jsmith with the account to measure):
+3. Download and run the bootstrap (set -TargetUsername to the account to measure):
      Invoke-WebRequest `
        -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" `
        -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-     & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername jsmith -StartNow
+     & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
 
    The bootstrap installs Git if missing, clones to %USERPROFILE%\log-logged-in-time,
    writes TargetUsername into config\config.json, then runs scripts\Install.ps1.

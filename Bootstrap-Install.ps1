@@ -8,7 +8,7 @@
   Example (raw GitHub URL):
     irm https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1 | iex
   Or save the file and run:
-    .\Bootstrap-Install.ps1 -TargetUsername jsmith -StartNow
+    .\Bootstrap-Install.ps1 -TargetUsername '<user-name>' -StartNow
 .PARAMETER TargetUsername
   Windows account to measure (required). Written into config\config.json before Install.ps1.
 .PARAMETER AdministratorProfile
