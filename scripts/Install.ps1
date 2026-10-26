@@ -911,6 +911,31 @@ function Set-ProtectedDirectory {
 }
 
 try {
+    $currentAccount = (& whoami 2>$null | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($currentAccount)) {
+        $currentAccount = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    }
+    $currentUpn = $null
+    try {
+        $upnOut = & whoami /upn 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($upnOut | Out-String).Trim())) {
+            $currentUpn = (($upnOut | Out-String).Trim() -split '\r?\n')[0].Trim()
+        }
+    }
+    catch { }
+    if ([string]::IsNullOrWhiteSpace($currentUpn)) {
+        $currentUpn = '(none)'
+    }
+
+    Write-Host 'Current machine / account context:' -ForegroundColor Cyan
+    Write-Host ("  COMPUTERNAME : {0}" -f $env:COMPUTERNAME)
+    Write-Host ("  USERDOMAIN   : {0}" -f $env:USERDOMAIN)
+    Write-Host ("  Account      : {0}" -f $currentAccount.Trim())
+    Write-Host ("  UPN          : {0}" -f $currentUpn)
+    Write-Host ("  AdminUsername: {0}" -f $AdminUsername)
+    Write-Host ("  TargetUsername: {0}" -f $TargetUsername)
+    Write-Host ''
+
     $monitorScript = Join-Path $repoRoot 'src\LoginTimeLogger.ps1'
     $templateConfigPath = Join-Path $repoRoot 'config\config.json'
     $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
