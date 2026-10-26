@@ -4,12 +4,33 @@
 .SYNOPSIS
   Installs LoginTimeLogger to start at system boot with highest privileges.
 .DESCRIPTION
-  Reads settings from the repo template config\config.json, then stores the
-  runtime config under the Administrator profile (ACL-protected). Creates a
-  Scheduled Task that runs as SYSTEM at startup.
+  Takes the administrative account (install/config owner) and the measured
+  user account as required arguments. Other settings come from
+  config\config.json. Runtime config is stored under the admin profile
+  (ACL-protected). Creates a Scheduled Task that runs as SYSTEM at startup.
+.PARAMETER AdminUsername
+  Administrative Windows account that owns install/config/logs
+  (e.g. AdminName). Profile path defaults to C:\Users\<sam-leaf>.
+.PARAMETER TargetUsername
+  Windows account whose unlocked login time will be measured.
+  For testing, this may be the same as AdminUsername (Deny ACL is skipped).
+.EXAMPLE
+  .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
+.EXAMPLE
+  .\scripts\Install.ps1 AdminName UserName -StartNow
+.EXAMPLE
+  # Testing with one account for both roles:
+  .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername AdminName -StartNow
 #>
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory, Position = 0)]
+    [Alias('AdministratorUsername')]
+    [string]$AdminUsername,
+
+    [Parameter(Mandatory, Position = 1)]
+    [string]$TargetUsername,
+
     [string]$TaskName = 'LoginTimeLogger',
     [switch]$StartNow
 )
@@ -148,6 +169,20 @@ function Get-AccountNameFromProfilePath {
         return $null
     }
     return (Split-Path -Leaf $normalized)
+}
+
+function Get-ProfilePathForAccount {
+    <#
+    .SYNOPSIS
+      Builds C:\Users\<sam> for an account name (local SAM, DOMAIN\user, or UPN).
+    #>
+    param([Parameter(Mandatory)][string]$AccountName)
+
+    $leaf = Get-AccountSamLeaf -UserName $AccountName
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        throw ("Could not derive profile folder name from account '{0}'." -f $AccountName)
+    }
+    return (Join-Path $env:SystemDrive ('Users\{0}' -f $leaf))
 }
 
 function Resolve-AdministratorAccountSid {
@@ -371,7 +406,9 @@ function Test-InstallPrerequisites {
         [Parameter(Mandatory)][string]$RepoRoot,
         [Parameter(Mandatory)][string]$MonitorScript,
         [Parameter(Mandatory)][string]$TemplateConfigPath,
-        [Parameter(Mandatory)][string]$CsPath
+        [Parameter(Mandatory)][string]$CsPath,
+        [Parameter(Mandatory)][string]$AdminUsername,
+        [Parameter(Mandatory)][string]$TargetUsername
     )
 
     Write-Host 'Checking required software and components...'
@@ -534,23 +571,37 @@ function Test-InstallPrerequisites {
     }
 
     # --- Config content (parsed before Git so UpdateEnabled can skip Git install) ---
+    # AdminUsername / TargetUsername come from script parameters (required).
     $raw = $null
     $configOk = $false
-    $targetUsername = $null
     $updateEnabled = $false
+    $administratorProfile = Get-ProfilePathForAccount -AccountName $AdminUsername
+
+    $adminOk = -not [string]::IsNullOrWhiteSpace($AdminUsername)
+    Write-CheckResult -Name 'AdminUsername (install owner)' -Ok $adminOk -Detail $(
+        if ($adminOk) { '{0} -> {1}' -f $AdminUsername, $administratorProfile } else { 'empty' }
+    )
+    if (-not $adminOk) {
+        $failures.Add('AdminUsername is required (administrative account for install/config/logs).')
+    }
+
+    $targetOk = -not [string]::IsNullOrWhiteSpace($TargetUsername)
+    Write-CheckResult -Name 'TargetUsername (measured user)' -Ok $targetOk -Detail $(
+        if ($targetOk) { $TargetUsername } else { 'empty' }
+    )
+    if (-not $targetOk) {
+        $failures.Add('TargetUsername is required (account whose unlocked time will be measured).')
+    }
+    $configOk = $adminOk -and $targetOk
+
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $raw = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $targetUsername = [string]$raw.TargetUsername
-            $configOk = -not [string]::IsNullOrWhiteSpace($targetUsername)
+            # Parameter values win over template placeholders.
+            $raw.TargetUsername = $TargetUsername
+            $raw.AdministratorProfile = $administratorProfile
             if ($null -ne $raw.UpdateEnabled) {
                 $updateEnabled = [bool]$raw.UpdateEnabled
-            }
-            Write-CheckResult -Name 'Config TargetUsername' -Ok $configOk -Detail $(
-                if ($configOk) { $targetUsername } else { 'empty - set Windows logon name in config\config.json' }
-            )
-            if (-not $configOk) {
-                $failures.Add('config\config.json has an empty TargetUsername. Set the Windows logon name, then retry.')
             }
             Write-CheckResult -Name 'Config UpdateEnabled' -Ok $true -Detail $(
                 if ($updateEnabled) { 'true (Git required)' } else { 'false (Git optional / skipped)' }
@@ -560,6 +611,20 @@ function Test-InstallPrerequisites {
             $parseDetails = Format-ErrorDetails -ErrorRecord $_ -Context ("Parsing '{0}'" -f $TemplateConfigPath)
             Write-CheckResult -Name 'Config JSON parse' -Ok $false -Detail $parseDetails
             $failures.Add("config\config.json is not valid JSON.`r`n$parseDetails")
+            $configOk = $false
+        }
+    }
+    else {
+        $failures.Add("Config template missing: $TemplateConfigPath")
+        $configOk = $false
+    }
+
+    if ($adminOk) {
+        $adminExists = Test-AccountExists -UserName $AdminUsername
+        Write-CheckResult -Name ("Admin account exists '{0}'" -f $AdminUsername) -Ok $adminExists
+        if (-not $adminExists) {
+            $failures.Add("AdminUsername '$AdminUsername' was not found. Use local SAM, DOMAIN\user, or user@upn.domain.")
+            $configOk = $false
         }
     }
 
@@ -653,17 +718,7 @@ function Test-InstallPrerequisites {
             $identityPath = [string]$raw.ScpIdentityFile
         }
         else {
-            $adminForKey = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
-                ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
-                $env:USERPROFILE
-            }
-            else {
-                Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
-            }
-            if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $adminForKey = [string]$raw.AdministratorProfile
-            }
-            $identityPath = Join-Path $adminForKey 'LoginTimeLogger\ssh\id_ed25519'
+            $identityPath = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
         }
         $identityOk = Test-Path -LiteralPath $identityPath
         Write-CheckResult -Name 'SCP identity file (private key)' -Ok $identityOk -Detail $identityPath
@@ -675,11 +730,12 @@ function Test-InstallPrerequisites {
         Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail 'skipped (ScpOnLockEnabled=false)'
     }
 
-    if ($configOk) {
-        $userExists = Test-AccountExists -UserName $targetUsername
-        Write-CheckResult -Name ("Account exists (local or domain) '{0}'" -f $targetUsername) -Ok $userExists
+    if ($targetOk) {
+        $userExists = Test-AccountExists -UserName $TargetUsername
+        Write-CheckResult -Name ("Measured account exists '{0}'" -f $TargetUsername) -Ok $userExists
         if (-not $userExists) {
-            $failures.Add("Account '$targetUsername' was not found. Use local SAM, DOMAIN\user, or user@upn.domain in config\config.json.")
+            $failures.Add("TargetUsername '$TargetUsername' was not found. Use local SAM, DOMAIN\user, or user@upn.domain.")
+            $configOk = $false
         }
     }
 
@@ -809,9 +865,8 @@ function Set-ProtectedDirectory {
     $deniedSid = Resolve-AccountSid -UserName $DeniedUsername
     if ($deniedSid) {
         if ($deniedSid.Value -eq $AllowedAdminSid.Value) {
-            $null = Write-ErrorMessage -Level WARN -Source 'Install' -Message (
-                "TargetUsername '{0}' is the same account as AdministratorProfile; skipping Deny ACE on '{1}'." -f `
-                    $DeniedUsername, $Directory)
+            # Allowed for testing when AdminUsername == TargetUsername.
+            Write-Host ("  Note: measured user equals admin account; skipping Deny ACE on '{0}' (OK for testing)." -f $Directory) -ForegroundColor Yellow
         }
         else {
             try {
@@ -867,30 +922,24 @@ try {
         -RepoRoot $repoRoot `
         -MonitorScript $monitorScript `
         -TemplateConfigPath $templateConfigPath `
-        -CsPath $csPath
+        -CsPath $csPath `
+        -AdminUsername $AdminUsername `
+        -TargetUsername $TargetUsername
 
-    $targetUsername = [string]$raw.TargetUsername
+    $targetUsername = [string]$TargetUsername
+    $administratorProfile = Get-ProfilePathForAccount -AccountName $AdminUsername
 
-    # Prefer the elevating admin's profile (e.g. C:\Users\AdminName). Do not require
-    # the built-in Administrator account or BUILTIN\Administrators.
-    $administratorProfile = [string]$raw.AdministratorProfile
-    if ([string]::IsNullOrWhiteSpace($administratorProfile)) {
-        if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
-            ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
-            $administratorProfile = $env:USERPROFILE
-        }
-        else {
-            $administratorProfile = Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
-        }
-    }
-
-    $adminAccountName = Get-AccountNameFromProfilePath -ProfilePath $administratorProfile
-    $allowedAdminSid = Resolve-AdministratorAccountSid -AdministratorProfile $administratorProfile
+    $adminAccountName = Get-AccountSamLeaf -UserName $AdminUsername
+    $allowedAdminSid = Resolve-AccountSid -UserName $AdminUsername
     if (-not $allowedAdminSid) {
-        throw ("Could not resolve administrator account from AdministratorProfile '{0}' (account name '{1}'). Set AdministratorProfile to a real user profile such as C:\Users\AdminName." -f `
-                $administratorProfile, $adminAccountName)
+        throw ("Could not resolve AdminUsername '{0}' to a SID for ACLs." -f $AdminUsername)
     }
-    Write-Host ("Administrator account for ACLs: {0} (SID {1})" -f $adminAccountName, $allowedAdminSid.Value)
+    Write-Host ("Administrator account for ACLs: {0} (profile {1}; SID {2})" -f `
+            $adminAccountName, $administratorProfile, $allowedAdminSid.Value)
+    $targetSid = Resolve-AccountSid -UserName $targetUsername
+    if ($targetSid -and ($targetSid.Value -eq $allowedAdminSid.Value)) {
+        Write-Host 'Note: AdminUsername and TargetUsername resolve to the same account (supported for testing).' -ForegroundColor Yellow
+    }
 
     $pollSeconds = 5
     if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
@@ -954,8 +1003,8 @@ try {
 
     if (-not (Test-Path -LiteralPath $administratorProfile)) {
         $null = Write-ErrorMessage -Level WARN -Source 'Install' -Message @"
-Administrator profile not found at '$administratorProfile'.
-Folders will still be created. If this path is wrong, set AdministratorProfile in config\config.json and re-run Install.ps1.
+Administrator profile not found at '$administratorProfile' (from AdminUsername '$AdminUsername').
+Folders will still be created. Confirm the account has a local profile under Users\.
 SystemDrive: $env:SystemDrive
 "@
     }

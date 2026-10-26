@@ -5,15 +5,21 @@
   One-file bootstrap: install Git if needed, clone the repo, run scripts\Install.ps1.
 .DESCRIPTION
   Download and run this script alone from an elevated PowerShell prompt.
-  Example (raw GitHub URL):
-    irm https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1 | iex
-  Or save the file and run:
-    .\Bootstrap-Install.ps1 -TargetUsername '<user-name>' -StartNow
+  Requires two account names:
+    1) administrative account (install/config owner)
+    2) measured user (unlocked login time)
+.PARAMETER AdminUsername
+  Administrative Windows account that owns install/config/logs.
 .PARAMETER TargetUsername
-  Windows account to measure (required). Written into config\config.json before Install.ps1.
-.PARAMETER AdministratorProfile
-  Admin profile path for config/logs (e.g. C:\Users\AdminName). Empty = Install.ps1 default
-  (profile of the elevating user).
+  Windows account whose unlocked login time will be measured.
+  For testing, this may be the same as AdminUsername.
+.EXAMPLE
+  .\Bootstrap-Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
+.EXAMPLE
+  .\Bootstrap-Install.ps1 AdminName UserName -StartNow
+.EXAMPLE
+  # Testing with one account for both roles:
+  .\Bootstrap-Install.ps1 -AdminUsername AdminName -TargetUsername AdminName -StartNow
 .PARAMETER RepoUrl
   Git clone URL (must be the allowlisted project repo by default).
 .PARAMETER Branch
@@ -27,10 +33,12 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string]$TargetUsername,
+    [Parameter(Mandatory, Position = 0)]
+    [Alias('AdministratorUsername')]
+    [string]$AdminUsername,
 
-    [string]$AdministratorProfile = '',
+    [Parameter(Mandatory, Position = 1)]
+    [string]$TargetUsername,
 
     [string]$RepoUrl = 'https://github.com/ldorau/log-logged-in-time.git',
 
@@ -193,21 +201,6 @@ function Invoke-Git {
     }
 }
 
-function Set-BootstrapConfigValues {
-    param(
-        [Parameter(Mandatory)][string]$ConfigPath,
-        [Parameter(Mandatory)][string]$TargetUsername,
-        [string]$AdministratorProfile
-    )
-
-    $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $raw.TargetUsername = $TargetUsername
-    if (-not [string]::IsNullOrWhiteSpace($AdministratorProfile)) {
-        $raw.AdministratorProfile = $AdministratorProfile
-    }
-    ($raw | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
-}
-
 # --- main ---
 try {
     Write-Host 'LoginTimeLogger one-file bootstrap' -ForegroundColor Cyan
@@ -229,6 +222,7 @@ try {
         $ClonePath = Join-Path $homeRoot 'log-logged-in-time'
     }
 
+    Write-Host ("AdminUsername  : {0}" -f $AdminUsername)
     Write-Host ("TargetUsername : {0}" -f $TargetUsername)
     Write-Host ("ClonePath      : {0}" -f $ClonePath)
     Write-Host ("RepoUrl        : {0}" -f $RepoUrl)
@@ -274,26 +268,21 @@ try {
     }
 
     $installScript = Join-Path $ClonePath 'scripts\Install.ps1'
-    $configPath = Join-Path $ClonePath 'config\config.json'
     if (-not (Test-Path -LiteralPath $installScript)) {
         throw "Install.ps1 missing after clone: $installScript"
     }
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "config.json missing after clone: $configPath"
-    }
-
-    Write-Host ("Writing TargetUsername into {0}..." -f $configPath)
-    Set-BootstrapConfigValues -ConfigPath $configPath -TargetUsername $TargetUsername -AdministratorProfile $AdministratorProfile
 
     Write-Host 'Running scripts\Install.ps1...'
     Push-Location -LiteralPath $ClonePath
     try {
+        $installArgs = @{
+            AdminUsername  = $AdminUsername
+            TargetUsername = $TargetUsername
+        }
         if ($StartNow) {
-            & $installScript -StartNow
+            $installArgs['StartNow'] = $true
         }
-        else {
-            & $installScript
-        }
+        & $installScript @installArgs
     }
     finally {
         Pop-Location

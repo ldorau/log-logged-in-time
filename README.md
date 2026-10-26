@@ -2,7 +2,7 @@
 
 Background monitor that tracks how long a configured Windows account is logged in **with the screen unlocked**. Time while logged in but locked (Win+L) is excluded.
 
-Set the account to measure in the project template `config/config.json` as `TargetUsername` (`user`, `DOMAIN\user`, or `user@upn.domain`). On install, the runtime config is written to the **Administrator** profile:
+Pass two account names at install time: **AdminUsername** (owns config/logs) and **TargetUsername** (measured unlocked time; `user`, `DOMAIN\user`, or `user@upn.domain`). For testing, both may be the same account. On install, the runtime config is written under the admin profile:
 
 `<AdministratorProfile>\LoginTimeLogger\config.json` (for example `C:\Users\AdminName\LoginTimeLogger\config.json`)
 
@@ -15,18 +15,18 @@ Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run
 - Windows 11
 - PowerShell 5.1+ (built in)
 - An Administrator account to install
-- `TargetUsername` set in `config/config.json` before install
+- Admin and measured account names passed to bootstrap/install
 - OpenSSH Client (`scp.exe`) when `ScpOnLockEnabled` is true — `Install.ps1` installs the Windows OpenSSH Client capability if missing
 - Git for Windows when `UpdateEnabled` is true — `Install.ps1` downloads and installs it if missing
 
 ## Configure
 
-Edit `config/config.json`:
+`AdminUsername` and `TargetUsername` are **script arguments** (not required in the template before install). Optional settings remain in `config/config.json`:
 
 ```json
 {
-  "TargetUsername": "<user-name>",
-  "AdministratorProfile": "C:\\Users\\AdminName",
+  "TargetUsername": "",
+  "AdministratorProfile": "",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
   "UpdateEnabled": false,
@@ -43,7 +43,7 @@ Edit `config/config.json`:
 }
 ```
 
-`TargetUsername` is required (`<user-name>`, `CONTOSO\<user-name>`, or `<user-name>@contoso.com`). Leave `LogDirectory` empty to use `<AdministratorProfile>\LoginTimeLogs`.
+Account forms: `UserName`, `CONTOSO\UserName`, or `UserName@contoso.com`. Leave `LogDirectory` empty to use `<AdministratorProfile>\LoginTimeLogs` (derived from `AdminUsername` as `C:\Users\<sam>`).
 
 Unknown lock state is treated as **locked** (fail closed). The startup task uses `-WindowStyle Hidden`. Verify lock detection with `Test-Session.ps1` while locked from another session when relying on WTS flags.
 
@@ -76,10 +76,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 Invoke-WebRequest `
   -Uri 'https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1' `
   -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-& "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
+& "$env:TEMP\Bootstrap-Install.ps1" -AdminUsername AdminName -TargetUsername UserName -StartNow
 ```
 
-The bootstrap installs Git for Windows if missing, clones the repo to `%USERPROFILE%\log-logged-in-time`, writes `TargetUsername` into `config\config.json`, then runs `scripts\Install.ps1`. Optional: `-AdministratorProfile 'C:\Users\AdminName'`, `-ClonePath`, `-Force`.
+Arguments (required, positional): **1)** `AdminUsername` — administrative account for install/config/logs; **2)** `TargetUsername` — account to measure. For testing, both may be the same account. The bootstrap installs Git if missing, clones to `%USERPROFILE%\log-logged-in-time`, then runs `scripts\Install.ps1` with those accounts. Optional: `-ClonePath`, `-Force`.
 
 ### From an existing clone
 
@@ -87,10 +87,10 @@ Open an **elevated** PowerShell prompt in this folder:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\Install.ps1 -StartNow
+.\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
 ```
 
-`Install.ps1` reads the project template `config/config.json` (without modifying it), then stores the runtime config under the Administrator profile and points the task at that path.
+`Install.ps1` stores the runtime config under `C:\Users\<AdminUsername>\...` and points the scheduled task at that path.
 
 ## Verify lock detection
 
@@ -142,5 +142,5 @@ Gaps larger than a short cap (sleep/hibernate) are not credited as unlocked time
 
 - Use a real account id (SAM / `DOMAIN\user` / UPN), not a display name.
 - Standard users cannot change the scheduled task or the log ACL without Administrator rights.
-- Supported on **Windows 11 Home**. Set `AdministratorProfile` to a real elevated user’s profile (for example `C:\Users\AdminName`), or leave it empty so install uses the account that runs `Install.ps1`. The built-in Administrator account is not required.
+- Supported on **Windows 11 Home**. Pass `-AdminUsername` for a real elevated user (for example `AdminName` → `C:\Users\AdminName`). The built-in Administrator account is not required.
 - See `INSTALL.txt` for a full plain-text install guide.

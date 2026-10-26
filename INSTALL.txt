@@ -4,22 +4,22 @@ Login Time Logger - Installation
 Prerequisites
 -------------
 1. Sign in with an account that has Administrator rights.
-2. Know the Windows logon name of the account to measure (SAM account name,
-   not the display name).
-3. Set AdministratorProfile in config\config.json to the admin account that
-   installs and manages the monitor (any elevated user profile), for example:
-     C:\Users\AdminName
-   Leave it empty to use the profile of the account that runs Install.ps1.
-   The built-in Administrator account / BUILTIN\Administrators group is not required.
+2. Know two Windows logon names (SAM / DOMAIN\user / UPN, not display names):
+   - AdminUsername: administrative account that owns install/config/logs
+     (profile path becomes C:\Users\<sam>, e.g. AdminName -> C:\Users\AdminName)
+   - TargetUsername: account whose unlocked login time is measured
+     (for testing, AdminUsername and TargetUsername may be the same account)
+3. The built-in Administrator account / BUILTIN\Administrators group is not required.
 
 
-Step 1 - Set the target username in config
-------------------------------------------
-Edit config\config.json and set TargetUsername to the account to measure:
+Step 1 - Optional config tweaks
+-------------------------------
+AdminUsername and TargetUsername are passed on the command line (required).
+Optional settings remain in config\config.json (poll interval, SCP, updates):
 
   {
-    "TargetUsername": "<user-name>",
-    "AdministratorProfile": "C:\\Users\\AdminName",
+    "TargetUsername": "",
+    "AdministratorProfile": "",
     "LogDirectory": "",
     "PollIntervalSeconds": 5,
     "UpdateEnabled": false,
@@ -35,12 +35,12 @@ Edit config\config.json and set TargetUsername to the account to measure:
     "ScpKnownHostsFile": ""
   }
 
-Accepted TargetUsername forms:
-  - Local SAM:     <user-name>
-  - Domain:        CONTOSO\<user-name>
-  - UPN:           <user-name>@contoso.com
+Accepted account name forms:
+  - Local SAM:     UserName
+  - Domain:        CONTOSO\UserName
+  - UPN:           UserName@contoso.com
 
-TargetUsername is required. Leave LogDirectory empty to use:
+Leave LogDirectory empty to use:
   <AdministratorProfile>\LoginTimeLogs
 
 
@@ -51,15 +51,16 @@ Option A - One-file bootstrap (download only Bootstrap-Install.ps1)
 1. Open PowerShell as Administrator.
 2. Allow scripts for this session only:
      Set-ExecutionPolicy -Scope Process Bypass
-3. Download and run the bootstrap (set -TargetUsername to the account to measure):
+3. Download and run the bootstrap (both account names required):
      Invoke-WebRequest `
        -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" `
        -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-     & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
+     & "$env:TEMP\Bootstrap-Install.ps1" -AdminUsername AdminName -TargetUsername UserName -StartNow
 
+   Arguments: (1) AdminUsername (2) TargetUsername (may be identical for testing).
    The bootstrap installs Git if missing, clones to %USERPROFILE%\log-logged-in-time,
-   writes TargetUsername into config\config.json, then runs scripts\Install.ps1.
-   Optional: -AdministratorProfile "C:\Users\AdminName"  -ClonePath "D:\src\log-logged-in-time"  -Force
+   then runs scripts\Install.ps1 with those accounts.
+   Optional: -ClonePath "D:\src\log-logged-in-time"  -Force
 
 Option B - From an existing project folder
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -73,14 +74,14 @@ Option B - From an existing project folder
      Set-ExecutionPolicy -Scope Process Bypass
 
 4. Install and start immediately:
-     .\scripts\Install.ps1 -StartNow
+     .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
 
    Or install only (starts automatically at next boot):
-     .\scripts\Install.ps1
+     .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName
 
-Install.ps1 first checks required software/components, then reads
-TargetUsername and paths from config\config.json.
-If any check fails (or TargetUsername is empty), install stops with an error.
+Install.ps1 first checks required software/components, then applies the two
+account arguments and optional settings from config\config.json.
+If any check fails, install stops with an error.
 
 Prerequisite checks include:
   - Windows 10/11
@@ -90,7 +91,7 @@ Prerequisite checks include:
   - wtsapi32.dll (session lock detection)
   - ScheduledTasks module and required cmdlets
   - Project files present
-  - TargetUsername set and account exists (local or domain)
+  - AdminUsername and TargetUsername set and both accounts exist
   - Program Files write access
   - SessionQuery.cs compiles under Windows PowerShell (Add-Type)
   - Git for Windows (git.exe) only when UpdateEnabled is true
@@ -190,12 +191,11 @@ Files:
 
 Change the monitored user later
 -------------------------------
-1. Edit TargetUsername in this project's config\config.json
-2. Re-run:
-     .\scripts\Install.ps1 -StartNow
-   This refreshes <AdministratorProfile>\LoginTimeLogger\config.json
+Re-run install with the new measured account:
+  .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
+This refreshes <AdministratorProfile>\LoginTimeLogger\config.json
 
-Or edit the runtime file directly as that admin user:
+Or edit TargetUsername in the runtime file as that admin user:
   C:\Users\AdminName\LoginTimeLogger\config.json
 then restart the task:
   Restart-ScheduledTask -TaskName LoginTimeLogger
@@ -229,8 +229,9 @@ Troubleshooting
   If the admin profile path is not writable, a TEMP fallback is used:
     %TEMP%\LoginTimeLogger\errors.log
 
-- Install says TargetUsername is empty:
-  Edit config\config.json and set the Windows logon name, then retry.
+- Install says AdminUsername or TargetUsername is missing:
+  Pass both arguments, for example:
+    .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
 
 - Account was not found:
   Use local SAM, DOMAIN\user, or user@upn.domain — not the display name.
@@ -244,10 +245,10 @@ Troubleshooting
   or reboot. Status.ps1 also reports monitor mutex/process liveness.
 
 - Wrong user measured:
-  Fix TargetUsername in config and re-run Install.ps1 -StartNow.
+  Re-run Install.ps1 with the correct -TargetUsername and -StartNow.
 
-- Log folder missing / access denied for Administrator:
-  Confirm AdministratorProfile in config.json points at a real profile directory.
+- Log folder missing / access denied for admin:
+  Confirm -AdminUsername matches a real local profile under C:\Users\.
 
 - Monitored user can still see logs:
   Re-run Install.ps1 so ACLs are reapplied; confirm you are checking

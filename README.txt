@@ -5,9 +5,9 @@ Background monitor that tracks how long a configured Windows account is logged
 in with the screen unlocked. Time while logged in but the screen is locked
 (Win+L) is not counted.
 
-Set TargetUsername (Windows logon / SAM name) in this project's
-config\config.json before install. The installer copies the runtime config to
-the admin profile from AdministratorProfile (e.g. C:\Users\AdminName):
+Pass AdminUsername (install owner) and TargetUsername (measured user) to
+bootstrap/install. For testing, both may be the same account. Runtime config
+is stored under the admin profile, e.g.:
   C:\Users\AdminName\LoginTimeLogger\config.json
 ACL: that admin account + SYSTEM (not BUILTIN\Administrators); task reads from there.
 
@@ -22,7 +22,7 @@ Requirements
 - Windows 11
 - PowerShell 5.1 or later (included with Windows)
 - An Administrator account to install and view logs
-- TargetUsername set in config\config.json before install
+- AdminUsername and TargetUsername passed to bootstrap/install
 - OpenSSH Client (scp.exe) when ScpOnLockEnabled=true
   (Install.ps1 installs the Windows capability if missing)
 - Git for Windows when UpdateEnabled=true
@@ -35,15 +35,13 @@ One-file bootstrap (download only Bootstrap-Install.ps1 from GitHub):
   Elevated PowerShell:
     Set-ExecutionPolicy -Scope Process Bypass
     Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ldorau/log-logged-in-time/main/Bootstrap-Install.ps1" -OutFile "$env:TEMP\Bootstrap-Install.ps1"
-    & "$env:TEMP\Bootstrap-Install.ps1" -TargetUsername '<user-name>' -StartNow
-  Installs Git if needed, clones the repo, runs scripts\Install.ps1.
+    & "$env:TEMP\Bootstrap-Install.ps1" -AdminUsername AdminName -TargetUsername UserName -StartNow
+  Args: (1) admin account (2) measured user (may be the same for testing).
+  Installs Git if needed, clones, runs Install.ps1.
 
 From an existing clone:
-1. Edit config\config.json and set TargetUsername
-   (local SAM, DOMAIN\user, or user@upn.domain).
-2. Follow INSTALL.txt for install, status, and uninstall steps.
-3. Optional calibration: .\scripts\Test-LockCycle.ps1
-   (current user; Win+L cycle; no Administrator files).
+  .\scripts\Install.ps1 -AdminUsername AdminName -TargetUsername UserName -StartNow
+  Follow INSTALL.txt for status/uninstall. Optional: .\scripts\Test-LockCycle.ps1
 
 
 How unlocked time is measured
@@ -87,7 +85,7 @@ SCP on lock (opt-in; ScpOnLockEnabled=false by default):
 Project layout
 --------------
   Bootstrap-Install.ps1       - one-file bootstrap (Git + clone + Install.ps1)
-  config\config.json          - install template (edit TargetUsername here)
+  config\config.json          - optional settings template (accounts are CLI args)
   src\LoginTimeLogger.ps1     - background monitor (reads runtime config)
   src\SessionQuery.cs         - session/lock detection helpers
   src\Update-Check.ps1        - daily GitHub self-update helper
@@ -104,12 +102,11 @@ Project layout
 
 Notes
 -----
-- TargetUsername: local SAM, DOMAIN\user, or user@upn.domain
+- Account args: local SAM, DOMAIN\user, or user@upn.domain
   (not the display name). Unknown lock state is treated as locked
   (fail closed — time is not counted).
-- Supported on Windows 11 Home. Set AdministratorProfile to a real
-  elevated user's profile (for example C:\Users\AdminName), or leave it
-  empty so install uses the account that runs Install.ps1. The built-in
+- Supported on Windows 11 Home. Pass -AdminUsername for a real elevated
+  user (for example AdminName -> C:\Users\AdminName). The built-in
   Administrator account / BUILTIN\Administrators group is not required.
 - Standard users cannot change the scheduled task or the log ACL without
   Administrator rights.

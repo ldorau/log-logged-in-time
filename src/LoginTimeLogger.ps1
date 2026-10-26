@@ -275,8 +275,9 @@ function Initialize-SecureLogDirectory {
         $deniedSid = Resolve-LocalAccountSid -UserName $DeniedUsername
         if ($deniedSid) {
             if ($deniedSid.Value -eq $allowedAdminSid.Value) {
-                Write-LoggerEvent -Level WARN -Message (
-                    "TargetUsername '{0}' matches AdministratorProfile account; skipping Deny ACE on '{1}'." -f `
+                # Allowed for testing when admin and measured user are the same account.
+                Write-LoggerEvent -Level INFO -Message (
+                    "TargetUsername '{0}' matches admin profile account; skipping Deny ACE on '{1}' (OK for testing)." -f `
                         $DeniedUsername, $Directory)
             }
             else {
