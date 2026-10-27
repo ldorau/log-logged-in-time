@@ -5,7 +5,7 @@
   One-account unlocked-time investigation (no second login required).
 .DESCRIPTION
   For machines with a single interactive user. Starts a background WTS probe
-  (SessionQuery — same path as LoginTimeLogger), then you unlock-use briefly,
+  (SessionQuery - same path as LoginTimeLogger), then you unlock-use briefly,
   Win+L for a while, unlock, and press Enter. Mid-lock Test-Session samples are
   not possible (console freezes); evidence while locked comes from the probe log
   and LoginTimeLogs after the run.
@@ -117,6 +117,23 @@ function Wait-Operator {
     Write-Journal -Message ("Operator continued: {0}" -f ($Prompt -replace '\s+', ' ').Trim())
 }
 
+function ConvertTo-ProcessArgumentListString {
+    # Start-Process joins ArgumentList arrays without reliable quoting; paths with
+    # spaces (e.g. OneDrive Desktop) must be a single properly quoted command line.
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $parts = foreach ($a in $Arguments) {
+        if ($null -eq $a) { continue }
+        $s = [string]$a
+        if ($s -notmatch '[\s"]') {
+            $s
+        }
+        else {
+            '"' + ($s -replace '"', '\"') + '"'
+        }
+    }
+    return (($parts | Where-Object { $null -ne $_ }) -join ' ')
+}
+
 function Invoke-CapturedScript {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -139,7 +156,8 @@ function Invoke-CapturedScript {
     $tempOut = Join-Path $env:TEMP ("llt-capture-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $tempErr = Join-Path $env:TEMP ("llt-capture-{0}.err" -f [guid]::NewGuid().ToString('N'))
     try {
-        $p = Start-Process -FilePath $psExe -ArgumentList @($argList.ToArray()) `
+        $captureArgLine = ConvertTo-ProcessArgumentListString -Arguments @($argList.ToArray())
+        $p = Start-Process -FilePath $psExe -ArgumentList $captureArgLine `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $tempOut `
             -RedirectStandardError $tempErr
@@ -219,38 +237,59 @@ function Get-AdminPathsFromConfig {
 
 function Start-TargetProbe {
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $args = @(
+    $probeOutFile = Join-Path $outDir 'probe.out.log'
+    $argLine = ConvertTo-ProcessArgumentListString -Arguments @(
         '-NoProfile'
-        '-ExecutionPolicy', 'Bypass'
-        '-File', $probeScript
-        '-TargetUsername', $TargetUsername
-        '-ProbeFile', $probeLogFile
-        '-SessionQueryCsPath', $csPath
-        '-IntervalSeconds', "$ProbeIntervalSeconds"
-        '-TimeoutSeconds', "$ProbeTimeoutSeconds"
+        '-ExecutionPolicy'
+        'Bypass'
+        '-File'
+        $probeScript
+        '-TargetUsername'
+        $TargetUsername
+        '-ProbeFile'
+        $probeLogFile
+        '-SessionQueryCsPath'
+        $csPath
+        '-IntervalSeconds'
+        "$ProbeIntervalSeconds"
+        '-TimeoutSeconds'
+        "$ProbeTimeoutSeconds"
     )
-    $script:ProbeProcess = Start-Process -FilePath $psExe -ArgumentList $args `
+    $script:ProbeProcess = Start-Process -FilePath $psExe -ArgumentList $argLine `
         -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $probeOutFile `
         -RedirectStandardError $probeErrFile
     Set-Content -LiteralPath $probePidFile -Value $script:ProbeProcess.Id -Encoding ASCII
     Write-Journal -Message ("Started WTS probe PID={0} target={1} log={2}" -f `
             $script:ProbeProcess.Id, $TargetUsername, $probeLogFile)
 
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $probeLogFile) { break }
+        if (Test-Path -LiteralPath $probeLogFile) {
+            # Wait until the file has content (first probe line written).
+            try {
+                if ((Get-Item -LiteralPath $probeLogFile).Length -gt 0) { break }
+            }
+            catch { }
+        }
         if ($script:ProbeProcess.HasExited) { break }
         Start-Sleep -Milliseconds 200
     }
 
     if ($script:ProbeProcess.HasExited) {
+        $script:ProbeProcess.Refresh()
         $err = ''
+        $out = ''
         if (Test-Path -LiteralPath $probeErrFile) {
             $err = Get-Content -LiteralPath $probeErrFile -Raw -ErrorAction SilentlyContinue
         }
-        throw ("WTS probe exited early (code={0}). stderr={1}" -f $script:ProbeProcess.ExitCode, $err)
+        if (Test-Path -LiteralPath $probeOutFile) {
+            $out = Get-Content -LiteralPath $probeOutFile -Raw -ErrorAction SilentlyContinue
+        }
+        throw ("WTS probe exited early (code={0}). stderr={1} stdout={2}" -f `
+                $script:ProbeProcess.ExitCode, $err, $out)
     }
-    if (-not (Test-Path -LiteralPath $probeLogFile)) {
+    if (-not (Test-Path -LiteralPath $probeLogFile) -or ((Get-Item -LiteralPath $probeLogFile).Length -le 0)) {
         throw "WTS probe did not create log file: $probeLogFile"
     }
 }
@@ -306,13 +345,13 @@ try {
     Write-Host ("LogDirectory  : {0}" -f $paths.LogDirectory)
     Write-Host ''
     Write-Host 'This mode does NOT need a second account.'
-    Write-Host 'While locked, this console may freeze — that is normal.'
+    Write-Host 'While locked, this console may freeze - that is normal.'
     Write-Host 'Evidence while locked comes from the background WTS probe + LoginTimeLogs.'
     Write-Journal -Message 'Run started (one-account mode).'
 
     Write-Host ''
     Write-Host 'End-of-use action after ~1-2 minutes of unlocked use:' -ForegroundColor Yellow
-    Write-Host '  A) Win+L (lock)  — recommended for this test'
+    Write-Host '  A) Win+L (lock)  - recommended for this test'
     Write-Host '  B) Switch user / disconnect'
     Write-Host '  C) Walk away with screen still unlocked'
     $endAction = ''
@@ -323,14 +362,14 @@ try {
     Add-Content -LiteralPath $metaPath -Value ("PlannedEndAction: {0}" -f $endAction) -Encoding UTF8
 
     # --- Step 1: baseline while unlocked ---
-    Write-Banner 'Step 1 — Baseline while unlocked'
+    Write-Banner 'Step 1 - Baseline while unlocked'
     Wait-Operator -Prompt 'Confirm you are unlocked and interactive on this account. Then continue.'
     $null = Invoke-CapturedScript -ScriptPath $testSessionScript `
         -OutFile (Join-Path $outDir '01-unlocked-baseline.txt') `
         -ArgumentList @('-TargetUsername', $TargetUsername)
 
     # --- Step 2: start probe ---
-    Write-Banner 'Step 2 — Start continuous WTS probe'
+    Write-Banner 'Step 2 - Start continuous WTS probe'
     Start-TargetProbe
     Write-Host ("Probe log: {0}" -f $probeLogFile) -ForegroundColor Green
     $unlockMark = Get-Date
@@ -338,7 +377,7 @@ try {
     Add-Content -LiteralPath $metaPath -Value ("UnlockMarkLocal: {0:yyyy-MM-dd HH:mm:ss}" -f $unlockMark) -Encoding UTF8
 
     # --- Step 3: use briefly, lock, unlock, then Enter ---
-    Write-Banner 'Step 3 — Short unlocked use, then end action, then return'
+    Write-Banner 'Step 3 - Short unlocked use, then end action, then return'
     Write-Host ''
     Write-Host 'Do the following now:' -ForegroundColor Yellow
     Write-Host '  1) Use this desktop unlocked for about 1-2 minutes (real work).'
@@ -356,7 +395,7 @@ try {
     }
     Write-Host '  4) Return to THIS window and press Enter (only after step 3).'
     Write-Host ''
-    Write-Host 'Do not press Enter while locked — wait until you are unlocked again.' -ForegroundColor DarkYellow
+    Write-Host 'Do not press Enter while locked - wait until you are unlocked again.' -ForegroundColor DarkYellow
 
     $null = Read-Host 'After unlocked-use + end action + return (unlocked), press Enter here'
     $returnMark = Get-Date
@@ -373,7 +412,7 @@ try {
     }
 
     # --- Step 4: post-return captures ---
-    Write-Banner 'Step 4 — Post-return Test-Session + Status + collect logs'
+    Write-Banner 'Step 4 - Post-return Test-Session + Status + collect logs'
     $null = Invoke-CapturedScript -ScriptPath $testSessionScript `
         -OutFile (Join-Path $outDir '02-after-return.txt') `
         -ArgumentList @('-TargetUsername', $TargetUsername)
@@ -422,7 +461,7 @@ try {
                 Write-Host 'WTS probe: saw unlocked=False during the run (good for Win+L).' -ForegroundColor Green
             }
             else {
-                Write-Host 'WTS probe: never saw unlocked=False — lock may not have been detected.' -ForegroundColor Yellow
+                Write-Host 'WTS probe: never saw unlocked=False - lock may not have been detected.' -ForegroundColor Yellow
             }
         }
     }
@@ -435,7 +474,7 @@ try {
     Write-Journal -Message 'Run finished successfully.'
 
     $readme = @(
-        'Unlocked-time investigation — one-account output folder'
+        'Unlocked-time investigation - one-account output folder'
         '======================================================='
         ''
         ("OutputDir: {0}" -f $outDir)

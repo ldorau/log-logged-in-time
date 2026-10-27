@@ -121,42 +121,69 @@ Unlock the desktop, then re-run:
             ([SessionQuery]::LastLockSource), ([SessionQuery]::LastWtsSessionFlags))
 
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $probeArgs = @(
+    # Quote paths with spaces (Start-Process ArgumentList arrays are unreliable).
+    $quoteArg = {
+        param([string]$s)
+        if ($s -notmatch '[\s"]') { return $s }
+        return ('"{0}"' -f ($s -replace '"', '\"'))
+    }
+    $probeArgLine = @(
         '-NoProfile'
-        '-ExecutionPolicy', 'Bypass'
-        '-File', $probeScript
-        '-TargetUsername', $User
-        '-ProbeFile', $probeFile
-        '-SessionQueryCsPath', $csPath
-        '-IntervalSeconds', "$IntervalSeconds"
-        '-TimeoutSeconds', "$ProbeTimeoutSeconds"
-    )
-    $probe = Start-Process -FilePath $psExe -ArgumentList $probeArgs `
+        '-ExecutionPolicy'
+        'Bypass'
+        '-File'
+        (& $quoteArg $probeScript)
+        '-TargetUsername'
+        (& $quoteArg $User)
+        '-ProbeFile'
+        (& $quoteArg $probeFile)
+        '-SessionQueryCsPath'
+        (& $quoteArg $csPath)
+        '-IntervalSeconds'
+        "$IntervalSeconds"
+        '-TimeoutSeconds'
+        "$ProbeTimeoutSeconds"
+    ) -join ' '
+    $probeOutFile = Join-Path $probeDir 'probe.out.log'
+    $probe = Start-Process -FilePath $psExe -ArgumentList $probeArgLine `
         -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $probeOutFile `
         -RedirectStandardError $probeErrFile
     Set-Content -LiteralPath $probePidFile -Value $probe.Id -Encoding ASCII
 
-    $readyDeadline = (Get-Date).AddSeconds(10)
+    $readyDeadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $readyDeadline) {
-        if (Test-Path -LiteralPath $probeFile) { break }
+        if (Test-Path -LiteralPath $probeFile) {
+            try {
+                if ((Get-Item -LiteralPath $probeFile).Length -gt 0) { break }
+            }
+            catch { }
+        }
         if ($probe.HasExited) { break }
         Start-Sleep -Milliseconds 100
     }
 
     if ($probe.HasExited) {
+        $probe.Refresh()
         $errText = ''
+        $outText = ''
         if (Test-Path -LiteralPath $probeErrFile) {
             $errText = Get-Content -LiteralPath $probeErrFile -Raw -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $probeOutFile) {
+            $outText = Get-Content -LiteralPath $probeOutFile -Raw -ErrorAction SilentlyContinue
         }
         Write-TestLine -Level FAIL -Message @"
 Probe process exited early (code=$($probe.ExitCode)).
 Stderr:
 $errText
+Stdout:
+$outText
 "@
         exit 2
     }
 
-    if (-not (Test-Path -LiteralPath $probeFile)) {
+    if (-not (Test-Path -LiteralPath $probeFile) -or ((Get-Item -LiteralPath $probeFile).Length -le 0)) {
         Write-TestLine -Level FAIL -Message "Probe is running but log was not created: $probeFile"
         exit 2
     }

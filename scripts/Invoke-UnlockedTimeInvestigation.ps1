@@ -117,6 +117,23 @@ function Wait-Operator {
     Write-Journal -Message ("Operator continued: {0}" -f ($Prompt -replace '\s+', ' ').Trim())
 }
 
+function ConvertTo-ProcessArgumentListString {
+    # Start-Process joins ArgumentList arrays without reliable quoting; paths with
+    # spaces (e.g. OneDrive Desktop) must be a single properly quoted command line.
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $parts = foreach ($a in $Arguments) {
+        if ($null -eq $a) { continue }
+        $s = [string]$a
+        if ($s -notmatch '[\s"]') {
+            $s
+        }
+        else {
+            '"' + ($s -replace '"', '\"') + '"'
+        }
+    }
+    return (($parts | Where-Object { $null -ne $_ }) -join ' ')
+}
+
 function Invoke-CapturedScript {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -139,7 +156,8 @@ function Invoke-CapturedScript {
     $tempOut = Join-Path $env:TEMP ("llt-capture-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $tempErr = Join-Path $env:TEMP ("llt-capture-{0}.err" -f [guid]::NewGuid().ToString('N'))
     try {
-        $p = Start-Process -FilePath $psExe -ArgumentList @($argList.ToArray()) `
+        $captureArgLine = ConvertTo-ProcessArgumentListString -Arguments @($argList.ToArray())
+        $p = Start-Process -FilePath $psExe -ArgumentList $captureArgLine `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $tempOut `
             -RedirectStandardError $tempErr
@@ -219,38 +237,58 @@ function Get-AdminPathsFromConfig {
 
 function Start-TargetProbe {
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $args = @(
+    $probeOutFile = Join-Path $outDir 'probe.out.log'
+    $argLine = ConvertTo-ProcessArgumentListString -Arguments @(
         '-NoProfile'
-        '-ExecutionPolicy', 'Bypass'
-        '-File', $probeScript
-        '-TargetUsername', $TargetUsername
-        '-ProbeFile', $probeLogFile
-        '-SessionQueryCsPath', $csPath
-        '-IntervalSeconds', "$ProbeIntervalSeconds"
-        '-TimeoutSeconds', "$ProbeTimeoutSeconds"
+        '-ExecutionPolicy'
+        'Bypass'
+        '-File'
+        $probeScript
+        '-TargetUsername'
+        $TargetUsername
+        '-ProbeFile'
+        $probeLogFile
+        '-SessionQueryCsPath'
+        $csPath
+        '-IntervalSeconds'
+        "$ProbeIntervalSeconds"
+        '-TimeoutSeconds'
+        "$ProbeTimeoutSeconds"
     )
-    $script:ProbeProcess = Start-Process -FilePath $psExe -ArgumentList $args `
+    $script:ProbeProcess = Start-Process -FilePath $psExe -ArgumentList $argLine `
         -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $probeOutFile `
         -RedirectStandardError $probeErrFile
     Set-Content -LiteralPath $probePidFile -Value $script:ProbeProcess.Id -Encoding ASCII
     Write-Journal -Message ("Started WTS probe PID={0} target={1} log={2}" -f `
             $script:ProbeProcess.Id, $TargetUsername, $probeLogFile)
 
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $probeLogFile) { break }
+        if (Test-Path -LiteralPath $probeLogFile) {
+            try {
+                if ((Get-Item -LiteralPath $probeLogFile).Length -gt 0) { break }
+            }
+            catch { }
+        }
         if ($script:ProbeProcess.HasExited) { break }
         Start-Sleep -Milliseconds 200
     }
 
     if ($script:ProbeProcess.HasExited) {
+        $script:ProbeProcess.Refresh()
         $err = ''
+        $out = ''
         if (Test-Path -LiteralPath $probeErrFile) {
             $err = Get-Content -LiteralPath $probeErrFile -Raw -ErrorAction SilentlyContinue
         }
-        throw ("WTS probe exited early (code={0}). stderr={1}" -f $script:ProbeProcess.ExitCode, $err)
+        if (Test-Path -LiteralPath $probeOutFile) {
+            $out = Get-Content -LiteralPath $probeOutFile -Raw -ErrorAction SilentlyContinue
+        }
+        throw ("WTS probe exited early (code={0}). stderr={1} stdout={2}" -f `
+                $script:ProbeProcess.ExitCode, $err, $out)
     }
-    if (-not (Test-Path -LiteralPath $probeLogFile)) {
+    if (-not (Test-Path -LiteralPath $probeLogFile) -or ((Get-Item -LiteralPath $probeLogFile).Length -le 0)) {
         throw "WTS probe did not create log file: $probeLogFile"
     }
 }
