@@ -1236,7 +1236,8 @@ SystemDrive: $env:SystemDrive
 
     # User-context SessionSwitch watcher (primary Win+L signal when WTS/Desktop lie).
     $installedLockWatcher = Join-Path $installSrc 'LockSignalWatcher.ps1'
-    $lockWatcherArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File "{0}" -TargetUsername "{1}" -SignalPath "{2}" -HeartbeatSeconds 30' -f `
+    # Hidden + STA; watcher ignores CTRL_CLOSE (0xC000013A) and self-restarts its message pump.
+    $lockWatcherArgs = '-NoProfile -NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File "{0}" -TargetUsername "{1}" -SignalPath "{2}" -HeartbeatSeconds 15' -f `
         $installedLockWatcher, $targetUsername, $lockSignalPath
     try {
         $lockAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument $lockWatcherArgs
@@ -1245,10 +1246,11 @@ SystemDrive: $env:SystemDrive
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
             -StartWhenAvailable `
-            -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -RestartCount 999 `
+            -RestartInterval (New-TimeSpan -Seconds 15) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -MultipleInstances IgnoreNew
+            -MultipleInstances IgnoreNew `
+            -DontStopOnIdleEnd
         $lockPrincipal = New-ScheduledTaskPrincipal -UserId $targetUsername -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $lockSignalTaskName -Action $lockAction -Trigger $lockTrigger `
             -Settings $lockSettings -Principal $lockPrincipal -Force | Out-Null

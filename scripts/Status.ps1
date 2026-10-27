@@ -256,7 +256,14 @@ try {
 
     $lockSignalTask = Get-ScheduledTask -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue
     if ($lockSignalTask) {
-        Write-Host ("Lock signal task: LoginTimeLoggerLockSignal | State: {0}" -f $lockSignalTask.State)
+        $lockInfo = $null
+        try { $lockInfo = Get-ScheduledTaskInfo -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue } catch { }
+        $lockLast = if ($lockInfo) { '0x{0:X8}' -f [uint32]$lockInfo.LastTaskResult } else { '?' }
+        Write-Host ("Lock signal task: LoginTimeLoggerLockSignal | State: {0} | LastResult: {1}" -f `
+                $lockSignalTask.State, $lockLast)
+        if ($lockSignalTask.State -ne 'Running') {
+            Write-Host 'WARNING: Lock signal task is not Running — Win+L may not be detected. Start-ScheduledTask LoginTimeLoggerLockSignal (or log off/on).' -ForegroundColor Yellow
+        }
     }
     else {
         Write-Host 'Lock signal task: LoginTimeLoggerLockSignal is not installed.' -ForegroundColor Yellow
@@ -268,6 +275,20 @@ try {
             Write-Host ("Lock signal file: Locked={0}; Reason={1}; UpdatedLocal={2}; Source={3}" -f `
                     $sig.Locked, $sig.Reason, $sig.UpdatedLocal, $sig.Source)
             Write-Host ("  path: {0}" -f $lockSignalPath)
+            $ageSec = $null
+            if (-not [string]::IsNullOrWhiteSpace([string]$sig.UpdatedUtc)) {
+                try {
+                    $updatedUtc = [datetime]::Parse([string]$sig.UpdatedUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                    $ageSec = [int]([datetime]::UtcNow - $updatedUtc.ToUniversalTime()).TotalSeconds
+                }
+                catch { }
+            }
+            if ($null -ne $ageSec -and $ageSec -gt 90) {
+                Write-Host ("WARNING: Lock signal file is stale ({0}s old) — watcher likely dead." -f $ageSec) -ForegroundColor Yellow
+            }
+            elseif ($null -ne $ageSec) {
+                Write-Host ("  age: {0}s (ok if under ~90s)" -f $ageSec)
+            }
         }
         catch {
             Write-Host ("Lock signal file present but unreadable: {0}" -f $lockSignalPath) -ForegroundColor Yellow
