@@ -19,21 +19,34 @@ Before testing, note what the measured user did after a short unlocked session
 lock/away.)
 
 
-Interactive script (preferred)
-------------------------------
-Elevated PowerShell on the admin/operator account (the account that owns
-install/config/logs):
+Interactive scripts
+-------------------
+Two-account machine (operator stays interactive while measured user locks)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Elevated PowerShell on the admin/operator account (owns install/config/logs):
 
   cd <path-to-this-repo-clone>
   .\scripts\Invoke-UnlockedTimeInvestigation.ps1
-  # Or pass the measured account:
-  # .\scripts\Invoke-UnlockedTimeInvestigation.ps1 -TargetUsername 'DOMAIN\UserName'
+  # Or: .\scripts\Invoke-UnlockedTimeInvestigation.ps1 -TargetUsername 'DOMAIN\UserName'
 
-Follow on-screen prompts. Artifacts go to:
-  <Desktop>\unlocked-time-test-<timestamp>\
-(Desktop is resolved via the environment; override with -OutputRoot if needed.)
+Artifacts: <Desktop>\unlocked-time-test-<timestamp>\
 
-Zip that folder and share for analysis.
+One-account machine (single interactive user; console freezes while locked)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Elevated PowerShell as that user (must also own install/config/logs, or the
+same account used as TargetUsername for testing):
+
+  cd <path-to-this-repo-clone>
+  .\scripts\Invoke-UnlockedTimeInvestigation-OneAccount.ps1
+  # Default TargetUsername = USERDOMAIN\USERNAME
+  # Or: ... -TargetUsername 'DOMAIN\UserName'
+
+Artifacts: <Desktop>\unlocked-time-test-oneaccount-<timestamp>\
+Evidence while locked comes from the background WTS probe + LoginTimeLogs
+(no mid-lock Test-Session samples).
+
+Zip the output folder and share for analysis.
+(Desktop via [Environment]::GetFolderPath; override with -OutputRoot.)
 
 
 Manual steps (same plan; only if not using the script)

@@ -98,6 +98,8 @@ Project layout
   scripts\Test-LockCycle.ps1  - lock/unlock calibration for current user
   scripts\Test-WtsLockProbe.ps1 - one-account WTS lock probe (Win+L)
   scripts\WtsLockProbe.ps1    - background worker for Test-WtsLockProbe
+  scripts\Invoke-UnlockedTimeInvestigation.ps1 - two-account investigation
+  scripts\Invoke-UnlockedTimeInvestigation-OneAccount.ps1 - one-account investigation
   src\Common-Error.ps1        - screen + Administrator errors.log helper
   INSTALL.txt                 - installation guide
   README.txt                  - this file
