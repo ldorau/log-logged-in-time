@@ -59,33 +59,47 @@ try {
     }
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
 
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task) {
-        try {
-            if ($task.State -eq 'Running') {
-                Write-Host ("Stopping running task '{0}' (State={1})..." -f $TaskName, $task.State)
-                Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-                Start-Sleep -Seconds 2
+    $taskNames = @($TaskName, 'LoginTimeLoggerLockSignal')
+    foreach ($name in $taskNames) {
+        $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($task) {
+            try {
+                if ($task.State -eq 'Running') {
+                    Write-Host ("Stopping running task '{0}' (State={1})..." -f $name, $task.State)
+                    Stop-ScheduledTask -TaskName $name -ErrorAction Stop
+                    Start-Sleep -Seconds 2
+                }
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Uninstall' -Context (
+                    "Stop-ScheduledTask failed; task='{0}'; state='{1}'. Will still try Unregister-ScheduledTask." -f `
+                        $name, $task.State)
+            }
+
+            try {
+                Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+                Write-Host "Removed scheduled task '$name'."
+            }
+            catch {
+                $details = Format-ErrorDetails -ErrorRecord $_ -Context (
+                    "Unregister-ScheduledTask failed; task='{0}'" -f $name)
+                throw (New-Object System.Exception($details, $_.Exception))
             }
         }
-        catch {
-            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Uninstall' -Context (
-                "Stop-ScheduledTask failed; task='{0}'; state='{1}'. Will still try Unregister-ScheduledTask." -f `
-                    $TaskName, $task.State)
-        }
-
-        try {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-            Write-Host "Removed scheduled task '$TaskName'."
-        }
-        catch {
-            $details = Format-ErrorDetails -ErrorRecord $_ -Context (
-                "Unregister-ScheduledTask failed; task='{0}'" -f $TaskName)
-            throw (New-Object System.Exception($details, $_.Exception))
+        else {
+            Write-Host "Scheduled task '$name' was not found."
         }
     }
-    else {
-        Write-Host "Scheduled task '$TaskName' was not found."
+
+    $lockSignalDir = Join-Path $env:ProgramData 'LoginTimeLogger'
+    if (Test-Path -LiteralPath $lockSignalDir) {
+        try {
+            Remove-Item -LiteralPath $lockSignalDir -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed lock-signal directory: $lockSignalDir"
+        }
+        catch {
+            Write-Warning ("Could not remove lock-signal directory '{0}': {1}" -f $lockSignalDir, $_.Exception.Message)
+        }
     }
 
     $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'

@@ -63,6 +63,7 @@ try {
 
     $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     $targetUsername = '(not set)'
+    $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
 
     if (Test-Path -LiteralPath $configPath) {
         try {
@@ -78,6 +79,9 @@ try {
             }
             else {
                 $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$raw.LockSignalPath)) {
+                $lockSignalPath = [string]$raw.LockSignalPath
             }
         }
         catch {
@@ -243,6 +247,30 @@ try {
     Write-Host "Config file:     $configPath"
     Write-Host "Target username: $targetUsername"
     Write-Host "Log directory:   $logDirectory"
+
+    $lockSignalTask = Get-ScheduledTask -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue
+    if ($lockSignalTask) {
+        Write-Host ("Lock signal task: LoginTimeLoggerLockSignal | State: {0}" -f $lockSignalTask.State)
+    }
+    else {
+        Write-Host 'Lock signal task: LoginTimeLoggerLockSignal is not installed.' -ForegroundColor Yellow
+    }
+
+    if (Test-Path -LiteralPath $lockSignalPath) {
+        try {
+            $sig = Get-Content -LiteralPath $lockSignalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            Write-Host ("Lock signal file: Locked={0}; Reason={1}; UpdatedLocal={2}; Source={3}" -f `
+                    $sig.Locked, $sig.Reason, $sig.UpdatedLocal, $sig.Source)
+            Write-Host ("  path: {0}" -f $lockSignalPath)
+        }
+        catch {
+            Write-Host ("Lock signal file present but unreadable: {0}" -f $lockSignalPath) -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host ("Lock signal file missing: {0} (log on as target or Start-ScheduledTask LoginTimeLoggerLockSignal)" -f `
+                $lockSignalPath) -ForegroundColor Yellow
+    }
 
     $statePath = Join-Path $logDirectory 'state.json'
     $summaryPath = Join-Path $logDirectory 'unlocked-time-summary.csv'

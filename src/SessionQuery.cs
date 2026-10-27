@@ -3,7 +3,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Eventing.Reader;
+using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class SessionQuery
 {
@@ -17,20 +20,50 @@ public static class SessionQuery
     private const uint DESKTOP_SWITCHDESKTOP = 0x0100;
 
     /// <summary>
+    /// Ignore SessionSwitch signal files older than this (watcher should heartbeat).
+    /// </summary>
+    private const double LockSignalMaxAgeSeconds = 120;
+
+    /// <summary>
     /// WTS SessionFlags polarity. Docs: 0=Lock, 1=Unlock. Many builds reverse this.
     /// Default treats flag==1 as locked; calibrated at runtime from SecurityLog/Desktop.
     /// </summary>
     private static bool s_wtsOneMeansLocked = true;
     private static bool s_wtsPolarityCalibrated;
+    private static string s_lockSignalPath;
 
     /// <summary>Last non-fatal diagnostic from session/lock queries (for PowerShell debugging).</summary>
     public static string LastError { get; private set; }
 
-    /// <summary>How the last lock decision was made (WTS / Desktop / SecurityLog / FailClosed).</summary>
+    /// <summary>How the last lock decision was made (SecurityLog / SignalFile / Desktop / WTS / FailClosed).</summary>
     public static string LastLockSource { get; private set; }
 
     /// <summary>Raw WTS SessionFlags from the last ResolveLocked call (-1 if unknown).</summary>
     public static int LastWtsSessionFlags { get; private set; }
+
+    /// <summary>
+    /// Optional path to SessionSwitch lock-signal JSON (written by LockSignalWatcher).
+    /// Empty uses %ProgramData%\LoginTimeLogger\lock-signal.json.
+    /// </summary>
+    public static string LockSignalPath
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(s_lockSignalPath))
+            {
+                return s_lockSignalPath;
+            }
+
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "LoginTimeLogger",
+                "lock-signal.json");
+        }
+        set
+        {
+            s_lockSignalPath = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+    }
 
     /// <summary>True after WTS polarity was calibrated against SecurityLog or Desktop.</summary>
     public static bool WtsPolarityCalibrated
@@ -494,7 +527,8 @@ public static class SessionQuery
 
             using (var reader = new EventLogReader(elQuery))
             {
-                for (int i = 0; i < 40; i++)
+                int scanned = 0;
+                for (int i = 0; i < 80; i++)
                 {
                     EventRecord rec = reader.ReadEvent();
                     if (rec == null)
@@ -502,6 +536,7 @@ public static class SessionQuery
                         break;
                     }
 
+                    scanned++;
                     using (rec)
                     {
                         string xml = rec.ToXml() ?? string.Empty;
@@ -531,6 +566,12 @@ public static class SessionQuery
                         return true;
                     }
                 }
+
+                if (scanned == 0)
+                {
+                    SetLastError(
+                        "Security log has no 4800/4801 events (enable Success audit for Other Logon/Logoff Events).");
+                }
             }
 
             return false;
@@ -538,6 +579,96 @@ public static class SessionQuery
         catch (Exception ex)
         {
             SetLastError("Security log lock probe unavailable: " + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Reads lock state written by LockSignalWatcher (SystemEvents.SessionSwitch).
+    /// Reliable for Win+L when WTS/Desktop stay wrong and Security audit is off.
+    /// </summary>
+    private static bool TryGetLockedSignalFile(string userName, string domainName, bool domainRequired, out bool isLocked)
+    {
+        isLocked = false;
+        string path = LockSignalPath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            string json;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(fs, Encoding.UTF8))
+            {
+                json = reader.ReadToEnd();
+            }
+
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return false;
+            }
+
+            string signalUser = GetJsonStringValue(json, "TargetUsername");
+            if (!string.IsNullOrWhiteSpace(signalUser))
+            {
+                string signalUserName;
+                string signalDomain;
+                bool signalDomainRequired;
+                ParseAccountName(signalUser, out signalUserName, out signalDomain, out signalDomainRequired);
+                if (!string.Equals(signalUserName, userName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                if (domainRequired
+                    && !string.IsNullOrWhiteSpace(domainName)
+                    && !string.IsNullOrWhiteSpace(signalDomain)
+                    && !DomainNamesMatch(signalDomain, domainName))
+                {
+                    return false;
+                }
+            }
+
+            string updatedUtcRaw = GetJsonStringValue(json, "UpdatedUtc");
+            if (!string.IsNullOrWhiteSpace(updatedUtcRaw))
+            {
+                DateTime updatedUtc;
+                if (DateTime.TryParse(
+                        updatedUtcRaw,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind,
+                        out updatedUtc))
+                {
+                    if (updatedUtc.Kind == DateTimeKind.Unspecified)
+                    {
+                        updatedUtc = DateTime.SpecifyKind(updatedUtc, DateTimeKind.Utc);
+                    }
+
+                    double ageSeconds = (DateTime.UtcNow - updatedUtc.ToUniversalTime()).TotalSeconds;
+                    if (ageSeconds > LockSignalMaxAgeSeconds || ageSeconds < -60)
+                    {
+                        SetLastError(
+                            "Lock signal file stale; ageSeconds=" + ageSeconds.ToString("0") +
+                            "; path=" + path);
+                        return false;
+                    }
+                }
+            }
+
+            bool lockedValue;
+            if (!TryGetJsonBoolValue(json, "Locked", out lockedValue))
+            {
+                return false;
+            }
+
+            isLocked = lockedValue;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            SetLastError("Lock signal file read failed: " + ex.Message);
             return false;
         }
     }
@@ -566,6 +697,101 @@ public static class SessionQuery
         return xml.Substring(i, j - i).Trim();
     }
 
+    private static string GetJsonStringValue(string json, string name)
+    {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(name))
+        {
+            return string.Empty;
+        }
+
+        string key = "\"" + name + "\"";
+        int i = json.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (i < 0)
+        {
+            return string.Empty;
+        }
+
+        i = json.IndexOf(':', i + key.Length);
+        if (i < 0)
+        {
+            return string.Empty;
+        }
+
+        i++;
+        while (i < json.Length && char.IsWhiteSpace(json[i]))
+        {
+            i++;
+        }
+
+        if (i >= json.Length || json[i] != '"')
+        {
+            return string.Empty;
+        }
+
+        i++;
+        var sb = new StringBuilder();
+        while (i < json.Length)
+        {
+            char c = json[i++];
+            if (c == '\\' && i < json.Length)
+            {
+                sb.Append(json[i++]);
+                continue;
+            }
+
+            if (c == '"')
+            {
+                break;
+            }
+
+            sb.Append(c);
+        }
+
+        return sb.ToString();
+    }
+
+    private static bool TryGetJsonBoolValue(string json, string name, out bool value)
+    {
+        value = false;
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(name))
+        {
+            return false;
+        }
+
+        string key = "\"" + name + "\"";
+        int i = json.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (i < 0)
+        {
+            return false;
+        }
+
+        i = json.IndexOf(':', i + key.Length);
+        if (i < 0)
+        {
+            return false;
+        }
+
+        i++;
+        while (i < json.Length && char.IsWhiteSpace(json[i]))
+        {
+            i++;
+        }
+
+        if (i + 4 <= json.Length && string.Compare(json, i, "true", 0, 4, StringComparison.OrdinalIgnoreCase) == 0)
+        {
+            value = true;
+            return true;
+        }
+
+        if (i + 5 <= json.Length && string.Compare(json, i, "false", 0, 5, StringComparison.OrdinalIgnoreCase) == 0)
+        {
+            value = false;
+            return true;
+        }
+
+        return false;
+    }
+
     private static bool ResolveLocked(
         int sessionId,
         string userName,
@@ -589,11 +815,16 @@ public static class SessionQuery
         bool securityLocked = false;
         bool securityKnown = TryGetLockedSecurityLog(userName, domainName, domainRequired, out securityLocked);
 
-        // Preference:
-        // 1) Security audit (authoritative across sessions when enabled)
-        // 2) Desktop probe for same-session callers
-        // 3) WTS SessionFlags (polarity calibrated from 1/2 when available)
-        // 4) Fail closed (locked)
+        bool signalLocked = false;
+        bool signalKnown = TryGetLockedSignalFile(userName, domainName, domainRequired, out signalLocked);
+
+        // Preference (Win+L often leaves WTS flags stuck and OpenInputDesktop false-unlocked):
+        // 1) Security audit 4800/4801 when present
+        // 2) SessionSwitch lock-signal file (user-context watcher)
+        // 3) Desktop only when it reports locked (true positive); unlocked Desktop is weak
+        // 4) WTS SessionFlags (calibrated when possible)
+        // 5) Weak Desktop unlocked
+        // 6) Fail closed
         if (securityKnown)
         {
             if (wtsKnown)
@@ -610,26 +841,42 @@ public static class SessionQuery
             return securityLocked;
         }
 
-        if (desktopKnown)
+        if (signalKnown)
         {
             if (wtsKnown)
             {
-                CalibrateWtsPolarity(desktopLocked, wtsFlags, "Desktop");
+                CalibrateWtsPolarity(signalLocked, wtsFlags, "SignalFile");
+                InterpretWtsFlags(wtsFlags, out wtsLocked);
+            }
+            else if (desktopKnown && desktopLocked)
+            {
+                // Keep Desktop locked as supporting calibration when WTS unknown.
+            }
+
+            lockSource = "SignalFile";
+            LastLockSource = lockSource;
+            if (string.IsNullOrEmpty(LastError) || LastError.IndexOf("Calibrated WTS", StringComparison.Ordinal) < 0)
+            {
+                SetLastError(string.Empty);
+            }
+            return signalLocked;
+        }
+
+        // OpenInputDesktop failure is a strong locked signal; success is not trustworthy alone.
+        if (desktopKnown && desktopLocked)
+        {
+            if (wtsKnown)
+            {
+                CalibrateWtsPolarity(true, wtsFlags, "Desktop");
                 InterpretWtsFlags(wtsFlags, out wtsLocked);
             }
             lockSource = "Desktop";
             LastLockSource = lockSource;
-            if (wtsKnown && wtsLocked != desktopLocked && !s_wtsPolarityCalibrated)
-            {
-                SetLastError(
-                    "WTS/Desktop disagree; preferring Desktop. wtsLocked=" + wtsLocked +
-                    "; desktopLocked=" + desktopLocked + "; wtsFlags=" + wtsFlags);
-            }
-            else if (LastError == null || LastError.IndexOf("Calibrated WTS", StringComparison.Ordinal) < 0)
+            if (LastError == null || LastError.IndexOf("Calibrated WTS", StringComparison.Ordinal) < 0)
             {
                 SetLastError(string.Empty);
             }
-            return desktopLocked;
+            return true;
         }
 
         if (wtsKnown)
@@ -639,15 +886,24 @@ public static class SessionQuery
             if (!s_wtsPolarityCalibrated)
             {
                 SetLastError(
-                    "Using WTS SessionFlags without SecurityLog/Desktop calibration; wtsFlags=" + wtsFlags +
+                    "Using WTS SessionFlags without SecurityLog/SignalFile calibration; wtsFlags=" + wtsFlags +
                     "; wtsOneMeansLocked=" + s_wtsOneMeansLocked +
-                    ". Verify with Test-Session.ps1 while locked from another session.");
+                    ". Install LockSignalWatcher or enable Other Logon/Logoff audit.");
             }
             else
             {
                 SetLastError(string.Empty);
             }
             return wtsLocked;
+        }
+
+        if (desktopKnown)
+        {
+            lockSource = "Desktop";
+            LastLockSource = lockSource;
+            SetLastError(
+                "Using weak Desktop unlocked (no SecurityLog/SignalFile/WTS); desktop may false-report unlocked during Win+L.");
+            return desktopLocked;
         }
 
         lockSource = "FailClosed";

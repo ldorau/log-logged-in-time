@@ -199,6 +199,11 @@ LogDirectory in file: $($raw.LogDirectory)
         $adminUsername = [string]$raw.AdminUsername
     }
 
+    $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.LockSignalPath)) {
+        $lockSignalPath = [string]$raw.LockSignalPath
+    }
+
     [pscustomobject]@{
         AdminUsername        = $adminUsername
         TargetUsername       = [string]$raw.TargetUsername
@@ -206,6 +211,7 @@ LogDirectory in file: $($raw.LogDirectory)
         LogDirectory         = $logDirectory
         PollIntervalSeconds  = $pollSeconds
         ConfigPath           = $Path
+        LockSignalPath       = $lockSignalPath
         UpdateEnabled        = $updateEnabled
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
@@ -480,6 +486,9 @@ try {
 
     $csPath = Join-Path $scriptDir 'SessionQuery.cs'
     Import-SessionQueryType -SourcePath $csPath
+    if (-not [string]::IsNullOrWhiteSpace([string]$config.LockSignalPath)) {
+        [SessionQuery]::LockSignalPath = [string]$config.LockSignalPath
+    }
 
     Initialize-SecureLogDirectory -Directory $config.LogDirectory `
         -DeniedUsername $config.TargetUsername `
@@ -500,8 +509,8 @@ try {
     }
     $adminAppDirectory = Join-Path $config.AdministratorProfile 'LoginTimeLogger'
 
-    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}" -f `
-            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled)
+    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}" -f `
+            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'

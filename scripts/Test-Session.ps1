@@ -114,7 +114,7 @@ Set the Windows logon name in TargetUsername, then retry.
         if (-not [string]::IsNullOrWhiteSpace([SessionQuery]::LastError)) {
             Write-Host ("SessionQuery.LastError: {0}" -f [SessionQuery]::LastError) -ForegroundColor Yellow
         }
-        Write-Host 'Tip: from another elevated session, lock the target desktop (Win+L) and re-run to verify LockSource/WtsFlags.'
+        Write-Host 'Tip: after Install, LockSource should be SignalFile or SecurityLog while Win+L is held (WTS/Desktop alone often stay wrong).'
     }
     catch {
         $last = $null

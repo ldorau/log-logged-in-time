@@ -418,7 +418,7 @@ try {
     $null = Invoke-CapturedScript -ScriptPath $statusScript `
         -OutFile (Join-Path $outDir '05-status.txt')
 
-    Write-Journal -Message 'Collecting LoginTimeLogs / config / errors.log'
+    Write-Journal -Message 'Collecting LoginTimeLogs / config / errors.log / lock-signal'
     if (Test-Path -LiteralPath $paths.LogDirectory) {
         Copy-Item -Path (Join-Path $paths.LogDirectory '*') -Destination $logsDir -Force -ErrorAction SilentlyContinue
     }
@@ -431,6 +431,19 @@ try {
     if (Test-Path -LiteralPath $paths.ErrorLogPath) {
         Copy-Item -LiteralPath $paths.ErrorLogPath -Destination (Join-Path $outDir 'errors.log') -Force
     }
+    try {
+        $sigPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+        if ($paths.RuntimeConfigPath -and (Test-Path -LiteralPath $paths.RuntimeConfigPath)) {
+            $cfg = Get-Content -LiteralPath $paths.RuntimeConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfg.LockSignalPath)) {
+                $sigPath = [string]$cfg.LockSignalPath
+            }
+        }
+        if (Test-Path -LiteralPath $sigPath) {
+            Copy-Item -LiteralPath $sigPath -Destination (Join-Path $outDir 'lock-signal.json') -Force
+        }
+    }
+    catch { }
 
     Stop-TargetProbe
 
@@ -474,6 +487,7 @@ try {
         '  wts-target-probe.log     - full continuous WTS probe for TargetUsername'
         '  LoginTimeLogs\           - copy of monitor day logs / state / service.log'
         '  config.json / errors.log - runtime config and error log (if present)'
+        '  lock-signal.json         - SessionSwitch signal file (if watcher running)'
         ''
         'Share this whole folder (zip) for analysis.'
     )

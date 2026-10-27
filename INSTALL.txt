@@ -102,6 +102,15 @@ Prerequisite checks include:
 
 The startup task runs powershell.exe with -WindowStyle Hidden.
 
+Lock detection
+--------------
+Install also registers LoginTimeLoggerLockSignal (At logon as TargetUsername).
+That watcher writes %ProgramData%\LoginTimeLogger\lock-signal.json from
+SystemEvents.SessionSwitch so Win+L is visible to the SYSTEM monitor when
+WTS SessionFlags / OpenInputDesktop stay wrong. Install tries to enable
+Success audit for Other Logon/Logoff Events (Security 4800/4801) when local
+policy allows; domain GPO may override.
+
 Self-update (background monitor; opt-in)
 ----------------------------------------
 Disabled by default (UpdateEnabled=false). When enabled, once per day the

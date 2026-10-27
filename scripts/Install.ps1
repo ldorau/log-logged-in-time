@@ -534,12 +534,13 @@ function Test-InstallPrerequisites {
 
     # --- Project files ---
     $requiredFiles = @{
-        'Monitor script'   = $MonitorScript
-        'Config template'  = $TemplateConfigPath
-        'SessionQuery.cs'  = $CsPath
-        'Common-Error.ps1' = (Join-Path $RepoRoot 'src\Common-Error.ps1')
-        'Update-Check.ps1' = (Join-Path $RepoRoot 'src\Update-Check.ps1')
-        'Scp-OnLock.ps1'   = (Join-Path $RepoRoot 'src\Scp-OnLock.ps1')
+        'Monitor script'         = $MonitorScript
+        'Config template'        = $TemplateConfigPath
+        'SessionQuery.cs'        = $CsPath
+        'Common-Error.ps1'       = (Join-Path $RepoRoot 'src\Common-Error.ps1')
+        'Update-Check.ps1'       = (Join-Path $RepoRoot 'src\Update-Check.ps1')
+        'Scp-OnLock.ps1'         = (Join-Path $RepoRoot 'src\Scp-OnLock.ps1')
+        'LockSignalWatcher.ps1'  = (Join-Path $RepoRoot 'src\LockSignalWatcher.ps1')
     }
     foreach ($entry in $requiredFiles.GetEnumerator()) {
         $exists = Test-Path -LiteralPath $entry.Value
@@ -1033,12 +1034,16 @@ SystemDrive: $env:SystemDrive
         $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     }
 
+    $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    $lockSignalTaskName = 'LoginTimeLoggerLockSignal'
+
     $config = [ordered]@{
         AdminUsername        = [string]$AdminUsername
         TargetUsername       = $targetUsername
         AdministratorProfile = $administratorProfile
         LogDirectory         = $logDirectory
         PollIntervalSeconds  = $pollSeconds
+        LockSignalPath       = $lockSignalPath
         UpdateEnabled        = $updateEnabled
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
@@ -1068,8 +1073,73 @@ SystemDrive: $env:SystemDrive
         throw (New-Object System.Exception($details, $_.Exception))
     }
 
+    # SessionSwitch signal dir: target user must write; SYSTEM/admin read (not the ACL-denied log folder).
+    try {
+        $lockSignalDir = Split-Path -Parent $lockSignalPath
+        if (-not (Test-Path -LiteralPath $lockSignalDir)) {
+            New-Item -ItemType Directory -Path $lockSignalDir -Force | Out-Null
+        }
+        $signalAcl = Get-Acl -LiteralPath $lockSignalDir
+        $signalAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($signalAcl.Access)) {
+            $null = $signalAcl.RemoveAccessRule($rule)
+        }
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $signalAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $sidSystem `
+                    -Rights FullControl `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
+        $signalAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $sidAdmins `
+                    -Rights FullControl `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
+        $signalAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                    -Sid $allowedAdminSid `
+                    -Rights FullControl `
+                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                    -PropagationFlags None `
+                    -AccessControlType Allow))
+        if ($targetSid) {
+            $signalAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                        -Sid $targetSid `
+                        -Rights Modify `
+                        -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                        -PropagationFlags None `
+                        -AccessControlType Allow))
+        }
+        Set-Acl -LiteralPath $lockSignalDir -AclObject $signalAcl
+        Write-Host ("Lock signal directory: {0}" -f $lockSignalDir)
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context (
+            "Creating lock-signal directory/ACL failed; path='{0}'" -f $lockSignalPath)
+        throw (New-Object System.Exception($details, $_.Exception))
+    }
+
+    # Prefer Security 4800/4801 when policy allows (may be overridden by domain GPO).
+    try {
+        $auditOut = & auditpol.exe /set /subcategory:'{0CCE921C-69AE-11D9-BED3-505054503030}' /success:enable 2>&1
+        $auditText = ($auditOut | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Enabled Success audit for Other Logon/Logoff Events (Security 4800/4801).'
+        }
+        else {
+            Write-Warning ("Could not enable Other Logon/Logoff audit (exit={0}): {1}. LockSignalWatcher remains the primary Win+L signal." -f `
+                    $LASTEXITCODE, $auditText)
+        }
+    }
+    catch {
+        Write-Warning ("auditpol failed: {0}. LockSignalWatcher remains the primary Win+L signal." -f $_.Exception.Message)
+    }
+
     $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
     $installSrc = Join-Path $installRoot 'src'
+    $lockSignalWatcherSrc = Join-Path $repoRoot 'src\LockSignalWatcher.ps1'
 
     try {
         New-Item -ItemType Directory -Path $installSrc -Force | Out-Null
@@ -1078,6 +1148,7 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $commonErrorSrc -Destination (Join-Path $installSrc 'Common-Error.ps1') -Force
         Copy-Item -LiteralPath $updateCheckSrc -Destination (Join-Path $installSrc 'Update-Check.ps1') -Force
         Copy-Item -LiteralPath $scpOnLockSrc -Destination (Join-Path $installSrc 'Scp-OnLock.ps1') -Force
+        Copy-Item -LiteralPath $lockSignalWatcherSrc -Destination (Join-Path $installSrc 'LockSignalWatcher.ps1') -Force
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
@@ -1163,10 +1234,39 @@ SystemDrive: $env:SystemDrive
         throw (New-Object System.Exception($details, $_.Exception))
     }
 
+    # User-context SessionSwitch watcher (primary Win+L signal when WTS/Desktop lie).
+    $installedLockWatcher = Join-Path $installSrc 'LockSignalWatcher.ps1'
+    $lockWatcherArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File "{0}" -TargetUsername "{1}" -SignalPath "{2}" -HeartbeatSeconds 30' -f `
+        $installedLockWatcher, $targetUsername, $lockSignalPath
+    try {
+        $lockAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument $lockWatcherArgs
+        $lockTrigger = New-ScheduledTaskTrigger -AtLogOn -User $targetUsername
+        $lockSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -MultipleInstances IgnoreNew
+        $lockPrincipal = New-ScheduledTaskPrincipal -UserId $targetUsername -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $lockSignalTaskName -Action $lockAction -Trigger $lockTrigger `
+            -Settings $lockSettings -Principal $lockPrincipal -Force | Out-Null
+        Write-Host ("Installed scheduled task '{0}' (At logon as {1}, SessionSwitch lock signal)." -f `
+                $lockSignalTaskName, $targetUsername)
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context (
+            "Register-ScheduledTask failed for lock signal; task='{0}'; user='{1}'" -f `
+                $lockSignalTaskName, $targetUsername)
+        throw (New-Object System.Exception($details, $_.Exception))
+    }
+
     Write-Host "Installed scheduled task '$TaskName' (At startup, SYSTEM, Highest)."
     Write-Host "Monitor scripts: $installRoot"
     Write-Host "Runtime config:  $runtimeConfigPath"
     Write-Host "Log directory:   $logDirectory"
+    Write-Host "Lock signal:     $lockSignalPath"
     Write-Host "Target username: $targetUsername"
 
     if ($StartNow) {
@@ -1179,9 +1279,19 @@ SystemDrive: $env:SystemDrive
                 "Start-ScheduledTask failed after successful registration; task='{0}'" -f $TaskName)
             throw (New-Object System.Exception($details, $_.Exception))
         }
+
+        try {
+            Start-ScheduledTask -TaskName $lockSignalTaskName -ErrorAction Stop
+            Write-Host ("Lock signal task '{0}' started (needs interactive logon session)." -f $lockSignalTaskName)
+        }
+        catch {
+            Write-Warning ("Could not start '{0}' now (user may need to log off/on): {1}" -f `
+                    $lockSignalTaskName, $_.Exception.Message)
+        }
     }
     else {
         Write-Host "Run: Start-ScheduledTask -TaskName '$TaskName'   (or reboot)"
+        Write-Host "Lock signal starts at next logon of '$targetUsername' (task '$lockSignalTaskName')."
     }
 }
 catch {
