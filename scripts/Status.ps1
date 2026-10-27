@@ -97,8 +97,9 @@ try {
     # 0x0      = completed successfully (also seen while some hosts keep Running)
     # 0x41300  = SCHED_S_TASK_READY
     # 0x41301  = SCHED_S_TASK_RUNNING (normal while the long-running monitor is up)
-    $schedTaskReady = 0x41300
-    $schedTaskRunning = 0x41301
+    # LastTaskResult can be a HRESULT > Int32.MaxValue (e.g. 0x800710E0); use UInt32.
+    $schedTaskReady = [uint32]0x41300
+    $schedTaskRunning = [uint32]0x41301
 
     $taskState = $null
     $lastTaskResult = $null
@@ -108,11 +109,11 @@ try {
         if ($task) {
             $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
             $taskState = [string]$task.State
-            $lastTaskResult = [int]$info.LastTaskResult
+            $lastTaskResult = [uint32]$info.LastTaskResult
             $lastRunTime = $info.LastRunTime
-            $resultHex = '0x{0:X}' -f $lastTaskResult
+            $resultHex = '0x{0:X8}' -f $lastTaskResult
             $resultNote = ''
-            if ($lastTaskResult -eq 0) {
+            if ($lastTaskResult -eq [uint32]0) {
                 $resultNote = 'success'
             }
             elseif ($lastTaskResult -eq $schedTaskRunning) {
@@ -121,14 +122,19 @@ try {
             elseif ($lastTaskResult -eq $schedTaskReady) {
                 $resultNote = 'SCHED_S_TASK_READY'
             }
+            elseif ($lastTaskResult -eq [uint32]0x800710E0) {
+                # Common after Start-ScheduledTask when MultipleInstances=IgnoreNew and monitor already holds the mutex.
+                $resultNote = 'HRESULT 0x800710E0 (often instance-already-running; OK if mutex/process healthy)'
+            }
             Write-Host ("Task: {0} | State: {1} | LastResult: {2} ({3}){4} | LastRun: {5}" -f `
                     $TaskName, $task.State, $lastTaskResult, $resultHex, $(
                         if ($resultNote) { " = $resultNote" } else { '' }
                     ), $info.LastRunTime)
 
-            $lastResultOk = ($lastTaskResult -eq 0) -or
+            $lastResultOk = ($lastTaskResult -eq [uint32]0) -or
                 ($lastTaskResult -eq $schedTaskRunning) -or
-                ($lastTaskResult -eq $schedTaskReady -and $taskState -eq 'Ready')
+                ($lastTaskResult -eq $schedTaskReady -and $taskState -eq 'Ready') -or
+                ($lastTaskResult -eq [uint32]0x800710E0)
             if (-not $lastResultOk) {
                 Write-Host ("WARNING: Task last result {0} ({1}) looks like a failure. Check '{2}\service.log', '{3}', and Task Scheduler history." -f `
                         $lastTaskResult, $resultHex, $logDirectory, (Get-ErrorLogPath)) -ForegroundColor Yellow
