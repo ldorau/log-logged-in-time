@@ -1242,18 +1242,23 @@ SystemDrive: $env:SystemDrive
     try {
         $lockAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument $lockWatcherArgs
         $lockTrigger = New-ScheduledTaskTrigger -AtLogOn -User $targetUsername
+        # RestartInterval minimum accepted by Task Scheduler is 1 minute (PT15S fails with 0x80041318).
         $lockSettings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
             -StartWhenAvailable `
             -RestartCount 999 `
-            -RestartInterval (New-TimeSpan -Seconds 15) `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -MultipleInstances IgnoreNew `
             -DontStopOnIdleEnd
         $lockPrincipal = New-ScheduledTaskPrincipal -UserId $targetUsername -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $lockSignalTaskName -Action $lockAction -Trigger $lockTrigger `
-            -Settings $lockSettings -Principal $lockPrincipal -Force | Out-Null
+            -Settings $lockSettings -Principal $lockPrincipal -Force -ErrorAction Stop | Out-Null
+        $registeredLock = Get-ScheduledTask -TaskName $lockSignalTaskName -ErrorAction Stop
+        if (-not $registeredLock) {
+            throw "Lock signal task '$lockSignalTaskName' was not present after Register-ScheduledTask."
+        }
         Write-Host ("Installed scheduled task '{0}' (At logon as {1}, SessionSwitch lock signal)." -f `
                 $lockSignalTaskName, $targetUsername)
     }
