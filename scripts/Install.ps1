@@ -1302,7 +1302,7 @@ SystemDrive: $env:SystemDrive
     }
 
     # User-context SessionSwitch watcher (primary Win+L signal when WTS/Desktop lie).
-    # Launch via wscript (hidden) — direct powershell.exe Interactive tasks flash a console.
+    # Launch via wscript (hidden) - direct powershell.exe Interactive tasks flash a console.
     $installedLockWatcher = Join-Path $installSrc 'LockSignalWatcher.ps1'
     $lockLauncherVbs = Join-Path $installSrc 'Start-LockSignalWatcher.vbs'
     $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'

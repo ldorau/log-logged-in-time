@@ -262,7 +262,7 @@ try {
         Write-Host ("Lock signal task: LoginTimeLoggerLockSignal | State: {0} | LastResult: {1}" -f `
                 $lockSignalTask.State, $lockLast)
         if ($lockSignalTask.State -ne 'Running') {
-            Write-Host 'WARNING: Lock signal task is not Running — Win+L may not be detected. Start-ScheduledTask LoginTimeLoggerLockSignal (or log off/on).' -ForegroundColor Yellow
+            Write-Host 'WARNING: Lock signal task is not Running - Win+L may not be detected. Start-ScheduledTask LoginTimeLoggerLockSignal (or log off/on).' -ForegroundColor Yellow
         }
     }
     else {
@@ -284,7 +284,7 @@ try {
                 catch { }
             }
             if ($null -ne $ageSec -and $ageSec -gt 90) {
-                Write-Host ("WARNING: Lock signal file is stale ({0}s old) — watcher likely dead." -f $ageSec) -ForegroundColor Yellow
+                Write-Host ("WARNING: Lock signal file is stale ({0}s old) - watcher likely dead." -f $ageSec) -ForegroundColor Yellow
             }
             elseif ($null -ne $ageSec) {
                 Write-Host ("  age: {0}s (ok if under ~90s)" -f $ageSec)
