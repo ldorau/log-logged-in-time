@@ -385,7 +385,10 @@ function Ensure-SummaryHeader {
 function Format-Duration {
     param([Parameter(Mandatory)][double]$Seconds)
     $ts = [TimeSpan]::FromSeconds([Math]::Max(0, [Math]::Floor($Seconds)))
-    '{0:00}:{1:00}:{2:00}' -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds
+    # Use Floor(TotalHours), not [int] cast: PowerShell casts double->int with rounding,
+    # so [int]0.5..0.99 becomes 1 and cumulative_today jumps from 00:mm:ss to 01:mm:ss
+    # after ~30 minutes of unlocked time (display bug; state seconds stayed correct).
+    '{0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($ts.TotalHours), $ts.Minutes, $ts.Seconds
 }
 
 function Write-DailyLogLine {
