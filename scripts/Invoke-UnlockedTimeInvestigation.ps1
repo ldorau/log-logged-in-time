@@ -5,9 +5,9 @@
   Interactive runner for UNLOCKED-TIME-INVESTIGATION-TEST-PLAN.txt.
 .DESCRIPTION
   Walks through Steps 1-5 of an unlocked-time investigation for a measured
-  account: Test-Session snapshots, background WTS probe targeting that user,
-  repeated post-lock samples, Status, and copies of LoginTimeLogs / config /
-  errors.log into one output folder for offline analysis.
+  account: Test-Session snapshots, background SessionQuery probe (SignalFile /
+  SecurityLog / WTS), repeated post-lock samples, Status, and copies of
+  LoginTimeLogs / config / errors.log / lock-signal into one output folder.
   Paths and account names are prompted or taken from parameters / runtime config
   (no hardcoded machine users or profile paths).
 .PARAMETER TargetUsername
@@ -361,19 +361,20 @@ try {
     Add-Content -LiteralPath $metaPath -Value ("PlannedEndAction: {0}" -f $endAction) -Encoding UTF8
 
     # --- Step 1 ---
-    Write-Banner 'Step 1 — Before target unlocks'
+    Write-Banner 'Step 1 - Before target unlocks'
     Wait-Operator -Prompt ("Confirm '{0}' is NOT unlocked-active yet (locked/disconnected/no session). Then continue." -f $TargetUsername)
     $null = Invoke-CapturedScript -ScriptPath $testSessionScript `
         -OutFile (Join-Path $outDir '01-before.txt') `
         -ArgumentList @('-TargetUsername', $TargetUsername)
 
     # --- Step 2 ---
-    Write-Banner 'Step 2 — Start continuous WTS probe for target'
+    Write-Banner 'Step 2 - Start continuous SessionQuery probe for target'
     Start-TargetProbe
     Write-Host ("Probe log: {0}" -f $probeLogFile) -ForegroundColor Green
+    Write-Host 'Expect source=SignalFile (or SecurityLog) while locked; WTS/Desktop alone often stay wrong.' -ForegroundColor DarkGray
 
     # --- Step 3 ---
-    Write-Banner 'Step 3 — Target unlocks and uses desktop 1-2 minutes only'
+    Write-Banner 'Step 3 - Target unlocks and uses desktop 1-2 minutes only'
     Wait-Operator -Prompt ("Have '{0}' unlock/sign in and start using the desktop now. Right after unlock is stable, continue HERE (do not wait the full 1-2 minutes yet)." -f $TargetUsername)
     $unlockMark = Get-Date
     Write-Journal -Message ("Unlock mark (operator): {0:yyyy-MM-dd HH:mm:ss}" -f $unlockMark)
@@ -387,7 +388,7 @@ try {
     Wait-Operator -Prompt ("When '{0}' has finished the 1-2 minutes and is ABOUT to perform end action {1} (or just did it within the last few seconds), continue HERE immediately." -f $TargetUsername, $endAction)
 
     # --- Step 4 ---
-    Write-Banner 'Step 4 — Right after end-of-use + repeated samples'
+    Write-Banner 'Step 4 - Right after end-of-use + repeated samples'
     $endMark = Get-Date
     Write-Journal -Message ("End-of-use mark (operator): {0:yyyy-MM-dd HH:mm:ss} action={1}" -f $endMark, $endAction)
     Add-Content -LiteralPath $metaPath -Value ("EndOfUseMarkLocal: {0:yyyy-MM-dd HH:mm:ss}" -f $endMark) -Encoding UTF8
@@ -407,7 +408,7 @@ try {
     }
 
     # --- Step 5 ---
-    Write-Banner ("Step 5 — Wait {0} more minute(s), then Status + collect logs" -f $PostLockWaitMinutes)
+    Write-Banner ("Step 5 - Wait {0} more minute(s), then Status + collect logs" -f $PostLockWaitMinutes)
     if ($PostLockWaitMinutes -gt 0) {
         Write-Host ("Waiting {0} minute(s). Keep target locked/away if that was the plan." -f $PostLockWaitMinutes)
         Write-Journal -Message ("Post-end wait start ({0} min)" -f $PostLockWaitMinutes)
@@ -448,32 +449,65 @@ try {
     Stop-TargetProbe
 
     $probeSummary = Join-Path $outDir '06-probe-summary.txt'
+    $sawLocked = $false
+    $sawUnlocked = $false
+    $signalFileFalseCount = 0
     if (Test-Path -LiteralPath $probeLogFile) {
         $probeLines = @(Get-Content -LiteralPath $probeLogFile -ErrorAction SilentlyContinue)
         $falseCount = @($probeLines | Where-Object { $_ -match '\bunlocked=False\b' }).Count
         $trueCount = @($probeLines | Where-Object { $_ -match '\bunlocked=True\b' }).Count
+        $signalFileFalseCount = @($probeLines | Where-Object {
+                $_ -match '\bunlocked=False\b' -and $_ -match '\bsource=SignalFile\b'
+            }).Count
+        $sawLocked = $falseCount -gt 0
+        $sawUnlocked = $trueCount -gt 0
         $summary = @(
             ("ProbeLog: {0}" -f $probeLogFile)
             ("Lines: {0}" -f $probeLines.Count)
             ("unlocked=True samples: {0}" -f $trueCount)
             ("unlocked=False samples: {0}" -f $falseCount)
+            ("unlocked=False source=SignalFile: {0}" -f $signalFileFalseCount)
+            ("WtsSawLocked: {0}" -f $sawLocked)
             ''
             '--- last 40 lines ---'
         ) + @($probeLines | Select-Object -Last 40)
         Set-Content -LiteralPath $probeSummary -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
+
+        if ($endAction -eq 'A') {
+            if ($sawLocked) {
+                Write-Host 'Probe: saw unlocked=False during the run (good for Win+L).' -ForegroundColor Green
+                if ($signalFileFalseCount -gt 0) {
+                    Write-Host ("Probe: {0} False sample(s) used source=SignalFile (expected after Install)." -f $signalFileFalseCount) -ForegroundColor Green
+                }
+                else {
+                    Write-Host 'Probe: False samples were not SignalFile - check lock-signal watcher / SecurityLog.' -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host 'Probe: never saw unlocked=False - lock may not have been detected.' -ForegroundColor Yellow
+            }
+        }
     }
 
     $finished = Get-Date
     Add-Content -LiteralPath $metaPath -Value ("FinishedLocal: {0:yyyy-MM-dd HH:mm:ss}" -f $finished) -Encoding UTF8
     Add-Content -LiteralPath $metaPath -Value ("FinishedUtc: {0:o}" -f $finished.ToUniversalTime()) -Encoding UTF8
+    Add-Content -LiteralPath $metaPath -Value ("WtsSawLocked: {0}" -f $sawLocked) -Encoding UTF8
+    Add-Content -LiteralPath $metaPath -Value ("WtsSawUnlocked: {0}" -f $sawUnlocked) -Encoding UTF8
+    Add-Content -LiteralPath $metaPath -Value ("SignalFileFalseSamples: {0}" -f $signalFileFalseCount) -Encoding UTF8
     Write-Journal -Message 'Run finished successfully.'
 
     $readme = @(
-        'Unlocked-time investigation — output folder'
+        'Unlocked-time investigation - output folder'
         '==========================================='
         ''
         ("OutputDir: {0}" -f $outDir)
         ("TargetUsername: {0}" -f $TargetUsername)
+        ''
+        'Pass hints (Win+L):'
+        '  - probe: many unlocked=False with source=SignalFile (or SecurityLog)'
+        '  - day log: LOCKED_OR_AWAY then UNLOCKED_ACTIVE (LockSource=SignalFile)'
+        '  - Status: lock-signal task Running; signal file age under ~90s'
         ''
         'Key files:'
         '  00-run-meta.txt          - run parameters and wall-clock marks'
@@ -483,8 +517,8 @@ try {
         '  03-right-after-end.txt   - Test-Session right after end-of-use'
         '  04-post-end-NN.txt       - repeated Test-Session samples'
         '  05-status.txt            - Status.ps1 after wait'
-        '  06-probe-summary.txt     - WTS probe True/False counts + tail'
-        '  wts-target-probe.log     - full continuous WTS probe for TargetUsername'
+        '  06-probe-summary.txt     - probe True/False + SignalFile counts + tail'
+        '  wts-target-probe.log     - full continuous SessionQuery probe'
         '  LoginTimeLogs\           - copy of monitor day logs / state / service.log'
         '  config.json / errors.log - runtime config and error log (if present)'
         '  lock-signal.json         - SessionSwitch signal file (if watcher running)'

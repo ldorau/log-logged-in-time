@@ -452,10 +452,14 @@ try {
     $probeSummary = Join-Path $outDir '04-probe-summary.txt'
     $sawLocked = $false
     $sawUnlocked = $false
+    $signalFileFalseCount = 0
     if (Test-Path -LiteralPath $probeLogFile) {
         $probeLines = @(Get-Content -LiteralPath $probeLogFile -ErrorAction SilentlyContinue)
         $falseCount = @($probeLines | Where-Object { $_ -match '\bunlocked=False\b' }).Count
         $trueCount = @($probeLines | Where-Object { $_ -match '\bunlocked=True\b' }).Count
+        $signalFileFalseCount = @($probeLines | Where-Object {
+                $_ -match '\bunlocked=False\b' -and $_ -match '\bsource=SignalFile\b'
+            }).Count
         $sawLocked = $falseCount -gt 0
         $sawUnlocked = $trueCount -gt 0
         $summary = @(
@@ -463,6 +467,7 @@ try {
             ("Lines: {0}" -f $probeLines.Count)
             ("unlocked=True samples: {0}" -f $trueCount)
             ("unlocked=False samples: {0}" -f $falseCount)
+            ("unlocked=False source=SignalFile: {0}" -f $signalFileFalseCount)
             ("WtsSawLocked: {0}" -f $sawLocked)
             ''
             '--- last 40 lines ---'
@@ -471,10 +476,16 @@ try {
 
         if ($endAction -eq 'A') {
             if ($sawLocked) {
-                Write-Host 'WTS probe: saw unlocked=False during the run (good for Win+L).' -ForegroundColor Green
+                Write-Host 'Probe: saw unlocked=False during the run (good for Win+L).' -ForegroundColor Green
+                if ($signalFileFalseCount -gt 0) {
+                    Write-Host ("Probe: {0} False sample(s) used source=SignalFile (expected after Install)." -f $signalFileFalseCount) -ForegroundColor Green
+                }
+                else {
+                    Write-Host 'Probe: False samples were not SignalFile - check lock-signal watcher / SecurityLog.' -ForegroundColor Yellow
+                }
             }
             else {
-                Write-Host 'WTS probe: never saw unlocked=False - lock may not have been detected.' -ForegroundColor Yellow
+                Write-Host 'Probe: never saw unlocked=False - lock may not have been detected.' -ForegroundColor Yellow
             }
         }
     }
@@ -484,6 +495,7 @@ try {
     Add-Content -LiteralPath $metaPath -Value ("FinishedUtc: {0:o}" -f $finished.ToUniversalTime()) -Encoding UTF8
     Add-Content -LiteralPath $metaPath -Value ("WtsSawLocked: {0}" -f $sawLocked) -Encoding UTF8
     Add-Content -LiteralPath $metaPath -Value ("WtsSawUnlocked: {0}" -f $sawUnlocked) -Encoding UTF8
+    Add-Content -LiteralPath $metaPath -Value ("SignalFileFalseSamples: {0}" -f $signalFileFalseCount) -Encoding UTF8
     Write-Journal -Message 'Run finished successfully.'
 
     $readme = @(
@@ -494,14 +506,19 @@ try {
         ("TargetUsername: {0}" -f $TargetUsername)
         'Mode: OneAccount (mid-lock interactive samples are not possible)'
         ''
+        'Pass hints (Win+L):'
+        '  - probe: many unlocked=False with source=SignalFile (or SecurityLog)'
+        '  - day log: LOCKED_OR_AWAY then UNLOCKED_ACTIVE (LockSource=SignalFile)'
+        '  - Status: lock-signal task Running; signal file age under ~90s'
+        ''
         'Key files:'
         '  00-run-meta.txt             - parameters and wall-clock marks'
         '  00-journal.txt              - step timeline'
         '  01-unlocked-baseline.txt    - Test-Session before lock'
         '  02-after-return.txt         - Test-Session after unlock/return'
         '  03-status.txt               - Status.ps1'
-        '  04-probe-summary.txt        - WTS probe True/False counts + tail'
-        '  wts-target-probe.log        - continuous WTS samples (includes lock window)'
+        '  04-probe-summary.txt        - probe True/False + SignalFile counts + tail'
+        '  wts-target-probe.log        - continuous SessionQuery samples (includes lock window)'
         '  LoginTimeLogs\              - monitor day logs / state / service.log'
         '  config.json / errors.log    - runtime config and error log (if present)'
         '  lock-signal.json            - SessionSwitch signal file (if watcher running)'
