@@ -1,0 +1,134 @@
+Unlocked-time investigation — test plan
+=======================================
+Use this when the monitor reports much more unlocked-active time than real
+unlocked use of the measured account.
+
+Goal
+----
+Learn whether SessionQuery kept reporting the measured user as unlocked after
+real use ended, or whether something else inflated the total — then fix the
+real bug.
+
+Before testing, note what the measured user did after a short unlocked session
+(e.g. 1-2 minutes):
+  A) Win+L (lock)
+  B) Switch user / disconnect
+  C) Walk away with the screen still unlocked
+
+(A/B should stop unlocked counting quickly; C correctly keeps counting until
+lock/away.)
+
+
+Interactive script (preferred)
+------------------------------
+Elevated PowerShell on the admin/operator account (the account that owns
+install/config/logs):
+
+  cd <path-to-this-repo-clone>
+  .\scripts\Invoke-UnlockedTimeInvestigation.ps1
+  # Or pass the measured account:
+  # .\scripts\Invoke-UnlockedTimeInvestigation.ps1 -TargetUsername 'DOMAIN\UserName'
+
+Follow on-screen prompts. Artifacts go to:
+  <Desktop>\unlocked-time-test-<timestamp>\
+(Desktop is resolved via the environment; override with -OutputRoot if needed.)
+
+Zip that folder and share for analysis.
+
+
+Manual steps (same plan; only if not using the script)
+------------------------------------------------------
+
+Prep
+~~~~
+Note wall-clock times for each step. Create an output folder of your choice,
+e.g. under the current user's Desktop, and set $Out to that path.
+
+  cd <path-to-this-repo-clone>
+  $Out = Join-Path ([Environment]::GetFolderPath('Desktop')) 'unlocked-time-test'
+  $Target = 'DOMAIN\UserName'   # measured account
+  New-Item -ItemType Directory -Force -Path $Out | Out-Null
+
+
+Step 1 — Before target unlocks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  .\scripts\Test-Session.ps1 -TargetUsername $Target |
+    Tee-Object -FilePath (Join-Path $Out '01-before.txt')
+
+
+Step 2 — Start a continuous WTS probe targeting the measured user
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Background probe (recommended):
+
+  $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  Start-Process $ps -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile','-ExecutionPolicy','Bypass','-File',".\scripts\WtsLockProbe.ps1",
+    '-TargetUsername',$Target,
+    '-ProbeFile',(Join-Path $Out 'wts-target-probe.log'),
+    '-SessionQueryCsPath',(Join-Path $PWD 'src\SessionQuery.cs'),
+    '-IntervalSeconds','3','-TimeoutSeconds','900'
+  )
+
+
+Step 3 — Target unlocks and uses the desktop briefly (e.g. 1-2 minutes)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Right after unlock, from the operator session:
+
+  .\scripts\Test-Session.ps1 -TargetUsername $Target |
+    Tee-Object (Join-Path $Out '02-target-unlocked.txt')
+
+Write down the exact unlock wall-clock time.
+
+
+Step 4 — End of real use (Win+L / disconnect / etc.)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Within ~10 seconds, from the operator session:
+
+  .\scripts\Test-Session.ps1 -TargetUsername $Target |
+    Tee-Object (Join-Path $Out '03-right-after-end.txt')
+
+Repeat every ~30 seconds for 2-3 minutes:
+
+  .\scripts\Test-Session.ps1 -TargetUsername $Target |
+    Tee-Object (Join-Path $Out '04-post-end.txt')
+
+Write down the exact end-of-use wall-clock time.
+
+
+Step 5 — Wait ~5 more minutes, then collect
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  .\scripts\Status.ps1 | Tee-Object (Join-Path $Out '05-status.txt')
+
+Resolve LogDirectory / config / errors.log from the runtime config under the
+elevating admin profile (or paths printed by Status), then copy them into $Out.
+Also copy the probe log.
+
+Also record:
+  - exact unlock time
+  - exact end-of-use time
+  - when you stopped collecting
+  - which end action was used (A / B / C)
+
+Zip $Out and share for analysis.
+
+
+How results map to a fix
+------------------------
+Probe after end-of-use                     | Meaning                                      | Fix direction
+-------------------------------------------|----------------------------------------------|------------------------------------------
+Quickly unlocked=False for target, but day | Monitor bug (config/target/poll/wrong        | Fix install/runtime path, restart task,
+log still counts far more than real use    | process)                                     | add logging
+Stays unlocked=True for many minutes after | WTS lock detection wrong for that account    | Fix SessionQuery lock resolution
+Win+L / expected end                       | (flags/polarity/session match)               | for that session type
+Goes False only on disconnect, not Win+L   | Lock flags ignored; only disconnect counted  | Prefer Security log / better WTS lock
+Stays True until left without locking      | Matches design (unlocked-active until lock)  | Document; optional idle timeout later
+
+Do not change counting logic until this run shows which row applies.
+
+
+Retest after a fix (summary)
+----------------------------
+1. Pull/install updated bits; restart LoginTimeLogger task if needed.
+2. Repeat Steps 1-5 with a short unlocked session then the planned end action.
+3. Expect LOCKED_OR_AWAY in LoginTimeLogs within ~poll interval (~5-15s) of
+   end-of-use when A/B was used, and unlocked cumulative near real use.
