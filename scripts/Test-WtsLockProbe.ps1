@@ -1,13 +1,13 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  One-account WTS lock probe: samples IsUserUnlocked while you Win+L.
+  One-account SessionQuery lock probe: samples IsUserUnlocked while you Win+L.
 .DESCRIPTION
   Starts scripts\WtsLockProbe.ps1 in a background process that keeps polling
-  SessionQuery (same API the monitor uses) into %TEMP%. You lock and unlock
-  on this account, then press Enter. The script reports whether any sample
-  saw unlocked=False. Does not require a second account or session.
-  Does not read/write Administrator LoginTimeLogs.
+  SessionQuery (same API as LoginTimeLogger: SignalFile / SecurityLog / WTS /
+  Desktop) into %TEMP%. You lock and unlock on this account, then press Enter.
+  Reports whether any sample saw unlocked=False. Prefer source=SignalFile after
+  Install. Does not require a second account. Does not read/write LoginTimeLogs.
 .PARAMETER TargetUsername
   Account to query (default: USERDOMAIN\USERNAME, else USERNAME).
 .PARAMETER IntervalSeconds
@@ -97,12 +97,13 @@ try {
     }
 
     Write-Host ''
-    Write-Host '=== WTS lock probe (one-account) ===' -ForegroundColor Cyan
+    Write-Host '=== SessionQuery lock probe (one-account) ===' -ForegroundColor Cyan
     Write-Host ("TargetUsername : {0}" -f $User)
     Write-Host ("Probe log      : {0}" -f $probeFile)
     Write-Host ("Probe script   : {0}" -f $probeScript)
     Write-Host ("Interval       : {0}s" -f $IntervalSeconds)
-    Write-Host 'Uses SessionQuery (same WTS path as LoginTimeLogger).'
+    Write-Host 'Uses SessionQuery (SignalFile / SecurityLog / WTS / Desktop - same as LoginTimeLogger).'
+    Write-Host 'After Install, expect source=SignalFile while Win+L is held.'
     Write-Host 'No Administrator LoginTimeLogs are read or written.'
     Write-Host ''
 
@@ -231,26 +232,37 @@ $outText
     Write-TestLine -Level INFO -Message ("Samples: {0}; unlocked=True seen={1}; unlocked=False seen={2}" -f `
             $sampleLines.Count, $sawUnlocked, $sawLocked)
 
+    $signalFileFalse = @($sampleLines | Where-Object {
+            $_ -match '\bunlocked=False\b' -and $_ -match '\bsource=SignalFile\b'
+        }).Count
+
     if (-not $sawLocked) {
         Write-TestLine -Level FAIL -Message @"
-WTS probe did NOT see unlocked=False while you were locked.
-SessionSwitch (Test-LockCycle) can still pass; LoginTimeLogger uses this WTS path.
+Probe did NOT see unlocked=False while you were locked.
+If LoginTimeLoggerLockSignal is not Running, Install/start it first (SignalFile path).
+Test-LockCycle still validates SessionSwitch events separately.
 Probe log: $probeFile
 Tip: lock for 30+ seconds and re-run.
 "@
         exit 3
     }
 
-    Write-TestLine -Level PASS -Message 'WTS probe saw unlocked=False during the lock window.'
+    Write-TestLine -Level PASS -Message 'Probe saw unlocked=False during the lock window.'
+    if ($signalFileFalse -gt 0) {
+        Write-TestLine -Level PASS -Message ("Probe used source=SignalFile on {0} False sample(s)." -f $signalFileFalse)
+    }
+    else {
+        Write-TestLine -Level WARN -Message 'False samples were not SignalFile - check lock-signal watcher / SecurityLog.'
+    }
     if ($sawUnlocked) {
-        Write-TestLine -Level PASS -Message 'WTS probe also saw unlocked=True (expected before/after lock).'
+        Write-TestLine -Level PASS -Message 'Probe also saw unlocked=True (expected before/after lock).'
     }
 
     $post = [SessionQuery]::IsUserUnlocked($User)
     Write-TestLine -Level INFO -Message ("Post-check IsUserUnlocked({0})={1}" -f $User, $post)
 
     Write-TestLine -Level PASS -Message @"
-WTS lock probe PASSED for USER='$User'.
+SessionQuery lock probe PASSED for USER='$User'.
 Probe log: $probeFile
 "@
     exit 0

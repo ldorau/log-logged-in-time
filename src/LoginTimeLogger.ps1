@@ -109,7 +109,7 @@ LogDirectory in file: $($raw.LogDirectory)
     }
 
     # Prefer configured admin profile (e.g. C:\Users\AdminName). Fall back to the
-    # elevating user's profile when possible — do not require built-in Administrator.
+    # elevating user's profile when possible - do not require built-in Administrator.
     $adminHome = $null
     if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
         $adminHome = [string]$raw.AdministratorProfile
@@ -618,6 +618,9 @@ while ($true) {
         $lastPollUtc = $nowUtc
     }
     catch {
+        # Advance the poll clock on failure so a partial credit + retry cannot
+        # double-count the same wall interval after the next successful loop.
+        $lastPollUtc = [datetime]::UtcNow
         $sessionLastError = $null
         try { $sessionLastError = [SessionQuery]::LastError } catch { $sessionLastError = '(unavailable)' }
         $null = Write-VerboseError -ErrorRecord $_ -Source 'LoginTimeLogger' -Context (

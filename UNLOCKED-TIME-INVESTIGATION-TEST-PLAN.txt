@@ -1,4 +1,4 @@
-Unlocked-time investigation — test plan
+Unlocked-time investigation - test plan
 =======================================
 Use this when the monitor reports much more unlocked-active time than real
 unlocked use of the measured account.
@@ -6,8 +6,12 @@ unlocked use of the measured account.
 Goal
 ----
 Learn whether SessionQuery kept reporting the measured user as unlocked after
-real use ended, or whether something else inflated the total — then fix the
+real use ended, or whether something else inflated the total - then fix the
 real bug.
+
+After Install, LoginTimeLogger prefers LockSource=SignalFile (SessionSwitch
+watcher) or SecurityLog (4800/4801), then Desktop/WTS. Status should show
+LoginTimeLoggerLockSignal Running and a fresh lock-signal.json.
 
 Before testing, note what the measured user did after a short unlocked session
 (e.g. 1-2 minutes):
@@ -39,14 +43,23 @@ same account used as TargetUsername for testing):
   cd <path-to-this-repo-clone>
   .\scripts\Invoke-UnlockedTimeInvestigation-OneAccount.ps1
   # Default TargetUsername = USERDOMAIN\USERNAME
-  # Or: ... -TargetUsername 'DOMAIN\UserName'
+  # Long lock example:
+  #   ... -ProbeTimeoutSeconds 2400 -MinLockSeconds 900
 
 Artifacts: <Desktop>\unlocked-time-test-oneaccount-<timestamp>\
-Evidence while locked comes from the background WTS probe + LoginTimeLogs
-(no mid-lock Test-Session samples).
+Evidence while locked comes from the background SessionQuery probe +
+LoginTimeLogs + lock-signal.json (no mid-lock Test-Session samples).
 
 Zip the output folder and share for analysis.
 (Desktop via [Environment]::GetFolderPath; override with -OutputRoot.)
+
+
+Pass hints (Win+L)
+------------------
+  - Probe: many unlocked=False with source=SignalFile (or SecurityLog)
+  - Day log: LOCKED_OR_AWAY then UNLOCKED_ACTIVE (LockSource=SignalFile)
+  - Status: lock-signal task Running; signal file age under ~90s
+  - Cumulative does not climb while locked
 
 
 Manual steps (same plan; only if not using the script)
@@ -63,14 +76,14 @@ e.g. under the current user's Desktop, and set $Out to that path.
   New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 
-Step 1 — Before target unlocks
+Step 1 - Before target unlocks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   .\scripts\Test-Session.ps1 -TargetUsername $Target |
     Tee-Object -FilePath (Join-Path $Out '01-before.txt')
 
 
-Step 2 — Start a continuous WTS probe targeting the measured user
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Step 2 - Start a continuous SessionQuery probe for the measured user
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Background probe (recommended):
 
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -83,7 +96,7 @@ Background probe (recommended):
   )
 
 
-Step 3 — Target unlocks and uses the desktop briefly (e.g. 1-2 minutes)
+Step 3 - Target unlocks and uses the desktop briefly (e.g. 1-2 minutes)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Right after unlock, from the operator session:
 
@@ -93,7 +106,7 @@ Right after unlock, from the operator session:
 Write down the exact unlock wall-clock time.
 
 
-Step 4 — End of real use (Win+L / disconnect / etc.)
+Step 4 - End of real use (Win+L / disconnect / etc.)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Within ~10 seconds, from the operator session:
 
@@ -108,13 +121,13 @@ Repeat every ~30 seconds for 2-3 minutes:
 Write down the exact end-of-use wall-clock time.
 
 
-Step 5 — Wait ~5 more minutes, then collect
+Step 5 - Wait ~5 more minutes, then collect
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   .\scripts\Status.ps1 | Tee-Object (Join-Path $Out '05-status.txt')
 
 Resolve LogDirectory / config / errors.log from the runtime config under the
 elevating admin profile (or paths printed by Status), then copy them into $Out.
-Also copy the probe log.
+Also copy the probe log and %ProgramData%\LoginTimeLogger\lock-signal.json.
 
 Also record:
   - exact unlock time
@@ -129,11 +142,11 @@ How results map to a fix
 ------------------------
 Probe after end-of-use                     | Meaning                                      | Fix direction
 -------------------------------------------|----------------------------------------------|------------------------------------------
-Quickly unlocked=False for target, but day | Monitor bug (config/target/poll/wrong        | Fix install/runtime path, restart task,
-log still counts far more than real use    | process)                                     | add logging
-Stays unlocked=True for many minutes after | WTS lock detection wrong for that account    | Fix SessionQuery lock resolution
-Win+L / expected end                       | (flags/polarity/session match)               | for that session type
-Goes False only on disconnect, not Win+L   | Lock flags ignored; only disconnect counted  | Prefer Security log / better WTS lock
+Quickly unlocked=False (SignalFile), but   | Monitor bug (config/target/poll/wrong        | Fix install/runtime path, restart task,
+day log still counts far more than use     | process) or Format-Duration display bug      | check Status / Test-UnlockedCumulative
+Stays unlocked=True for many minutes after | Lock signal watcher dead/stale, or no        | Start LoginTimeLoggerLockSignal; check
+Win+L / expected end                       | SecurityLog; WTS/Desktop alone wrong         | lock-signal.json age; reinstall
+Goes False only on disconnect, not Win+L   | SessionSwitch not firing for lock            | Prefer Security log / fix watcher
 Stays True until left without locking      | Matches design (unlocked-active until lock)  | Document; optional idle timeout later
 
 Do not change counting logic until this run shows which row applies.
@@ -141,7 +154,7 @@ Do not change counting logic until this run shows which row applies.
 
 Retest after a fix (summary)
 ----------------------------
-1. Pull/install updated bits; restart LoginTimeLogger task if needed.
+1. Pull/install updated bits; restart LoginTimeLogger + lock-signal tasks.
 2. Repeat Steps 1-5 with a short unlocked session then the planned end action.
 3. Expect LOCKED_OR_AWAY in LoginTimeLogs within ~poll interval (~5-15s) of
    end-of-use when A/B was used, and unlocked cumulative near real use.

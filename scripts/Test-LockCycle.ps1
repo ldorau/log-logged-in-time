@@ -87,6 +87,7 @@ try {
     Write-Host ("Event log file : {0}" -f $eventFile)
     Write-Host ("Watcher script : {0}" -f $watcherScript)
     Write-Host 'Lock detection : separate STA watcher + SystemEvents.SessionSwitch'
+    Write-Host 'Note: LoginTimeLogger prefers SignalFile/SecurityLog; this test only validates SessionSwitch events.'
     Write-Host ''
 
     Write-TestLine -Level INFO -Message ("Phase 1: verifying '{0}' is currently UNLOCKED and active..." -f $User)

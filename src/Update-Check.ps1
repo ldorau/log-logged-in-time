@@ -252,6 +252,7 @@ function Publish-InstalledFilesFromRepo {
         'Update-Check.ps1'
         'Scp-OnLock.ps1'
         'LockSignalWatcher.ps1'
+        'LockSignalLauncher.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name
@@ -260,6 +261,42 @@ function Publish-InstalledFilesFromRepo {
         }
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
+}
+
+function Update-LockSignalHiddenLauncherFromConfig {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+
+    $launcherHelper = Join-Path $InstallRoot 'src\LockSignalLauncher.ps1'
+    if (-not (Test-Path -LiteralPath $launcherHelper)) {
+        Write-LoggerEvent -Level WARN -Message ("Lock signal launcher helper missing after update: {0}" -f $launcherHelper)
+        return
+    }
+    . $launcherHelper
+
+    $watcherScript = Join-Path $InstallRoot 'src\LockSignalWatcher.ps1'
+    $launcherPath = Join-Path $InstallRoot 'src\Start-LockSignalWatcher.vbs'
+    if (-not (Test-Path -LiteralPath $watcherScript)) {
+        Write-LoggerEvent -Level WARN -Message ("LockSignalWatcher.ps1 missing after update: {0}" -f $watcherScript)
+        return
+    }
+
+    $signalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.LockSignalPath)) {
+        $signalPath = [string]$Config.LockSignalPath
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Write-LockSignalHiddenLauncher `
+        -LauncherPath $launcherPath `
+        -PowerShellExe $windowsPowerShell `
+        -WatcherScript $watcherScript `
+        -TargetUsername ([string]$Config.TargetUsername) `
+        -SignalPath $signalPath `
+        -HeartbeatSeconds 15
+    Write-LoggerEvent ("Refreshed lock-signal hidden launcher: {0}" -f $launcherPath)
 }
 
 function Release-InstanceMutex {
@@ -404,6 +441,13 @@ function Invoke-LoginTimeLoggerUpdateCheck {
 
         $newHead = Sync-UpdateRepository -GitExe $gitExe -RepoUrl $Config.UpdateRepoUrl -Branch $Config.UpdateBranch -ClonePath $Config.UpdateClonePath
         Publish-InstalledFilesFromRepo -ClonePath $Config.UpdateClonePath -InstallRoot $InstallRoot
+        try {
+            Update-LockSignalHiddenLauncherFromConfig -Config $Config -InstallRoot $InstallRoot
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+                'Updated monitor files but failed to refresh Start-LockSignalWatcher.vbs')
+        }
         Set-InstalledCommit -InstallRoot $InstallRoot -CommitSha $newHead
 
         $updateState.LastLocalCommit = $newHead
