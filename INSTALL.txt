@@ -147,9 +147,11 @@ What the installer does
    (the template file is not modified).
 2. Writes the runtime config under AdministratorProfile (example):
      C:\Users\AdminName\LoginTimeLogger\config.json
-   ACLs: AdministratorProfile account + SYSTEM full control; target user Deny.
-   (Does not require BUILTIN\Administrators.)
-3. Creates the log directory under AdministratorProfile with the same ACLs:
+   ACLs: AdministratorProfile account + SYSTEM full control; target user
+   read-only (ReadAndExecute). SSH keys under LoginTimeLogger\ssh stay
+   admin + SYSTEM only. (Does not require BUILTIN\Administrators.)
+3. Creates the log directory under AdministratorProfile with the same
+   admin/SYSTEM full + target read-only ACLs:
      C:\Users\AdminName\LoginTimeLogs
 4. Copies monitor scripts (not the config) into:
      C:\Program Files\LoginTimeLogger
@@ -162,10 +164,11 @@ What the installer does
 
 Verify installation
 -------------------
-Check the task, monitor process/mutex, and today's totals (Administrator PowerShell):
+Check the task, monitor process/mutex, and today's totals (admin or target user):
   .\scripts\Status.ps1
   LastResult 267009 (0x41301) while State=Running means the monitor is still running
   (normal). Status treats that as healthy and does not treat it as a failure.
+  Target user can run Status/Get-LockedTime after install (read-only logs/config).
 
 Estimate locked/away time from existing daily logs (transition timestamps):
   .\scripts\Get-LockedTime.ps1

@@ -7,6 +7,7 @@
   unlocked-time-YYYY-MM-DD.log and sums intervals between them.
   Does not change monitor behavior or other scripts. LOCKED_OR_AWAY means
   not unlocked-active (screen lock or away / no active session).
+  Works for the install admin or the measured target user (read-only logs).
 .PARAMETER Date
   Calendar day to analyze (local). Default: today.
 .PARAMETER AllDays
@@ -15,6 +16,8 @@
   Override log folder (default: from runtime config / Administrator profile).
 .PARAMETER LogPath
   Analyze a single log file path (ignores -Date / -AllDays).
+.PARAMETER ConfigPath
+  Runtime config path (default: from LoginTimeLogger scheduled task).
 .EXAMPLE
   .\scripts\Get-LockedTime.ps1
 .EXAMPLE
@@ -35,7 +38,9 @@ param(
     [Parameter(ParameterSetName = 'ByPath')]
     [string]$LogPath,
 
-    [string]$TemplateConfigPath
+    [string]$TemplateConfigPath,
+
+    [string]$ConfigPath
 )
 
 Set-StrictMode -Version Latest
@@ -59,7 +64,10 @@ ScriptDir: $scriptDir
 $null = Initialize-ErrorLog -ConfigPath $TemplateConfigPath
 
 function Get-DefaultLogDirectory {
-    param([string]$TemplateConfigPath)
+    param(
+        [string]$TemplateConfigPath,
+        [string]$ConfigPath
+    )
 
     $administratorProfile = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
         ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
@@ -79,11 +87,24 @@ function Get-DefaultLogDirectory {
         catch { }
     }
 
-    $runtimeConfigPath = Join-Path $administratorProfile 'LoginTimeLogger\config.json'
-    $configPath = if (Test-Path -LiteralPath $runtimeConfigPath) { $runtimeConfigPath } else { $TemplateConfigPath }
-    if (Test-Path -LiteralPath $configPath) {
+    $resolvedConfig = $null
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
+        $resolvedConfig = $ConfigPath
+    }
+    else {
+        $fromTask = Get-LoginTimeLoggerRuntimeConfigPath
+        if ($fromTask) {
+            $resolvedConfig = $fromTask
+        }
+    }
+    if (-not $resolvedConfig) {
+        $runtimeConfigPath = Join-Path $administratorProfile 'LoginTimeLogger\config.json'
+        $resolvedConfig = if (Test-Path -LiteralPath $runtimeConfigPath) { $runtimeConfigPath } else { $TemplateConfigPath }
+    }
+
+    if (Test-Path -LiteralPath $resolvedConfig) {
         try {
-            $raw = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = Get-Content -LiteralPath $resolvedConfig -Raw -Encoding UTF8 | ConvertFrom-Json
             if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
                 $administratorProfile = [string]$raw.AdministratorProfile
             }
@@ -217,7 +238,7 @@ try {
     }
     else {
         if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
-            $LogDirectory = Get-DefaultLogDirectory -TemplateConfigPath $TemplateConfigPath
+            $LogDirectory = Get-DefaultLogDirectory -TemplateConfigPath $TemplateConfigPath -ConfigPath $ConfigPath
         }
         Write-Host ("Log directory: {0}" -f $LogDirectory)
 

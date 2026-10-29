@@ -6,7 +6,7 @@ Pass two account names at install time: **AdminUsername** (owns config/logs) and
 
 `<AdministratorProfile>\LoginTimeLogger\config.json` (for example `C:\Users\AdminName\LoginTimeLogger\config.json`)
 
-That file (and the logs) are ACL-locked to the **AdministratorProfile account + SYSTEM** (not `BUILTIN\Administrators`) so the monitored user cannot read or modify them. The startup task reads that copy.
+That file (and the logs) are ACL-owned by the **AdministratorProfile account + SYSTEM** (not `BUILTIN\Administrators`). The measured target user gets **read-only** access so they can run `Status.ps1` / `Get-LockedTime.ps1`; they cannot write or change ACLs. `LoginTimeLogger\ssh` (private keys) stays admin + SYSTEM only. The startup task reads that config copy.
 
 Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run level Highest).
 
@@ -145,6 +145,6 @@ Gaps larger than a short cap (sleep/hibernate) are not credited as unlocked time
 ## Notes
 
 - Use a real account id (SAM / `DOMAIN\user` / UPN), not a display name.
-- Standard users cannot change the scheduled task or the log ACL without Administrator rights.
+- The target user can read logs/status but cannot change the scheduled task, write logs, or change ACLs without Administrator rights.
 - Supported on **Windows 11 Home**. Pass `-AdminUsername` for a real elevated user (for example `AdminName` → `C:\Users\AdminName`). The built-in Administrator account is not required.
 - See `INSTALL.txt` for a full plain-text install guide.

@@ -47,6 +47,44 @@ function Resolve-ErrorLogPathFromConfig {
     return (Get-DefaultErrorLogPath -AdministratorProfile $adminProfile)
 }
 
+function Get-LoginTimeLoggerRuntimeConfigPath {
+    <#
+      Resolves the installed runtime config path from the LoginTimeLogger task
+      (-ConfigPath argument). Lets Status/Get-LockedTime run as the target user
+      without guessing the admin profile.
+    #>
+    param([string]$TaskName = 'LoginTimeLogger')
+
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        foreach ($action in @($task.Actions)) {
+            $arguments = [string]$action.Arguments
+            if ([string]::IsNullOrWhiteSpace($arguments)) {
+                continue
+            }
+            if ($arguments -match '-ConfigPath\s+"([^"]+)"') {
+                $path = $Matches[1]
+            }
+            elseif ($arguments -match "-ConfigPath\s+'([^']+)'") {
+                $path = $Matches[1]
+            }
+            elseif ($arguments -match '-ConfigPath\s+(\S+)') {
+                $path = $Matches[1].TrimEnd('"').TrimEnd("'")
+            }
+            else {
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)) {
+                return $path
+            }
+        }
+    }
+    catch {
+        # Task missing or not queryable; caller falls back.
+    }
+    return $null
+}
+
 function Initialize-ErrorLog {
     [CmdletBinding()]
     param(

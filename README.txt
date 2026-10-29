@@ -9,19 +9,20 @@ Pass AdminUsername (install owner) and TargetUsername (measured user) to
 bootstrap/install. For testing, both may be the same account. Runtime config
 is stored under the admin profile, e.g.:
   C:\Users\AdminName\LoginTimeLogger\config.json
-ACL: that admin account + SYSTEM (not BUILTIN\Administrators); task reads from there.
+ACL: that admin account + SYSTEM full control; target user read-only on
+config/logs (SSH keys under LoginTimeLogger\ssh stay admin + SYSTEM only).
 
 The monitor starts at system startup with elevated privileges (Scheduled Task
-running as SYSTEM, Run level Highest). Log files are stored under the
-Administrator profile and protected with ACLs so the monitored account cannot
-read or modify them.
+running as SYSTEM, Run level Highest). Log files are under the Administrator
+profile; the measured user can read them (Status / Get-LockedTime) but cannot
+write or change ACLs.
 
 
 Requirements
 ------------
 - Windows 11
 - PowerShell 5.1 or later (included with Windows)
-- An Administrator account to install and view logs
+- An Administrator account to install (target user can read Status/logs)
 - AdminUsername and TargetUsername passed to bootstrap/install
 - OpenSSH Client (scp.exe) when ScpOnLockEnabled=true
   (Install.ps1 installs the Windows capability if missing)
@@ -114,5 +115,5 @@ Notes
 - Supported on Windows 11 Home. Pass -AdminUsername for a real elevated
   user (for example AdminName -> C:\Users\AdminName). The built-in
   Administrator account / BUILTIN\Administrators group is not required.
-- Standard users cannot change the scheduled task or the log ACL without
-  Administrator rights.
+- The target user can read logs/status but cannot change the scheduled task,
+  write logs, or change ACLs without Administrator rights.

@@ -1,13 +1,17 @@
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
   Shows LoginTimeLogger task state and today's unlocked-time summary.
+.DESCRIPTION
+  Readable by the install admin (full) or the measured target user (read-only
+  logs/config). Does not require elevation. Target users cannot change ACLs
+  or start the SYSTEM monitor task.
 #>
 [CmdletBinding()]
 param(
     [string]$TaskName = 'LoginTimeLogger',
-    [string]$TemplateConfigPath
+    [string]$TemplateConfigPath,
+    [string]$ConfigPath
 )
 
 Set-StrictMode -Version Latest
@@ -35,12 +39,23 @@ try {
     else {
         Join-Path $env:SystemDrive ('Users\{0}' -f $env:USERNAME)
     }
+
+    $configPath = $null
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
+        $configPath = $ConfigPath
+    }
+    else {
+        $fromTask = Get-LoginTimeLoggerRuntimeConfigPath -TaskName $TaskName
+        if ($fromTask) {
+            $configPath = $fromTask
+        }
+    }
+
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $template = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
             if (-not [string]::IsNullOrWhiteSpace([string]$template.AdministratorProfile)) {
                 $administratorProfile = [string]$template.AdministratorProfile
-                $null = Initialize-ErrorLog -AdministratorProfile $administratorProfile
             }
         }
         catch {
@@ -49,17 +64,25 @@ try {
         }
     }
     else {
-        $null = Write-ErrorMessage -Level WARN -Source 'Status' -Message "Template config not found: $TemplateConfigPath"
+        Write-Host ("WARNING: Template config not found: {0}" -f $TemplateConfigPath) -ForegroundColor Yellow
     }
-    Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
 
-    $runtimeConfigPath = Join-Path $administratorProfile 'LoginTimeLogger\config.json'
-    $configPath = $runtimeConfigPath
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        $null = Write-ErrorMessage -Level WARN -Source 'Status' -Message (
-            "Runtime config not found at '$runtimeConfigPath'. Falling back to template.")
-        $configPath = $TemplateConfigPath
+    if (-not $configPath) {
+        $runtimeConfigPath = Join-Path $administratorProfile 'LoginTimeLogger\config.json'
+        if (Test-Path -LiteralPath $runtimeConfigPath) {
+            $configPath = $runtimeConfigPath
+        }
+        else {
+            Write-Host ("WARNING: Runtime config not found at '{0}'. Falling back to template." -f $runtimeConfigPath) -ForegroundColor Yellow
+            $configPath = $TemplateConfigPath
+        }
     }
+
+    try {
+        $null = Initialize-ErrorLog -ConfigPath $configPath
+    }
+    catch { }
+    Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
 
     $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     $targetUsername = '(not set)'
