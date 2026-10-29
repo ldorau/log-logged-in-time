@@ -133,7 +133,7 @@ LogDirectory in file: $($raw.LogDirectory)
     }
 
     # Opt-in: self-update is off unless explicitly enabled (remote code as SYSTEM).
-    $updateEnabled = $false
+    $updateEnabled = $true
     if ($null -ne $raw.UpdateEnabled) {
         $updateEnabled = [bool]$raw.UpdateEnabled
     }

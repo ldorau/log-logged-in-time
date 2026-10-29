@@ -23,7 +23,7 @@ Optional settings remain in config\config.json (poll interval, SCP, updates):
     "AdministratorProfile": "",
     "LogDirectory": "",
     "PollIntervalSeconds": 5,
-    "UpdateEnabled": false,
+    "UpdateEnabled": true,
     "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
     "UpdateBranch": "main",
     "UpdateClonePath": "",
@@ -111,11 +111,11 @@ WTS SessionFlags / OpenInputDesktop stay wrong. Install tries to enable
 Success audit for Other Logon/Logoff Events (Security 4800/4801) when local
 policy allows; domain GPO may override.
 
-Self-update (background monitor; opt-in)
-----------------------------------------
-Disabled by default (UpdateEnabled=false). When enabled, once per day the
-monitor checks https://github.com/ldorau/log-logged-in-time for a newer
-commit (git ls-remote). Only that HTTPS GitHub repo URL is accepted.
+Self-update (background monitor; on by default)
+-----------------------------------------------
+Enabled by default (UpdateEnabled=true). Once per day the monitor checks
+https://github.com/ldorau/log-logged-in-time for a newer commit
+(git ls-remote). Only that HTTPS GitHub repo URL is accepted.
 If the tip differs from
   C:\Program Files\LoginTimeLogger\installed-commit.txt
 it clones/pulls into
@@ -123,7 +123,7 @@ it clones/pulls into
 copies updated src files into Program Files, then restarts via the
 scheduled task (Start-ScheduledTask after exit) so monitoring stays under
 Task Scheduler. Offline checks are postponed by 10 minutes.
-Set "UpdateEnabled": true in config.json to enable.
+Set "UpdateEnabled": false in config.json to disable.
 
 SCP on lock (optional)
 ----------------------

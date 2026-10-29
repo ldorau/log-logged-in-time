@@ -561,7 +561,7 @@ function Test-InstallPrerequisites {
     # AdminUsername / TargetUsername come from script parameters (required).
     $raw = $null
     $configOk = $false
-    $updateEnabled = $false
+    $updateEnabled = $true
     $administratorProfile = Get-ProfilePathForAccount -AccountName $AdminUsername
 
     $adminOk = -not [string]::IsNullOrWhiteSpace($AdminUsername)
@@ -994,7 +994,7 @@ try {
         $pollSeconds = [int]$raw.PollIntervalSeconds
     }
 
-    $updateEnabled = $false
+    $updateEnabled = $true
     if ($null -ne $raw.UpdateEnabled) {
         $updateEnabled = [bool]$raw.UpdateEnabled
     }

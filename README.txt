@@ -69,12 +69,13 @@ Error log (same admin profile; separate from daily time logs):
   C:\Users\AdminName\LoginTimeLogger\errors.log
   All script errors/warnings are printed to the screen and appended here.
 
-Self-update (opt-in; UpdateEnabled=false by default):
-  When enabled and online, compares allowlisted GitHub tip to
+Self-update (on by default; UpdateEnabled=true):
+  When online, compares allowlisted GitHub tip to
   C:\Program Files\LoginTimeLogger\installed-commit.txt
   If different: sync LoginTimeLogger\repo, refresh Program Files, restart
   via the scheduled task. Offline: retry in 10 minutes.
-  Git for Windows is installed (Authenticode-checked) only if UpdateEnabled=true.
+  Git for Windows is installed (Authenticode-checked) when UpdateEnabled=true.
+  Set UpdateEnabled=false to disable.
 
 SCP on lock (opt-in; ScpOnLockEnabled=false by default):
   When enabled, on each lock copies today's unlocked-time log and errors.log

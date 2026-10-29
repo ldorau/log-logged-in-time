@@ -4,7 +4,7 @@
   "AdministratorProfile": "",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
-  "UpdateEnabled": false,
+  "UpdateEnabled": true,
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
   "UpdateClonePath": "",

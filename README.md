@@ -30,7 +30,7 @@ Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run
   "AdministratorProfile": "",
   "LogDirectory": "",
   "PollIntervalSeconds": 5,
-  "UpdateEnabled": false,
+  "UpdateEnabled": true,
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
   "UpdateClonePath": "",
@@ -50,7 +50,7 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 
 ### Self-update
 
-**Off by default** (`UpdateEnabled: false`). When enabled, once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) only when updates are enabled.
+**On by default** (`UpdateEnabled: true`). Once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) when updates are enabled. Set `UpdateEnabled: false` to disable.
 
 ### SCP on lock
 
