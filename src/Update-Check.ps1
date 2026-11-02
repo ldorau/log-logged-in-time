@@ -176,6 +176,40 @@ function Find-GitExecutable {
     return $null
 }
 
+function Invoke-GitCommand {
+    <#
+      Git writes progress to stderr. With $ErrorActionPreference Stop, PowerShell
+      turns that into NativeCommandError even when git exits 0. Temporarily use
+      Continue and trust LASTEXITCODE.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$RepoPath
+    )
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($RepoPath)) {
+            $output = & $GitExe -C $RepoPath @Arguments 2>&1
+        }
+        else {
+            $output = & $GitExe @Arguments 2>&1
+        }
+        $exitCode = [int]$LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = (($output | ForEach-Object { "$_" }) -join [Environment]::NewLine)
+        Lines    = @($output | ForEach-Object { "$_" })
+    }
+}
+
 function Get-RemoteCommitSha {
     param(
         [Parameter(Mandatory)][string]$GitExe,
@@ -184,12 +218,12 @@ function Get-RemoteCommitSha {
     )
 
     $ref = "refs/heads/$Branch"
-    $output = & $GitExe ls-remote --heads $RepoUrl $Branch 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ("git ls-remote failed (exit {0}): {1}" -f $LASTEXITCODE, ($output | Out-String))
+    $result = Invoke-GitCommand -GitExe $GitExe -Arguments @('ls-remote', '--heads', $RepoUrl, $Branch)
+    if ($result.ExitCode -ne 0) {
+        throw ("git ls-remote failed (exit {0}): {1}" -f $result.ExitCode, $result.Output)
     }
 
-    foreach ($line in @($output)) {
+    foreach ($line in @($result.Lines)) {
         $text = "$line".Trim()
         if ($text -match '^(?<sha>[0-9a-fA-F]{40})\s+(?<ref>\S+)$') {
             if ($Matches['ref'] -eq $ref -or $Matches['ref'] -eq $Branch) {
@@ -198,7 +232,7 @@ function Get-RemoteCommitSha {
         }
     }
 
-    throw ("Could not parse remote commit for refs/heads/{0} from git ls-remote output: {1}" -f $Branch, ($output | Out-String))
+    throw ("Could not parse remote commit for refs/heads/{0} from git ls-remote output: {1}" -f $Branch, $result.Output)
 }
 
 function Sync-UpdateRepository {
@@ -216,33 +250,35 @@ function Sync-UpdateRepository {
 
     if (-not (Test-Path -LiteralPath (Join-Path $ClonePath '.git'))) {
         Write-LoggerEvent ("Cloning {0} (branch {1}) into {2}" -f $RepoUrl, $Branch, $ClonePath)
-        $cloneOut = & $GitExe clone --branch $Branch --single-branch --depth 1 $RepoUrl $ClonePath 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw ("git clone failed (exit {0}): {1}" -f $LASTEXITCODE, ($cloneOut | Out-String))
+        $clone = Invoke-GitCommand -GitExe $GitExe -Arguments @(
+            'clone', '--branch', $Branch, '--single-branch', '--depth', '1', $RepoUrl, $ClonePath
+        )
+        if ($clone.ExitCode -ne 0) {
+            throw ("git clone failed (exit {0}): {1}" -f $clone.ExitCode, $clone.Output)
         }
     }
     else {
         Write-LoggerEvent ("git fetch/pull in {0}" -f $ClonePath)
-        $fetchOut = & $GitExe -C $ClonePath fetch origin $Branch 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw ("git fetch failed (exit {0}): {1}" -f $LASTEXITCODE, ($fetchOut | Out-String))
+        $fetch = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('fetch', 'origin', $Branch)
+        if ($fetch.ExitCode -ne 0) {
+            throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, $fetch.Output)
         }
         # Unattended-safe equivalent of updating to newest tip after pull/fetch.
-        $pullOut = & $GitExe -C $ClonePath pull --ff-only origin $Branch 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-LoggerEvent -Level WARN -Message ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, ($pullOut | Out-String))
-            $resetOut = & $GitExe -C $ClonePath reset --hard ("origin/{0}" -f $Branch) 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw ("git reset --hard failed (exit {0}): {1}" -f $LASTEXITCODE, ($resetOut | Out-String))
+        $pull = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('pull', '--ff-only', 'origin', $Branch)
+        if ($pull.ExitCode -ne 0) {
+            Write-LoggerEvent -Level WARN -Message ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, $pull.Output)
+            $reset = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('reset', '--hard', ("origin/{0}" -f $Branch))
+            if ($reset.ExitCode -ne 0) {
+                throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
             }
         }
     }
 
-    $head = & $GitExe -C $ClonePath rev-parse HEAD 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ("git rev-parse HEAD failed: {0}" -f ($head | Out-String))
+    $head = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('rev-parse', 'HEAD')
+    if ($head.ExitCode -ne 0) {
+        throw ("git rev-parse HEAD failed: {0}" -f $head.Output)
     }
-    return ("$head").Trim().ToLowerInvariant()
+    return ($head.Output).Trim().ToLowerInvariant()
 }
 
 function Publish-InstalledFilesFromRepo {

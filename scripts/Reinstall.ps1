@@ -70,6 +70,34 @@ function Find-GitExecutable {
     return $null
 }
 
+function Invoke-GitInRepo {
+    <#
+      Runs git with stderr merged to output. Git writes progress to stderr;
+      with $ErrorActionPreference Stop that becomes a terminating NativeCommandError
+      even when exit code is 0. Use Continue for the call and trust LASTEXITCODE.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $GitExe -C $RepoRoot @Arguments 2>&1
+        $exitCode = [int]$LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = (($output | ForEach-Object { "$_" }) -join [Environment]::NewLine)
+    }
+}
+
 function Resolve-RuntimeConfigPath {
     param(
         [string]$ConfigPath,
@@ -160,21 +188,22 @@ try {
             }
             else {
                 Write-Host ("Updating git clone from origin/{0}..." -f $Branch) -ForegroundColor Cyan
-                $fetchOut = & $gitExe -C $repoRoot fetch origin $Branch 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw ("git fetch failed (exit {0}): {1}" -f $LASTEXITCODE, ($fetchOut | Out-String))
+                $fetch = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('fetch', 'origin', $Branch)
+                if ($fetch.ExitCode -ne 0) {
+                    throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, $fetch.Output)
                 }
 
-                $pullOut = & $gitExe -C $repoRoot pull --ff-only origin $Branch 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, ($pullOut | Out-String))
-                    $resetOut = & $gitExe -C $repoRoot reset --hard ("origin/{0}" -f $Branch) 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        throw ("git reset --hard failed (exit {0}): {1}" -f $LASTEXITCODE, ($resetOut | Out-String))
+                $pull = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('pull', '--ff-only', 'origin', $Branch)
+                if ($pull.ExitCode -ne 0) {
+                    Write-Warning ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, $pull.Output)
+                    $reset = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('reset', '--hard', ("origin/{0}" -f $Branch))
+                    if ($reset.ExitCode -ne 0) {
+                        throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
                     }
                 }
 
-                $head = (& $gitExe -C $repoRoot rev-parse --short HEAD 2>&1 | Out-String).Trim()
+                $headResult = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('rev-parse', '--short', 'HEAD')
+                $head = ($headResult.Output).Trim()
                 Write-Host ("Repo updated to {0}." -f $head) -ForegroundColor Green
             }
         }

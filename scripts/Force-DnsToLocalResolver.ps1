@@ -141,10 +141,14 @@ function Get-DnsForceIPv4BlockRanges {
         $i--
     }
     if ($i -lt 0) {
-        $lowRange = $null  # Allow IP is 0.0.0.0 — only high range
+        $lowRange = $null  # Allow IP is 0.0.0.0 - only high range
     }
     else {
+        # Avoid 0.0.0.0 as a lone endpoint; some Windows builds reject it as a prefix.
         $lowRange = '0.0.0.0-{0}.{1}.{2}.{3}' -f $prev[0], $prev[1], $prev[2], $prev[3]
+        if ($lowRange -eq '0.0.0.0-0.0.0.0') {
+            $lowRange = '0.0.0.0/32'
+        }
     }
 
     # next address
@@ -161,7 +165,8 @@ function Get-DnsForceIPv4BlockRanges {
         $highRange = $null  # Allow IP is 255.255.255.255
     }
     else {
-        $highRange = '{0}.{1}.{2}.{3}-255.255.255.255' -f $next[0], $next[1], $next[2], $next[3]
+        # 255.255.255.255 as range end is invalid on many Windows Firewall builds.
+        $highRange = '{0}.{1}.{2}.{3}-255.255.255.254' -f $next[0], $next[1], $next[2], $next[3]
     }
 
     $ranges = New-Object System.Collections.Generic.List[string]
@@ -238,18 +243,23 @@ function New-DnsForceFirewallRules {
         throw "Could not build IPv4 exclude ranges for $Server"
     }
 
+    # ::/0 is rejected by New-NetFirewallRule on many builds ("address prefix invalid").
+    # Block common IPv6 DNS-capable space instead (global unicast + ULA).
+    $ipv6Block = @('2000::/3', 'fc00::/7')
+
     $specs = @(
-        @{ Name = "$RulePrefix Block IPv4 UDP/53 except $Server"; Protocol = 'UDP'; AddressFamily = 'IPv4'; RemoteAddress = $v4Ranges }
-        @{ Name = "$RulePrefix Block IPv4 TCP/53 except $Server"; Protocol = 'TCP'; AddressFamily = 'IPv4'; RemoteAddress = $v4Ranges }
-        @{ Name = "$RulePrefix Block IPv6 UDP/53"; Protocol = 'UDP'; AddressFamily = 'IPv6'; RemoteAddress = @('::/0') }
-        @{ Name = "$RulePrefix Block IPv6 TCP/53"; Protocol = 'TCP'; AddressFamily = 'IPv6'; RemoteAddress = @('::/0') }
+        @{ Name = "$RulePrefix Block IPv4 UDP/53 except $Server"; Protocol = 'UDP'; RemoteAddress = $v4Ranges }
+        @{ Name = "$RulePrefix Block IPv4 TCP/53 except $Server"; Protocol = 'TCP'; RemoteAddress = $v4Ranges }
+        @{ Name = "$RulePrefix Block IPv6 UDP/53"; Protocol = 'UDP'; RemoteAddress = $ipv6Block }
+        @{ Name = "$RulePrefix Block IPv6 TCP/53"; Protocol = 'TCP'; RemoteAddress = $ipv6Block }
     )
 
+    $ruleErrors = New-Object System.Collections.Generic.List[string]
     foreach ($spec in $specs) {
         $existing = Get-NetFirewallRule -DisplayName $spec.Name -ErrorAction SilentlyContinue
         if ($existing) {
             if ($PSCmdlet.ShouldProcess($spec.Name, 'Recreate firewall rule')) {
-                $existing | Remove-NetFirewallRule
+                $existing | Remove-NetFirewallRule -ErrorAction Stop
             }
             else {
                 continue
@@ -259,19 +269,26 @@ function New-DnsForceFirewallRules {
             continue
         }
 
-        New-NetFirewallRule `
-            -DisplayName $spec.Name `
-            -Description ("Blocks outbound DNS $($spec.Protocol)/53 except LAN resolver $Server (managed by Force-DnsToLocalResolver.ps1)") `
-            -Direction Outbound `
-            -Action Block `
-            -Protocol $spec.Protocol `
-            -RemotePort 53 `
-            -RemoteAddress $spec.RemoteAddress `
-            -Profile Any `
-            -Enabled True `
-            | Out-Null
+        try {
+            New-NetFirewallRule `
+                -DisplayName $spec.Name `
+                -Description ("Blocks outbound DNS $($spec.Protocol)/53 except LAN resolver $Server (managed by Force-DnsToLocalResolver.ps1)") `
+                -Direction Outbound `
+                -Action Block `
+                -Protocol $spec.Protocol `
+                -RemotePort 53 `
+                -RemoteAddress $spec.RemoteAddress `
+                -Profile Any `
+                -Enabled True `
+                -ErrorAction Stop `
+                | Out-Null
 
-        Write-Host ("  [fw]   {0}" -f $spec.Name) -ForegroundColor Green
+            Write-Host ("  [fw]   {0}" -f $spec.Name) -ForegroundColor Green
+        }
+        catch {
+            $ruleErrors.Add(('{0}: {1}' -f $spec.Name, $_.Exception.Message))
+            Write-Host ("  [fw]   FAILED {0} - {1}" -f $spec.Name, $_.Exception.Message) -ForegroundColor Red
+        }
     }
 
     # Explicit allow to the LAN resolver (documentation / clarity). Block-except
@@ -284,7 +301,7 @@ function New-DnsForceFirewallRules {
         $existing = Get-NetFirewallRule -DisplayName $spec.Name -ErrorAction SilentlyContinue
         if ($existing) {
             if ($PSCmdlet.ShouldProcess($spec.Name, 'Recreate allow firewall rule')) {
-                $existing | Remove-NetFirewallRule
+                $existing | Remove-NetFirewallRule -ErrorAction Stop
             }
             else {
                 continue
@@ -294,19 +311,31 @@ function New-DnsForceFirewallRules {
             continue
         }
 
-        New-NetFirewallRule `
-            -DisplayName $spec.Name `
-            -Description ("Allows outbound DNS $($spec.Protocol)/53 to LAN resolver $Server (managed by Force-DnsToLocalResolver.ps1)") `
-            -Direction Outbound `
-            -Action Allow `
-            -Protocol $spec.Protocol `
-            -RemotePort 53 `
-            -RemoteAddress $Server `
-            -Profile Any `
-            -Enabled True `
-            | Out-Null
+        try {
+            New-NetFirewallRule `
+                -DisplayName $spec.Name `
+                -Description ("Allows outbound DNS $($spec.Protocol)/53 to LAN resolver $Server (managed by Force-DnsToLocalResolver.ps1)") `
+                -Direction Outbound `
+                -Action Allow `
+                -Protocol $spec.Protocol `
+                -RemotePort 53 `
+                -RemoteAddress $Server `
+                -Profile Any `
+                -Enabled True `
+                -ErrorAction Stop `
+                | Out-Null
 
-        Write-Host ("  [fw]   {0}" -f $spec.Name) -ForegroundColor Green
+            Write-Host ("  [fw]   {0}" -f $spec.Name) -ForegroundColor Green
+        }
+        catch {
+            $ruleErrors.Add(('{0}: {1}' -f $spec.Name, $_.Exception.Message))
+            Write-Host ("  [fw]   FAILED {0} - {1}" -f $spec.Name, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+
+    if ($ruleErrors.Count -gt 0) {
+        throw ("Failed to create {0} DNS-Force firewall rule(s):`r`n - {1}" -f `
+                $ruleErrors.Count, ($ruleErrors -join "`r`n - "))
     }
 }
 

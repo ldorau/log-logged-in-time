@@ -554,7 +554,7 @@ if ($Verify) {
     else {
         $msg = "RESULT: $($blocked.Count) tested TCP endpoint(s) are blocked."
         if ($skipped.Count -gt 0) {
-            $msg += " ($($skipped.Count) skipped/inconclusive — not counted as pass.)"
+            $msg += (' ({0} skipped/inconclusive - not counted as pass.)' -f $skipped.Count)
             Write-DoHHost $msg -ForegroundColor Yellow
         }
         else {
@@ -568,7 +568,7 @@ if ($Verify) {
         $udpLabels = @($udpSpecs | ForEach-Object { $_.Label }) -join ', '
         $udpPorts = @($udpSpecs | ForEach-Object { $_.Port } | Select-Object -Unique) -join ', '
         Write-DoHHost ''
-        Write-DoHHost "NOTE: UDP rules ($udpLabels on port(s) $udpPorts) were checked for configuration only (Step 1)." -ForegroundColor Yellow
+        Write-DoHHost ('NOTE: UDP rules ({0} on port(s) {1}) were checked for configuration only (Step 1).' -f $udpLabels, $udpPorts) -ForegroundColor Yellow
         Write-DoHHost '      Live UDP blocking cannot be reliably verified from PowerShell (no connection handshake to test against).' -ForegroundColor Yellow
     }
 
