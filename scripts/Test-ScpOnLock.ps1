@@ -19,6 +19,9 @@
   directory/identity in config).
 .PARAMETER ProbeOnly
   Do not use real logs; create and upload a temporary probe file only.
+.PARAMETER GenerateIdentity
+  If the configured ScpIdentityFile is missing, generate an ed25519 key pair
+  (and empty known_hosts) then print the public key for remote authorized_keys.
 .PARAMETER LogPath
   Output log file. Default:
   <AdministratorProfile>\LoginTimeLogger\scp-on-lock-test-yyyyMMdd-HHmmss.log
@@ -26,12 +29,15 @@
   .\scripts\Test-ScpOnLock.ps1
 .EXAMPLE
   .\scripts\Test-ScpOnLock.ps1 -Force -ProbeOnly
+.EXAMPLE
+  .\scripts\Test-ScpOnLock.ps1 -GenerateIdentity -Force -ProbeOnly
 #>
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
     [switch]$Force,
     [switch]$ProbeOnly,
+    [switch]$GenerateIdentity,
     [string]$LogPath
 )
 
@@ -122,15 +128,23 @@ function Write-Check {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][bool]$Ok,
-        [string]$Detail = ''
+        [string]$Detail = '',
+        [ValidateSet('Auto', 'OK', 'FAIL', 'WARN')]
+        [string]$Status = 'Auto'
     )
-    $status = if ($Ok) { 'OK' } else { 'FAIL' }
-    $color = if ($Ok) { 'Green' } else { 'Red' }
+    if ($Status -eq 'Auto') {
+        $Status = if ($Ok) { 'OK' } else { 'FAIL' }
+    }
+    $color = switch ($Status) {
+        'OK' { [ConsoleColor]::Green }
+        'WARN' { [ConsoleColor]::Yellow }
+        default { [ConsoleColor]::Red }
+    }
     if ($Detail) {
-        Write-ScpTestLine ("  [{0}] {1} - {2}" -f $status, $Name, $Detail) -ForegroundColor $color
+        Write-ScpTestLine ("  [{0}] {1} - {2}" -f $Status, $Name, $Detail) -ForegroundColor $color
     }
     else {
-        Write-ScpTestLine ("  [{0}] {1}" -f $status, $Name) -ForegroundColor $color
+        Write-ScpTestLine ("  [{0}] {1}" -f $Status, $Name) -ForegroundColor $color
     }
 }
 
@@ -232,9 +246,15 @@ function Get-FileDebugInfo {
 
 function Test-TcpEndpoint {
     param(
-        [Parameter(Mandatory)][string]$HostName,
+        [string]$HostName,
         [Parameter(Mandatory)][int]$Port
     )
+    if ([string]::IsNullOrWhiteSpace($HostName)) {
+        return [pscustomobject]@{
+            Ok     = $false
+            Detail = 'HostName is empty; TCP check skipped'
+        }
+    }
     try {
         $tnc = Test-NetConnection -ComputerName $HostName -Port $Port -WarningAction SilentlyContinue -ErrorAction Stop
         return [pscustomobject]@{
@@ -350,8 +370,13 @@ function Write-FailureDebug {
         }
     }
 
-    $tcp = Test-TcpEndpoint -HostName $Config.ScpHost -Port ([int]$Config.ScpPort)
-    Write-ScpTestLine ("TCP {0}:{1}:  {2} ({3})" -f $Config.ScpHost, $Config.ScpPort, $(if ($tcp.Ok) { 'OK' } else { 'FAIL' }), $tcp.Detail)
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) {
+        $tcp = Test-TcpEndpoint -HostName $Config.ScpHost -Port ([int]$Config.ScpPort)
+        Write-ScpTestLine ("TCP {0}:{1}:  {2} ({3})" -f $Config.ScpHost, $Config.ScpPort, $(if ($tcp.Ok) { 'OK' } else { 'FAIL' }), $tcp.Detail)
+    }
+    else {
+        Write-ScpTestLine 'TCP check:       skipped (ScpHost empty)'
+    }
 
     if ($CopyResult) {
         Write-ScpTestLine ("scp exit code:  {0}" -f $CopyResult.ExitCode)
@@ -374,6 +399,7 @@ function Write-FailureDebug {
     Write-ScpTestLine ''
     Write-ScpTestLine 'Hints:' -ForegroundColor DarkGray
     Write-ScpTestLine '  - Public key for ScpIdentityFile must be in remote authorized_keys for ScpUser.' -ForegroundColor DarkGray
+    Write-ScpTestLine '  - Missing key: re-run Install, or .\scripts\Test-ScpOnLock.ps1 -GenerateIdentity' -ForegroundColor DarkGray
     Write-ScpTestLine '  - ScpRemoteDirectory must exist and be writable by ScpUser.' -ForegroundColor DarkGray
     Write-ScpTestLine '  - Monitor runs as SYSTEM: identity ACL must allow SYSTEM read (reinstall/set ACL if needed).' -ForegroundColor DarkGray
     Write-ScpTestLine '  - BatchMode=yes means password prompts fail; key auth only.' -ForegroundColor DarkGray
@@ -412,23 +438,50 @@ try {
     Write-Check -Name 'ScpUser' -Ok (-not [string]::IsNullOrWhiteSpace($cfg.ScpUser)) -Detail $(if ($cfg.ScpUser) { $cfg.ScpUser } else { 'empty' })
     Write-Check -Name 'ScpRemoteDirectory' -Ok (-not [string]::IsNullOrWhiteSpace($cfg.ScpRemoteDirectory)) -Detail $(if ($cfg.ScpRemoteDirectory) { $cfg.ScpRemoteDirectory } else { 'empty' })
     Write-Check -Name 'ScpPort' -Ok ($cfg.ScpPort -gt 0) -Detail "$($cfg.ScpPort)"
-    Write-Check -Name 'ScpIdentityFile exists' -Ok (Test-Path -LiteralPath $cfg.ScpIdentityFile) -Detail $cfg.ScpIdentityFile
+
+    if ($GenerateIdentity -and -not (Test-Path -LiteralPath $cfg.ScpIdentityFile)) {
+        Write-ScpTestLine ''
+        Write-ScpTestLine ("Generating SCP identity at {0} ..." -f $cfg.ScpIdentityFile) -ForegroundColor Cyan
+        $generated = New-ScpIdentityKeyFile -IdentityPath $cfg.ScpIdentityFile -KnownHostsPath $cfg.ScpKnownHostsFile
+        if ($generated.Created) {
+            Write-Check -Name 'ScpIdentityFile generated' -Ok $true -Detail $generated.IdentityPath
+            if (-not [string]::IsNullOrWhiteSpace($generated.PublicKey)) {
+                Write-ScpTestLine 'Add this public key to the remote user authorized_keys:' -ForegroundColor Yellow
+                Write-ScpTestLine $generated.PublicKey -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Check -Name 'ScpIdentityFile exists' -Ok $true -Detail ('already present: {0}' -f $generated.IdentityPath)
+        }
+    }
+
+    $identityExists = Test-Path -LiteralPath $cfg.ScpIdentityFile
+    Write-Check -Name 'ScpIdentityFile exists' -Ok $identityExists -Detail $(
+        if ($identityExists) { $cfg.ScpIdentityFile }
+        else { "missing: $($cfg.ScpIdentityFile) (re-run Install or pass -GenerateIdentity)" }
+    )
 
     $scpExe = Find-ScpExecutable
     Write-Check -Name 'scp.exe' -Ok (-not [string]::IsNullOrWhiteSpace($scpExe)) -Detail $(if ($scpExe) { $scpExe } else { 'not found' })
 
     $knownOk = [string]::IsNullOrWhiteSpace($cfg.ScpKnownHostsFile) -or (Test-Path -LiteralPath $cfg.ScpKnownHostsFile)
-    Write-Check -Name 'ScpKnownHostsFile' -Ok $knownOk -Detail $(
-        if ([string]::IsNullOrWhiteSpace($cfg.ScpKnownHostsFile)) { '(not set; OpenSSH default)' }
-        elseif ($knownOk) { $cfg.ScpKnownHostsFile }
-        else { "missing: $($cfg.ScpKnownHostsFile) (will accept-new on first connect)" }
-    )
+    if ($knownOk) {
+        Write-Check -Name 'ScpKnownHostsFile' -Ok $true -Detail $(
+            if ([string]::IsNullOrWhiteSpace($cfg.ScpKnownHostsFile)) { '(not set; OpenSSH default)' }
+            else { $cfg.ScpKnownHostsFile }
+        )
+    }
+    else {
+        # Missing file is fine with StrictHostKeyChecking=accept-new; OpenSSH creates it on first connect.
+        Write-Check -Name 'ScpKnownHostsFile' -Ok $true -Status WARN -Detail (
+            "missing: $($cfg.ScpKnownHostsFile) (will accept-new on first connect)")
+    }
 
     $configReady = ($cfg.ScpOnLockEnabled -or $Force) `
         -and -not [string]::IsNullOrWhiteSpace($cfg.ScpHost) `
         -and -not [string]::IsNullOrWhiteSpace($cfg.ScpUser) `
         -and -not [string]::IsNullOrWhiteSpace($cfg.ScpRemoteDirectory) `
-        -and (Test-Path -LiteralPath $cfg.ScpIdentityFile) `
+        -and $identityExists `
         -and $scpExe
 
     if (-not $configReady) {

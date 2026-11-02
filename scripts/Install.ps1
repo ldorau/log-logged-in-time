@@ -56,6 +56,12 @@ if (-not (Test-Path -LiteralPath $lockSignalLauncherHelper)) {
 }
 . $lockSignalLauncherHelper
 
+$scpHelperPath = Join-Path $repoRoot 'src\Scp-OnLock.ps1'
+if (-not (Test-Path -LiteralPath $scpHelperPath)) {
+    throw "Scp-OnLock.ps1 missing at '$scpHelperPath'."
+}
+. $scpHelperPath
+
 $templateConfigForLog = Join-Path $repoRoot 'config\config.json'
 $null = Initialize-ErrorLog -ConfigPath $templateConfigForLog
 Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
@@ -710,9 +716,20 @@ function Test-InstallPrerequisites {
             $identityPath = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
         }
         $identityOk = Test-Path -LiteralPath $identityPath
-        Write-CheckResult -Name 'SCP identity file (private key)' -Ok $identityOk -Detail $identityPath
-        if (-not $identityOk) {
-            $failures.Add(("ScpOnLockEnabled=true requires an SSH private key at '{0}' (or set ScpIdentityFile)." -f $identityPath))
+        if ($identityOk) {
+            Write-CheckResult -Name 'SCP identity file (private key)' -Ok $true -Detail $identityPath
+        }
+        else {
+            $keygen = Find-SshKeygenExecutable
+            if ($keygen) {
+                Write-CheckResult -Name 'SCP identity file (private key)' -Ok $true -Detail (
+                    "missing; will generate ed25519 key at install: $identityPath")
+            }
+            else {
+                Write-CheckResult -Name 'SCP identity file (private key)' -Ok $false -Detail (
+                    "missing: $identityPath (and ssh-keygen.exe not found to auto-generate)")
+                $failures.Add(("ScpOnLockEnabled=true requires an SSH private key at '{0}' (or OpenSSH Client so Install can generate one)." -f $identityPath))
+            }
         }
     }
     else {
@@ -1154,9 +1171,36 @@ SystemDrive: $env:SystemDrive
         Set-ProtectedDirectory -Directory $logDirectory -TargetUsername $targetUsername `
             -AllowedAdminSid $allowedAdminSid -AdministratorProfile $administratorProfile
         # Private keys must stay admin/SYSTEM-only even though LoginTimeLogger is readable.
+        $sshDir = Join-Path $adminAppDirectory 'ssh'
         Set-ProtectedSshDirectory `
-            -Directory (Join-Path $adminAppDirectory 'ssh') `
+            -Directory $sshDir `
             -AllowedAdminSid $allowedAdminSid
+
+        if ($scpOnLockEnabledRuntime -and -not [string]::IsNullOrWhiteSpace($scpIdentityFile)) {
+            if (-not (Test-Path -LiteralPath $scpIdentityFile)) {
+                Write-Host ("Generating SCP identity key: {0}" -f $scpIdentityFile) -ForegroundColor Cyan
+                $generated = New-ScpIdentityKeyFile `
+                    -IdentityPath $scpIdentityFile `
+                    -KnownHostsPath $scpKnownHostsFile
+                # Re-apply ACL so the new key files inherit admin/SYSTEM-only rights.
+                Set-ProtectedSshDirectory -Directory $sshDir -AllowedAdminSid $allowedAdminSid
+                if (-not [string]::IsNullOrWhiteSpace($generated.PublicKey)) {
+                    Write-Host 'Add this public key to the remote ScpUser authorized_keys file:' -ForegroundColor Yellow
+                    Write-Host $generated.PublicKey -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ("Public key file: {0}" -f $generated.PublicKeyPath) -ForegroundColor Yellow
+                }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($scpKnownHostsFile) -and -not (Test-Path -LiteralPath $scpKnownHostsFile)) {
+                $khDir = Split-Path -Parent $scpKnownHostsFile
+                if (-not [string]::IsNullOrWhiteSpace($khDir) -and -not (Test-Path -LiteralPath $khDir)) {
+                    New-Item -ItemType Directory -Path $khDir -Force | Out-Null
+                }
+                Set-Content -LiteralPath $scpKnownHostsFile -Value '' -Encoding ASCII
+                Set-ProtectedSshDirectory -Directory $sshDir -AllowedAdminSid $allowedAdminSid
+            }
+        }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (

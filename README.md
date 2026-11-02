@@ -64,7 +64,7 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 - `ScpIdentityFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519`
 - `ScpKnownHostsFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\known_hosts`
 
-Place a private key readable by `SYSTEM` at that path (and the matching public key on the remote). `Install.ps1` installs OpenSSH Client if `scp.exe` is missing.
+`Install.ps1` installs OpenSSH Client if `scp.exe` is missing and generates an ed25519 key at `ScpIdentityFile` when that file does not exist (prints the public key to add to the remote `authorized_keys`). Keys are ACL-protected for admin + `SYSTEM` only. You can also run `.\scripts\Test-ScpOnLock.ps1 -GenerateIdentity` to create the key without a full reinstall.
 
 ## Install
 

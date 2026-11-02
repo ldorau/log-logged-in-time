@@ -16,6 +16,104 @@ function Find-ScpExecutable {
     return $null
 }
 
+function Find-SshKeygenExecutable {
+    $cmd = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe')
+        (Join-Path $env:SystemRoot 'Sysnative\OpenSSH\ssh-keygen.exe')
+        (Join-Path ${env:ProgramFiles} 'OpenSSH\ssh-keygen.exe')
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+function New-ScpIdentityKeyFile {
+    <#
+      Creates an ed25519 private key for SCP-on-lock when missing.
+      Also ensures the parent directory and an empty known_hosts sibling exist.
+      Returns Created=$false when the private key already exists.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IdentityPath,
+        [string]$KnownHostsPath = '',
+        [string]$Comment = 'LoginTimeLogger-scp-on-lock'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IdentityPath)) {
+        throw 'IdentityPath is required.'
+    }
+
+    $dir = Split-Path -Parent $IdentityPath
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($KnownHostsPath)) {
+        $KnownHostsPath = Join-Path $dir 'known_hosts'
+    }
+    if (-not (Test-Path -LiteralPath $KnownHostsPath)) {
+        $khDir = Split-Path -Parent $KnownHostsPath
+        if (-not [string]::IsNullOrWhiteSpace($khDir) -and -not (Test-Path -LiteralPath $khDir)) {
+            New-Item -ItemType Directory -Path $khDir -Force | Out-Null
+        }
+        Set-Content -LiteralPath $KnownHostsPath -Value '' -Encoding ASCII
+    }
+
+    $pubPath = "$IdentityPath.pub"
+    if (Test-Path -LiteralPath $IdentityPath) {
+        $pubText = ''
+        if (Test-Path -LiteralPath $pubPath) {
+            $pubText = ((Get-Content -LiteralPath $pubPath -Raw -ErrorAction SilentlyContinue) + '').Trim()
+        }
+        return [pscustomobject]@{
+            Created        = $false
+            IdentityPath   = $IdentityPath
+            PublicKeyPath  = $pubPath
+            PublicKey      = $pubText
+            KnownHostsPath = $KnownHostsPath
+        }
+    }
+
+    $keygen = Find-SshKeygenExecutable
+    if (-not $keygen) {
+        throw 'ssh-keygen.exe not found (install OpenSSH Client).'
+    }
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $exitCode = -1
+    try {
+        # Empty passphrase: Windows OpenSSH wants -N "" (two double-quotes).
+        $output = & $keygen -t ed25519 -f $IdentityPath -N '""' -q -C $Comment 2>&1
+        $exitCode = [int]$LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $IdentityPath)) {
+        throw ("ssh-keygen failed (exit {0}) creating '{1}': {2}" -f `
+                $exitCode, $IdentityPath, (($output | ForEach-Object { "$_" }) -join ' '))
+    }
+
+    $pubText = ''
+    if (Test-Path -LiteralPath $pubPath) {
+        $pubText = ((Get-Content -LiteralPath $pubPath -Raw -ErrorAction SilentlyContinue) + '').Trim()
+    }
+
+    return [pscustomobject]@{
+        Created        = $true
+        IdentityPath   = $IdentityPath
+        PublicKeyPath  = $pubPath
+        PublicKey      = $pubText
+        KnownHostsPath = $KnownHostsPath
+    }
+}
+
 function Test-ScpOnLockConfigured {
     param([Parameter(Mandatory)]$Config)
 
