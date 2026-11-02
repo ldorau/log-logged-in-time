@@ -451,6 +451,52 @@ try {
                 "DoH verify failed; script='{0}'" -f $dohScript)
         }
     }
+
+    # --- Local DNS force verify (Force-DnsToLocalResolver.ps1 -Verify) ---
+    $dnsForceCandidates = @(
+        (Join-Path $scriptDir 'Force-DnsToLocalResolver.ps1')
+        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Force-DnsToLocalResolver.ps1')
+    )
+    $dnsForceScript = $dnsForceCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $dnsForceScript) {
+        Write-Host 'DNS-Force: SKIP (Force-DnsToLocalResolver.ps1 not found)' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host 'Checking DNS-Force (local resolver) via Force-DnsToLocalResolver.ps1 -Verify...' -ForegroundColor DarkGray
+        try {
+            $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $dnsForceArgs = New-Object System.Collections.Generic.List[string]
+            $dnsForceArgs.Add('-NoProfile')
+            $dnsForceArgs.Add('-NonInteractive')
+            $dnsForceArgs.Add('-WindowStyle')
+            $dnsForceArgs.Add('Hidden')
+            $dnsForceArgs.Add('-ExecutionPolicy')
+            $dnsForceArgs.Add('Bypass')
+            $dnsForceArgs.Add('-File')
+            $dnsForceArgs.Add($dnsForceScript)
+            $dnsForceArgs.Add('-Verify')
+            $dnsForceArgs.Add('-Quiet')
+
+            $dnsForceProc = Start-Process -FilePath $windowsPowerShell -ArgumentList $dnsForceArgs.ToArray() `
+                -Wait -PassThru -WindowStyle Hidden
+            $dnsForceExit = 1
+            if ($null -ne $dnsForceProc) {
+                $dnsForceExit = [int]$dnsForceProc.ExitCode
+            }
+
+            if ($dnsForceExit -eq 0) {
+                Write-Host 'DNS-Force: OK' -ForegroundColor Green
+            }
+            else {
+                Write-Host 'DNS-Force: FAIL (adapter DNS or firewall rules not forcing the LAN resolver)' -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host ("DNS-Force: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                "DNS-Force verify failed; script='{0}'" -f $dnsForceScript)
+        }
+    }
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'Status.ps1 failed' -Source 'Status'

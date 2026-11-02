@@ -2,7 +2,8 @@
 # Once per day: if online, compare local installed commit to GitHub tip;
 # if different, git pull (or clone) and restart via the scheduled task.
 # After a successful daily check (up-to-date or just updated), also run
-# scripts/Block-DoH-Firewall.ps1 in a child process to reconcile DoH/DoT blocks.
+# scripts/Force-DnsToLocalResolver.ps1 and scripts/Block-DoH-Firewall.ps1 in
+# child processes to reconcile local-DNS forcing and DoH/DoT blocks.
 # If offline, postpone the check by 10 minutes.
 # Only https://github.com/ldorau/log-logged-in-time(.git) is accepted.
 
@@ -62,6 +63,8 @@ function Read-UpdateState {
             LastLocalCommit      = $null
             LastDoHBlockUtc      = $null
             LastDoHBlockResult   = $null
+            LastDnsForceUtc      = $null
+            LastDnsForceResult   = $null
         }
     }
 
@@ -75,6 +78,8 @@ function Read-UpdateState {
             LastLocalCommit    = $(if ($json.LastLocalCommit) { [string]$json.LastLocalCommit } else { $null })
             LastDoHBlockUtc    = $(if ($json.LastDoHBlockUtc) { [string]$json.LastDoHBlockUtc } else { $null })
             LastDoHBlockResult = $(if ($json.LastDoHBlockResult) { [string]$json.LastDoHBlockResult } else { $null })
+            LastDnsForceUtc    = $(if ($json.LastDnsForceUtc) { [string]$json.LastDnsForceUtc } else { $null })
+            LastDnsForceResult = $(if ($json.LastDnsForceResult) { [string]$json.LastDnsForceResult } else { $null })
         }
     }
     catch {
@@ -87,6 +92,8 @@ function Read-UpdateState {
             LastLocalCommit      = $null
             LastDoHBlockUtc      = $null
             LastDoHBlockResult   = $null
+            LastDnsForceUtc      = $null
+            LastDnsForceResult   = $null
         }
     }
 }
@@ -270,17 +277,18 @@ function Publish-InstalledFilesFromRepo {
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
 
-    # Daily DoH/DoT helper (optional for older clones; preferred when present).
+    # Daily DNS/DoH helpers (optional for older clones; preferred when present).
     $scriptsSrc = Join-Path $ClonePath 'scripts'
     $scriptsDest = Join-Path $InstallRoot 'scripts'
-    $dohFiles = @(
+    $helperFiles = @(
         'Block-DoH-Firewall.ps1'
         'Block-DoH-Providers.json'
+        'Force-DnsToLocalResolver.ps1'
     )
-    foreach ($name in $dohFiles) {
+    foreach ($name in $helperFiles) {
         $from = Join-Path $scriptsSrc $name
         if (-not (Test-Path -LiteralPath $from)) {
-            Write-LoggerEvent -Level WARN -Message ("DoH helper missing in clone (skipped): {0}" -f $from)
+            Write-LoggerEvent -Level WARN -Message ("Helper script missing in clone (skipped): {0}" -f $from)
             continue
         }
         if (-not (Test-Path -LiteralPath $scriptsDest)) {
@@ -377,6 +385,83 @@ function Invoke-DailyDoHFirewallBlock {
         Write-UpdateState -Path $StatePath -State $UpdateState
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
             'Daily DoH/DoT firewall reconcile failed')
+    }
+}
+
+function Invoke-DailyDnsForceLocalResolver {
+    <#
+      Runs Force-DnsToLocalResolver.ps1 once after a successful daily update check.
+      Uses a child powershell.exe so exit codes cannot stop the monitor.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$ClonePath,
+        [Parameter(Mandatory)]$UpdateState,
+        [Parameter(Mandatory)][string]$StatePath,
+        [string]$DnsServer = '192.168.0.200'
+    )
+
+    $scriptPath = $null
+    $cloneScript = $null
+    if (-not [string]::IsNullOrWhiteSpace($ClonePath)) {
+        $cloneScript = Join-Path $ClonePath 'scripts\Force-DnsToLocalResolver.ps1'
+    }
+    $installScript = Join-Path $InstallRoot 'scripts\Force-DnsToLocalResolver.ps1'
+
+    if ($cloneScript -and (Test-Path -LiteralPath $cloneScript)) {
+        $scriptPath = $cloneScript
+    }
+    elseif (Test-Path -LiteralPath $installScript) {
+        $scriptPath = $installScript
+    }
+    else {
+        $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastDnsForceResult = 'skipped-script-missing'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        Write-LoggerEvent -Level WARN -Message (
+            'Daily DNS-force reconcile skipped: Force-DnsToLocalResolver.ps1 not found in clone or InstallRoot\scripts.')
+        return
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-NoProfile')
+    $argList.Add('-NonInteractive')
+    $argList.Add('-WindowStyle')
+    $argList.Add('Hidden')
+    $argList.Add('-ExecutionPolicy')
+    $argList.Add('Bypass')
+    $argList.Add('-File')
+    $argList.Add($scriptPath)
+    $argList.Add('-DnsServer')
+    $argList.Add($DnsServer)
+
+    Write-LoggerEvent ("Daily DNS-force reconcile starting: {0} (DnsServer={1})" -f $scriptPath, $DnsServer)
+    try {
+        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
+            -Wait -PassThru -WindowStyle Hidden
+        $exitCode = 0
+        if ($null -ne $proc) {
+            $exitCode = [int]$proc.ExitCode
+        }
+        $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
+        if ($exitCode -eq 0) {
+            $UpdateState.LastDnsForceResult = 'ok'
+            Write-LoggerEvent 'Daily DNS-force reconcile finished successfully.'
+        }
+        else {
+            $UpdateState.LastDnsForceResult = ('exit-{0}' -f $exitCode)
+            Write-LoggerEvent -Level WARN -Message (
+                "Daily DNS-force reconcile exited with code {0}." -f $exitCode)
+        }
+        Write-UpdateState -Path $StatePath -State $UpdateState
+    }
+    catch {
+        $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastDnsForceResult = 'error'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Daily DNS-force reconcile failed')
     }
 }
 
@@ -551,6 +636,11 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             $updateState.LastResult = 'up-to-date'
             Write-UpdateState -Path $statePath -State $updateState
             Write-LoggerEvent ("Update check: already on latest commit {0}." -f $remoteSha)
+            Invoke-DailyDnsForceLocalResolver `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath
             Invoke-DailyDoHFirewallBlock `
                 -InstallRoot $InstallRoot `
                 -ClonePath ([string]$Config.UpdateClonePath) `
@@ -578,7 +668,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
-        # Reconcile DoH/DoT rules against the freshly pulled provider list before restart.
+        # Reconcile local DNS force + DoH/DoT rules before restart.
+        Invoke-DailyDnsForceLocalResolver `
+            -InstallRoot $InstallRoot `
+            -ClonePath ([string]$Config.UpdateClonePath) `
+            -UpdateState $updateState `
+            -StatePath $statePath
         Invoke-DailyDoHFirewallBlock `
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `

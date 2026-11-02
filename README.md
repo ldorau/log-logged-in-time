@@ -50,7 +50,7 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 
 ### Self-update
 
-**On by default** (`UpdateEnabled: true`). Once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. After each successful daily check (whether up to date or just updated), it runs `scripts/Block-DoH-Firewall.ps1` to reconcile outbound DoH/DoT firewall blocks. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) when updates are enabled. Set `UpdateEnabled: false` to disable.
+**On by default** (`UpdateEnabled: true`). Once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. After each successful daily check (whether up to date or just updated), it runs `scripts/Force-DnsToLocalResolver.ps1` (force DNS to the configured LAN resolver) and `scripts/Block-DoH-Firewall.ps1` (DoH/DoT blocks). Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) when updates are enabled. Set `UpdateEnabled: false` to disable.
 
 ### SCP on lock
 

@@ -123,9 +123,11 @@ it clones/pulls into
 copies updated src files into Program Files, then restarts via the
 scheduled task (Start-ScheduledTask after exit) so monitoring stays under
 Task Scheduler. After each successful daily check (up-to-date or just
-updated), it also runs scripts\Block-DoH-Firewall.ps1 (child process) to
-reconcile outbound DoH/DoT block rules. Offline checks are postponed by
-10 minutes. Set "UpdateEnabled": false in config.json to disable.
+updated), it also runs scripts\Force-DnsToLocalResolver.ps1 and
+scripts\Block-DoH-Firewall.ps1 (child processes) to force DNS to the
+configured LAN resolver and reconcile outbound DoH/DoT block rules.
+Offline checks are postponed by 10 minutes. Set "UpdateEnabled": false in
+config.json to disable.
 
 SCP on lock (optional)
 ----------------------

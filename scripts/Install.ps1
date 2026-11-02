@@ -1235,6 +1235,7 @@ SystemDrive: $env:SystemDrive
     $lockSignalWatcherSrc = Join-Path $repoRoot 'src\LockSignalWatcher.ps1'
     $dohFirewallSrc = Join-Path $repoRoot 'scripts\Block-DoH-Firewall.ps1'
     $dohProvidersSrc = Join-Path $repoRoot 'scripts\Block-DoH-Providers.json'
+    $dnsForceSrc = Join-Path $repoRoot 'scripts\Force-DnsToLocalResolver.ps1'
 
     try {
         New-Item -ItemType Directory -Path $installSrc -Force | Out-Null
@@ -1252,6 +1253,9 @@ SystemDrive: $env:SystemDrive
         }
         if (Test-Path -LiteralPath $dohProvidersSrc) {
             Copy-Item -LiteralPath $dohProvidersSrc -Destination (Join-Path $installScripts 'Block-DoH-Providers.json') -Force
+        }
+        if (Test-Path -LiteralPath $dnsForceSrc) {
+            Copy-Item -LiteralPath $dnsForceSrc -Destination (Join-Path $installScripts 'Force-DnsToLocalResolver.ps1') -Force
         }
     }
     catch {

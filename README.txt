@@ -75,6 +75,7 @@ Self-update (on by default; UpdateEnabled=true):
   C:\Program Files\LoginTimeLogger\installed-commit.txt
   If different: sync LoginTimeLogger\repo, refresh Program Files, restart
   via the scheduled task. After each successful daily check, also runs
+  scripts\Force-DnsToLocalResolver.ps1 (force DNS to the LAN resolver) and
   scripts\Block-DoH-Firewall.ps1 to reconcile DoH/DoT block rules.
   Offline: retry in 10 minutes.
   Git for Windows is installed (Authenticode-checked) when UpdateEnabled=true.
