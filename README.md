@@ -128,6 +128,16 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 
 Errors are also printed to the screen. If that path is not writable, a fallback is used: `%TEMP%\LoginTimeLogger\errors.log`.
 
+## Reinstall
+
+From an elevated PowerShell in a git clone of this repo:
+
+```powershell
+.\scripts\Reinstall.ps1
+```
+
+Pulls `origin/main` when possible, then runs `Install.ps1 -StartNow`. Account names come from the installed runtime config (`AdminUsername` / `TargetUsername`). Pass `-ConfigPath` if needed, or `-SkipGitPull` to reinstall without fetching.
+
 ## Uninstall
 
 ```powershell

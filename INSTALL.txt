@@ -234,6 +234,24 @@ then restart the task:
   (or Stop then Start the task)
 
 
+Reinstall (pull latest + full Install -StartNow)
+------------------------------------------------
+From an Administrator PowerShell in this project folder (a git clone):
+
+  Set-ExecutionPolicy -Scope Process Bypass
+  .\scripts\Reinstall.ps1
+
+Pulls origin/main (when .git + git.exe are available), then runs Install.ps1
+-StartNow. AdminUsername and TargetUsername are read from the current
+runtime config (LoginTimeLogger task -ConfigPath). Override with:
+
+  .\scripts\Reinstall.ps1 -ConfigPath 'C:\Users\AdminName\LoginTimeLogger\config.json'
+
+Skip the git pull and only reinstall from the current tree:
+
+  .\scripts\Reinstall.ps1 -SkipGitPull
+
+
 Uninstall
 ---------
 In an Administrator PowerShell from this project folder:
