@@ -295,6 +295,10 @@ function Invoke-ScpCopyForTest {
     $argList.Add('-o')
     $argList.Add('BatchMode=yes')
     $argList.Add('-o')
+    $argList.Add('IdentitiesOnly=yes')
+    $argList.Add('-o')
+    $argList.Add('PreferredAuthentications=publickey')
+    $argList.Add('-o')
     $argList.Add('StrictHostKeyChecking=accept-new')
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpKnownHostsFile)) {
         $argList.Add('-o')
@@ -396,10 +400,33 @@ function Write-FailureDebug {
         Write-ScpTestLine ("Extra:          {0}" -f $Extra)
     }
 
+    $stderrText = ''
+    if ($CopyResult -and -not [string]::IsNullOrWhiteSpace([string]$CopyResult.StdErr)) {
+        $stderrText = [string]$CopyResult.StdErr
+    }
+    $authFailed = Test-ScpAuthFailure -StdErr $stderrText
+    if ($authFailed -and -not [string]::IsNullOrWhiteSpace([string]$Config.ScpIdentityFile)) {
+        $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
+        Write-ScpTestLine ''
+        Write-ScpTestLine '=== PUBLIC KEY AUTH REJECTED ===' -ForegroundColor Red
+        Write-ScpTestLine ("The remote host accepted the TCP connection but rejected key '{0}'." -f $Config.ScpIdentityFile)
+        Write-ScpTestLine ("Append the following single line to ~{0}/.ssh/authorized_keys on {1}:" -f $Config.ScpUser, $Config.ScpHost) -ForegroundColor Yellow
+        if (-not [string]::IsNullOrWhiteSpace($pub)) {
+            Write-ScpTestLine $pub -ForegroundColor Yellow
+        }
+        else {
+            Write-ScpTestLine ("(could not read public key; check {0}.pub)" -f $Config.ScpIdentityFile) -ForegroundColor Yellow
+        }
+        Write-ScpTestLine 'On the remote host (example):' -ForegroundColor DarkGray
+        Write-ScpTestLine '  mkdir -p ~/.ssh && chmod 700 ~/.ssh' -ForegroundColor DarkGray
+        Write-ScpTestLine '  # paste the public key line into ~/.ssh/authorized_keys then:' -ForegroundColor DarkGray
+        Write-ScpTestLine '  chmod 600 ~/.ssh/authorized_keys' -ForegroundColor DarkGray
+    }
+
     Write-ScpTestLine ''
     Write-ScpTestLine 'Hints:' -ForegroundColor DarkGray
     Write-ScpTestLine '  - Public key for ScpIdentityFile must be in remote authorized_keys for ScpUser.' -ForegroundColor DarkGray
-    Write-ScpTestLine '  - Missing key: re-run Install, or .\scripts\Test-ScpOnLock.ps1 -GenerateIdentity' -ForegroundColor DarkGray
+    Write-ScpTestLine '  - Missing local key: re-run Install, or .\scripts\Test-ScpOnLock.ps1 -GenerateIdentity' -ForegroundColor DarkGray
     Write-ScpTestLine '  - ScpRemoteDirectory must exist and be writable by ScpUser.' -ForegroundColor DarkGray
     Write-ScpTestLine '  - Monitor runs as SYSTEM: identity ACL must allow SYSTEM read (reinstall/set ACL if needed).' -ForegroundColor DarkGray
     Write-ScpTestLine '  - BatchMode=yes means password prompts fail; key auth only.' -ForegroundColor DarkGray
@@ -530,7 +557,9 @@ try {
             Write-Check -Name 'Error log' -Ok $true -Detail $errorLog
         }
         else {
-            Write-Check -Name 'Error log' -Ok $false -Detail ("missing: {0}" -f $(if ($errorLog) { $errorLog } else { '(unset)' }))
+            # Optional when a time log (or probe) is present; do not treat as a hard failure.
+            Write-Check -Name 'Error log' -Ok $true -Status WARN -Detail (
+                "missing: $(if ($errorLog) { $errorLog } else { '(unset)' }) (optional; not required for SCP)")
         }
         if ($fileList.Count -eq 0) {
             $probePath = Join-Path $env:TEMP ('LoginTimeLogger-scp-probe-{0}.txt' -f [guid]::NewGuid().ToString('N'))

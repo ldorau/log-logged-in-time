@@ -114,6 +114,54 @@ function New-ScpIdentityKeyFile {
     }
 }
 
+function Get-ScpPublicKeyText {
+    <#
+      Returns the OpenSSH public key line for an identity file (.pub or derived via ssh-keygen -y).
+    #>
+    param([Parameter(Mandatory)][string]$IdentityPath)
+
+    if ([string]::IsNullOrWhiteSpace($IdentityPath)) {
+        return ''
+    }
+
+    $pubPath = "$IdentityPath.pub"
+    if (Test-Path -LiteralPath $pubPath) {
+        return ((Get-Content -LiteralPath $pubPath -Raw -ErrorAction SilentlyContinue) + '').Trim()
+    }
+
+    if (-not (Test-Path -LiteralPath $IdentityPath)) {
+        return ''
+    }
+
+    $keygen = Find-SshKeygenExecutable
+    if (-not $keygen) {
+        return ''
+    }
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $keygen -y -f $IdentityPath 2>&1
+        if ([int]$LASTEXITCODE -ne 0) {
+            return ''
+        }
+        return (("$output") + '').Trim()
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+function Test-ScpAuthFailure {
+    param([string]$StdErr)
+
+    if ([string]::IsNullOrWhiteSpace($StdErr)) {
+        return $false
+    }
+    return ($StdErr -match '(?i)Permission denied \(publickey') -or
+        ($StdErr -match '(?i)No more authentication methods to try')
+}
+
 function Test-ScpOnLockConfigured {
     param([Parameter(Mandatory)]$Config)
 
@@ -200,6 +248,10 @@ function Invoke-ScpLogCopyOnLock {
         $args.Add('-o')
         $args.Add('BatchMode=yes')
         $args.Add('-o')
+        $args.Add('IdentitiesOnly=yes')
+        $args.Add('-o')
+        $args.Add('PreferredAuthentications=publickey')
+        $args.Add('-o')
         $args.Add('StrictHostKeyChecking=accept-new')
         if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpKnownHostsFile)) {
             $args.Add('-o')
@@ -229,8 +281,19 @@ function Invoke-ScpLogCopyOnLock {
                 $stderr = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
             if ($proc.ExitCode -ne 0) {
-                Write-LoggerEvent -Level ERROR -Message ("SCP on lock failed (exit {0}). stderr={1} stdout={2}" -f `
+                $msg = ("SCP on lock failed (exit {0}). stderr={1} stdout={2}" -f `
                         $proc.ExitCode, ("$stderr").Trim(), ("$stdout").Trim())
+                if (Test-ScpAuthFailure -StdErr "$stderr") {
+                    $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
+                    if (-not [string]::IsNullOrWhiteSpace($pub)) {
+                        $msg = $msg + ("`r`nRemote rejected public key auth. Append this line to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
+                                $Config.ScpUser, $pub)
+                    }
+                    else {
+                        $msg = $msg + "`r`nRemote rejected public key auth; ensure ScpIdentityFile.pub is in remote authorized_keys."
+                    }
+                }
+                Write-LoggerEvent -Level ERROR -Message $msg
                 return
             }
             Write-LoggerEvent ("SCP on lock succeeded: {0}" -f ($files -join ', '))
