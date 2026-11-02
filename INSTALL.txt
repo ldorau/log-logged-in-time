@@ -180,6 +180,11 @@ Estimate locked/away time from existing daily logs (transition timestamps):
   .\scripts\Get-LockedTime.ps1 -AllDays
   LOCKED_OR_AWAY means not unlocked-active (screen lock or away).
 
+Test SCP-on-lock copy to the remote host (uses runtime config; prints debug on failure).
+Output goes to the screen and a log under LoginTimeLogger\scp-on-lock-test-*.log:
+  .\scripts\Test-ScpOnLock.ps1
+  .\scripts\Test-ScpOnLock.ps1 -Force -ProbeOnly
+
 Test session / lock detection for the configured user:
   .\scripts\Test-Session.ps1
   Tip: lock the target desktop (Win+L) from another session and re-run to

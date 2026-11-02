@@ -97,6 +97,7 @@ Project layout
   src\Scp-OnLock.ps1          - copy time + error logs via scp on lock
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Reinstall.ps1       - git pull (optional) + Install.ps1 -StartNow
+  scripts\Test-ScpOnLock.ps1  - test remote log copy (SCP on lock) + debug
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total
   scripts\Get-LockedTime.ps1  - estimate locked/away time from daily logs
