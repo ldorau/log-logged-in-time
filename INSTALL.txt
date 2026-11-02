@@ -122,8 +122,10 @@ it clones/pulls into
   <AdministratorProfile>\LoginTimeLogger\repo
 copies updated src files into Program Files, then restarts via the
 scheduled task (Start-ScheduledTask after exit) so monitoring stays under
-Task Scheduler. Offline checks are postponed by 10 minutes.
-Set "UpdateEnabled": false in config.json to disable.
+Task Scheduler. After each successful daily check (up-to-date or just
+updated), it also runs scripts\Block-DoH-Firewall.ps1 (child process) to
+reconcile outbound DoH/DoT block rules. Offline checks are postponed by
+10 minutes. Set "UpdateEnabled": false in config.json to disable.
 
 SCP on lock (optional)
 ----------------------

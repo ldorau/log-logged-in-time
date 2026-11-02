@@ -74,7 +74,9 @@ Self-update (on by default; UpdateEnabled=true):
   When online, compares allowlisted GitHub tip to
   C:\Program Files\LoginTimeLogger\installed-commit.txt
   If different: sync LoginTimeLogger\repo, refresh Program Files, restart
-  via the scheduled task. Offline: retry in 10 minutes.
+  via the scheduled task. After each successful daily check, also runs
+  scripts\Block-DoH-Firewall.ps1 to reconcile DoH/DoT block rules.
+  Offline: retry in 10 minutes.
   Git for Windows is installed (Authenticode-checked) when UpdateEnabled=true.
   Set UpdateEnabled=false to disable.
 

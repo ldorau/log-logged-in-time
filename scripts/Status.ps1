@@ -397,6 +397,60 @@ try {
                 "Failed to read error log '{0}'" -f $errorLogPath)
         }
     }
+
+    # --- DoH / DNS-over-HTTPS verify (Block-DoH-Firewall.ps1 -Verify) ---
+    $dohCandidates = @(
+        (Join-Path $scriptDir 'Block-DoH-Firewall.ps1')
+        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Block-DoH-Firewall.ps1')
+    )
+    $dohScript = $dohCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $dohScript) {
+        Write-Host 'DNS-over-HTTP: SKIP (Block-DoH-Firewall.ps1 not found)' -ForegroundColor Yellow
+    }
+    else {
+        $dohProviders = Join-Path (Split-Path -Parent $dohScript) 'Block-DoH-Providers.json'
+        Write-Host 'Checking DNS-over-HTTP (DoH) block via Block-DoH-Firewall.ps1 -Verify (may take a minute)...' -ForegroundColor DarkGray
+        try {
+            $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $dohArgs = New-Object System.Collections.Generic.List[string]
+            $dohArgs.Add('-NoProfile')
+            $dohArgs.Add('-NonInteractive')
+            $dohArgs.Add('-WindowStyle')
+            $dohArgs.Add('Hidden')
+            $dohArgs.Add('-ExecutionPolicy')
+            $dohArgs.Add('Bypass')
+            $dohArgs.Add('-File')
+            $dohArgs.Add($dohScript)
+            $dohArgs.Add('-Verify')
+            $dohArgs.Add('-Quiet')
+            if (Test-Path -LiteralPath $dohProviders) {
+                $dohArgs.Add('-ProvidersPath')
+                $dohArgs.Add($dohProviders)
+            }
+
+            $dohProc = Start-Process -FilePath $windowsPowerShell -ArgumentList $dohArgs.ToArray() `
+                -Wait -PassThru -WindowStyle Hidden
+            $dohExit = 1
+            if ($null -ne $dohProc) {
+                $dohExit = [int]$dohProc.ExitCode
+            }
+
+            if ($dohExit -eq 0) {
+                Write-Host 'DNS-over-HTTP: OK' -ForegroundColor Green
+            }
+            elseif ($dohExit -eq 2) {
+                Write-Host 'DNS-over-HTTP: INCONCLUSIVE (rules/tests did not confirm a block)' -ForegroundColor Yellow
+            }
+            else {
+                Write-Host 'DNS-over-HTTP: FAIL (reachable endpoints or missing/mismatched firewall rules)' -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host ("DNS-over-HTTP: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                "DoH verify failed; script='{0}'" -f $dohScript)
+        }
+    }
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'Status.ps1 failed' -Source 'Status'

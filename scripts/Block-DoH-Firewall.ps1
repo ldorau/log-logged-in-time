@@ -44,6 +44,12 @@
     Optional path to a JSON object of provider name -> IP array. Default:
     Block-DoH-Providers.json next to this script.
 
+.PARAMETER Quiet
+    With -Verify, suppress tables/details and only rely on the exit code:
+      0 = DoH/DoT looks blocked (rules OK, no reachable endpoints, >=1 blocked)
+      1 = not blocked or rules missing/misconfigured
+      2 = inconclusive (no leaks, but no conclusive blocked samples)
+
 .EXAMPLE
     # Run from an elevated PowerShell prompt to add/reconcile the rules:
     .\Block-DoH-Firewall.ps1
@@ -61,7 +67,8 @@
     .\Block-DoH-Firewall.ps1 -Remove
 
 .NOTES
-    - Must be run as Administrator (Windows Firewall rule changes require it).
+    - Add/reconcile and -Remove must be run as Administrator.
+    - -Verify can run without elevation (reads rules + live TCP tests).
     - This blocks HTTPS/TLS *to these specific IPs only*. It does not block
       port 53 plain DNS to the same IPs, and it cannot block arbitrary
       self-hosted DoH servers (Windows Firewall has no domain/SNI filtering).
@@ -86,7 +93,8 @@ param(
     [switch]$Remove,
     [switch]$Verify,
     [bool]$IncludeDoT = $true,
-    [string]$ProvidersPath
+    [string]$ProvidersPath,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,11 +104,29 @@ if ($Remove -and $Verify) {
     throw "Specify only one of -Remove or -Verify (not both)."
 }
 
-# --- Require elevation -----------------------------------------------------
+function Write-DoHHost {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray,
+        [switch]$Force
+    )
+    if ($Quiet -and -not $Force) {
+        return
+    }
+    if ($PSBoundParameters.ContainsKey('ForegroundColor')) {
+        Write-Host $Message -ForegroundColor $ForegroundColor
+    }
+    else {
+        Write-Host $Message
+    }
+}
+
+# --- Require elevation for rule changes (Verify is read-only) --------------
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Error "This script must be run from an elevated (Administrator) PowerShell prompt."
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $Verify -and -not $isAdmin) {
+    Write-Error "This script must be run from an elevated (Administrator) PowerShell prompt (except -Verify)."
     exit 1
 }
 
@@ -394,8 +420,8 @@ if ($Remove) {
 # -Verify : check rule configuration + live connectivity
 # =============================================================================
 if ($Verify) {
-    Write-Host '=== Step 1/2: Checking firewall rule configuration ===' -ForegroundColor Cyan
-    Write-Host ''
+    Write-DoHHost '=== Step 1/2: Checking firewall rule configuration ===' -ForegroundColor Cyan
+    Write-DoHHost ''
 
     $ruleResults = @()
     foreach ($providerName in $Providers.Keys) {
@@ -420,31 +446,33 @@ if ($Verify) {
             }
         }
     }
-    $ruleResults | Format-Table Provider, Label, Proto, Port, State -AutoSize
+    if (-not $Quiet) {
+        $ruleResults | Format-Table Provider, Label, Proto, Port, State -AutoSize
+    }
 
     $orphans = @(Get-ManagedFirewallRules | Where-Object { -not $expectedRuleNames.Contains($_.DisplayName) })
     if ($orphans.Count -gt 0) {
-        Write-Host "WARNING: $($orphans.Count) orphan managed rule(s) present (not in current provider/port set):" -ForegroundColor Yellow
-        $orphans | ForEach-Object { Write-Host "  - $($_.DisplayName)" -ForegroundColor Yellow }
+        Write-DoHHost "WARNING: $($orphans.Count) orphan managed rule(s) present (not in current provider/port set):" -ForegroundColor Yellow
+        $orphans | ForEach-Object { Write-DoHHost "  - $($_.DisplayName)" -ForegroundColor Yellow }
     }
 
     $missing = @($ruleResults | Where-Object { $_.State -ne 'OK' })
     if ($missing.Count -gt 0) {
-        Write-Host "WARNING: $($missing.Count) rule(s) are missing or misconfigured. Run the script without -Verify/-Remove to (re)create them." -ForegroundColor Red
+        Write-DoHHost "WARNING: $($missing.Count) rule(s) are missing or misconfigured. Run the script without -Verify/-Remove to (re)create them." -ForegroundColor Red
     }
     else {
-        Write-Host "All $($ruleResults.Count) expected rules exist with matching filters." -ForegroundColor Green
+        Write-DoHHost "All $($ruleResults.Count) expected rules exist with matching filters." -ForegroundColor Green
     }
 
-    Write-Host ''
-    Write-Host '=== Step 2/2: Live connectivity test (TCP only) ===' -ForegroundColor Cyan
-    Write-Host "Attempting real outbound TCP connections. 'BLOCKED' = good; 'SKIP' = inconclusive." -ForegroundColor Cyan
-    Write-Host ''
+    Write-DoHHost ''
+    Write-DoHHost '=== Step 2/2: Live connectivity test (TCP only) ===' -ForegroundColor Cyan
+    Write-DoHHost "Attempting real outbound TCP connections. 'BLOCKED' = good; 'SKIP' = inconclusive." -ForegroundColor Cyan
+    Write-DoHHost ''
 
     $ipv6Available = Test-IPv6OutboundAvailable
     if (-not $ipv6Available) {
-        Write-Host 'Host has no usable IPv6 default route/global address; IPv6 endpoints will be SKIP (inconclusive).' -ForegroundColor Yellow
-        Write-Host ''
+        Write-DoHHost 'Host has no usable IPv6 default route/global address; IPv6 endpoints will be SKIP (inconclusive).' -ForegroundColor Yellow
+        Write-DoHHost ''
     }
 
     $tcpSpecs = @($PortSpecs | Where-Object { $_.Protocol -eq 'TCP' })
@@ -498,44 +526,55 @@ if ($Verify) {
         }
     }
 
-    $connResults | Format-Table Provider, IP, Proto, Port, Purpose, Status, Note -AutoSize
+    if (-not $Quiet) {
+        $connResults | Format-Table Provider, IP, Proto, Port, Purpose, Status, Note -AutoSize
+    }
 
     $leaky = @($connResults | Where-Object { $_.Status -eq 'NOT BLOCKED !!' })
     $skipped = @($connResults | Where-Object { $_.Status -like 'SKIP*' })
     $blocked = @($connResults | Where-Object { $_.Status -eq 'BLOCKED (ok)' })
 
-    Write-Host ''
-    if ($leaky.Count -gt 0) {
-        Write-Host "RESULT: $($leaky.Count) endpoint(s) are still REACHABLE. DoH/DoT is NOT fully blocked:" -ForegroundColor Red
-        $leaky | ForEach-Object { Write-Host "  - $($_.Provider) $($_.IP):$($_.Port)/$($_.Proto)" -ForegroundColor Red }
-        Write-Host 'Check that the rules exist/enabled (Step 1), that no VPN/split-tunnel bypasses the firewall, and that the correct Network Profile (Domain/Private/Public) is active.' -ForegroundColor Yellow
+    Write-DoHHost ''
+    $verifyExit = 0
+    if ($missing.Count -gt 0 -or $leaky.Count -gt 0) {
+        $verifyExit = 1
+        if ($leaky.Count -gt 0) {
+            Write-DoHHost "RESULT: $($leaky.Count) endpoint(s) are still REACHABLE. DoH/DoT is NOT fully blocked:" -ForegroundColor Red
+            $leaky | ForEach-Object { Write-DoHHost "  - $($_.Provider) $($_.IP):$($_.Port)/$($_.Proto)" -ForegroundColor Red }
+            Write-DoHHost 'Check that the rules exist/enabled (Step 1), that no VPN/split-tunnel bypasses the firewall, and that the correct Network Profile (Domain/Private/Public) is active.' -ForegroundColor Yellow
+        }
+        if ($missing.Count -gt 0) {
+            Write-DoHHost "RESULT: $($missing.Count) expected firewall rule(s) missing or mismatched." -ForegroundColor Red
+        }
     }
     elseif ($blocked.Count -eq 0) {
-        Write-Host "RESULT: No conclusive BLOCKED samples ($($skipped.Count) skipped). Cannot confirm blocking from live tests alone." -ForegroundColor Yellow
+        $verifyExit = 2
+        Write-DoHHost "RESULT: No conclusive BLOCKED samples ($($skipped.Count) skipped). Cannot confirm blocking from live tests alone." -ForegroundColor Yellow
     }
     else {
         $msg = "RESULT: $($blocked.Count) tested TCP endpoint(s) are blocked."
         if ($skipped.Count -gt 0) {
             $msg += " ($($skipped.Count) skipped/inconclusive — not counted as pass.)"
-            Write-Host $msg -ForegroundColor Yellow
+            Write-DoHHost $msg -ForegroundColor Yellow
         }
         else {
-            Write-Host ($msg + ' DoH/DoT blocking looks good for tested endpoints.') -ForegroundColor Green
+            Write-DoHHost ($msg + ' DoH/DoT blocking looks good for tested endpoints.') -ForegroundColor Green
         }
+        $verifyExit = 0
     }
 
     $udpSpecs = @($PortSpecs | Where-Object { $_.Protocol -eq 'UDP' })
     if ($udpSpecs.Count -gt 0) {
         $udpLabels = @($udpSpecs | ForEach-Object { $_.Label }) -join ', '
         $udpPorts = @($udpSpecs | ForEach-Object { $_.Port } | Select-Object -Unique) -join ', '
-        Write-Host ''
-        Write-Host "NOTE: UDP rules ($udpLabels on port(s) $udpPorts) were checked for configuration only (Step 1)." -ForegroundColor Yellow
-        Write-Host '      Live UDP blocking cannot be reliably verified from PowerShell (no connection handshake to test against).' -ForegroundColor Yellow
+        Write-DoHHost ''
+        Write-DoHHost "NOTE: UDP rules ($udpLabels on port(s) $udpPorts) were checked for configuration only (Step 1)." -ForegroundColor Yellow
+        Write-DoHHost '      Live UDP blocking cannot be reliably verified from PowerShell (no connection handshake to test against).' -ForegroundColor Yellow
     }
 
-    Write-Host ''
-    Write-Host 'Companion controls reminder: also disable browser/OS Secure DNS (DoH), and use NRPT/policy if you need org-wide DNS path control.' -ForegroundColor DarkGray
-    exit 0
+    Write-DoHHost ''
+    Write-DoHHost 'Companion controls reminder: also disable browser/OS Secure DNS (DoH), and use NRPT/policy if you need org-wide DNS path control.' -ForegroundColor DarkGray
+    exit $verifyExit
 }
 
 # =============================================================================

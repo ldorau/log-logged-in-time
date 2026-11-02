@@ -1231,7 +1231,10 @@ SystemDrive: $env:SystemDrive
 
     $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
     $installSrc = Join-Path $installRoot 'src'
+    $installScripts = Join-Path $installRoot 'scripts'
     $lockSignalWatcherSrc = Join-Path $repoRoot 'src\LockSignalWatcher.ps1'
+    $dohFirewallSrc = Join-Path $repoRoot 'scripts\Block-DoH-Firewall.ps1'
+    $dohProvidersSrc = Join-Path $repoRoot 'scripts\Block-DoH-Providers.json'
 
     try {
         New-Item -ItemType Directory -Path $installSrc -Force | Out-Null
@@ -1242,6 +1245,14 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $scpOnLockSrc -Destination (Join-Path $installSrc 'Scp-OnLock.ps1') -Force
         Copy-Item -LiteralPath $lockSignalWatcherSrc -Destination (Join-Path $installSrc 'LockSignalWatcher.ps1') -Force
         Copy-Item -LiteralPath $lockSignalLauncherHelper -Destination (Join-Path $installSrc 'LockSignalLauncher.ps1') -Force
+
+        New-Item -ItemType Directory -Path $installScripts -Force | Out-Null
+        if (Test-Path -LiteralPath $dohFirewallSrc) {
+            Copy-Item -LiteralPath $dohFirewallSrc -Destination (Join-Path $installScripts 'Block-DoH-Firewall.ps1') -Force
+        }
+        if (Test-Path -LiteralPath $dohProvidersSrc) {
+            Copy-Item -LiteralPath $dohProvidersSrc -Destination (Join-Path $installScripts 'Block-DoH-Providers.json') -Force
+        }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (

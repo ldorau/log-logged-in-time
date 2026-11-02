@@ -1,6 +1,8 @@
 # Update helper for LoginTimeLogger (dot-sourced by the monitor).
 # Once per day: if online, compare local installed commit to GitHub tip;
 # if different, git pull (or clone) and restart via the scheduled task.
+# After a successful daily check (up-to-date or just updated), also run
+# scripts/Block-DoH-Firewall.ps1 in a child process to reconcile DoH/DoT blocks.
 # If offline, postpone the check by 10 minutes.
 # Only https://github.com/ldorau/log-logged-in-time(.git) is accepted.
 
@@ -53,11 +55,13 @@ function Read-UpdateState {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return [pscustomobject]@{
-            NextUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
-            LastUpdateCheckUtc = $null
-            LastResult         = 'never'
-            LastRemoteCommit   = $null
-            LastLocalCommit    = $null
+            NextUpdateCheckUtc   = [datetime]::UtcNow.ToString('o')
+            LastUpdateCheckUtc   = $null
+            LastResult           = 'never'
+            LastRemoteCommit     = $null
+            LastLocalCommit      = $null
+            LastDoHBlockUtc      = $null
+            LastDoHBlockResult   = $null
         }
     }
 
@@ -69,16 +73,20 @@ function Read-UpdateState {
             LastResult         = $(if ($json.LastResult) { [string]$json.LastResult } else { 'unknown' })
             LastRemoteCommit   = $(if ($json.LastRemoteCommit) { [string]$json.LastRemoteCommit } else { $null })
             LastLocalCommit    = $(if ($json.LastLocalCommit) { [string]$json.LastLocalCommit } else { $null })
+            LastDoHBlockUtc    = $(if ($json.LastDoHBlockUtc) { [string]$json.LastDoHBlockUtc } else { $null })
+            LastDoHBlockResult = $(if ($json.LastDoHBlockResult) { [string]$json.LastDoHBlockResult } else { $null })
         }
     }
     catch {
         Write-LoggerEvent -Level WARN -Message ("Corrupt update-state.json; resetting. {0}" -f $_.Exception.Message)
         return [pscustomobject]@{
-            NextUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
-            LastUpdateCheckUtc = $null
-            LastResult         = 'reset-corrupt'
-            LastRemoteCommit   = $null
-            LastLocalCommit    = $null
+            NextUpdateCheckUtc   = [datetime]::UtcNow.ToString('o')
+            LastUpdateCheckUtc   = $null
+            LastResult           = 'reset-corrupt'
+            LastRemoteCommit     = $null
+            LastLocalCommit      = $null
+            LastDoHBlockUtc      = $null
+            LastDoHBlockResult   = $null
         }
     }
 }
@@ -261,6 +269,115 @@ function Publish-InstalledFilesFromRepo {
         }
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
+
+    # Daily DoH/DoT helper (optional for older clones; preferred when present).
+    $scriptsSrc = Join-Path $ClonePath 'scripts'
+    $scriptsDest = Join-Path $InstallRoot 'scripts'
+    $dohFiles = @(
+        'Block-DoH-Firewall.ps1'
+        'Block-DoH-Providers.json'
+    )
+    foreach ($name in $dohFiles) {
+        $from = Join-Path $scriptsSrc $name
+        if (-not (Test-Path -LiteralPath $from)) {
+            Write-LoggerEvent -Level WARN -Message ("DoH helper missing in clone (skipped): {0}" -f $from)
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $scriptsDest)) {
+            New-Item -ItemType Directory -Path $scriptsDest -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $from -Destination (Join-Path $scriptsDest $name) -Force
+    }
+}
+
+function Invoke-DailyDoHFirewallBlock {
+    <#
+      Runs Block-DoH-Firewall.ps1 once after a successful daily update check.
+      Uses a child powershell.exe so the script's exit codes cannot stop the monitor.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$ClonePath,
+        [Parameter(Mandatory)]$UpdateState,
+        [Parameter(Mandatory)][string]$StatePath
+    )
+
+    $scriptPath = $null
+    $providersPath = $null
+
+    $cloneScript = $null
+    $cloneProviders = $null
+    if (-not [string]::IsNullOrWhiteSpace($ClonePath)) {
+        $cloneScript = Join-Path $ClonePath 'scripts\Block-DoH-Firewall.ps1'
+        $cloneProviders = Join-Path $ClonePath 'scripts\Block-DoH-Providers.json'
+    }
+    $installScript = Join-Path $InstallRoot 'scripts\Block-DoH-Firewall.ps1'
+    $installProviders = Join-Path $InstallRoot 'scripts\Block-DoH-Providers.json'
+
+    # Prefer the just-synced clone, then the published Program Files copy.
+    if ($cloneScript -and (Test-Path -LiteralPath $cloneScript)) {
+        $scriptPath = $cloneScript
+        if ($cloneProviders -and (Test-Path -LiteralPath $cloneProviders)) {
+            $providersPath = $cloneProviders
+        }
+    }
+    elseif (Test-Path -LiteralPath $installScript) {
+        $scriptPath = $installScript
+        if (Test-Path -LiteralPath $installProviders) {
+            $providersPath = $installProviders
+        }
+    }
+    else {
+        $UpdateState.LastDoHBlockUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastDoHBlockResult = 'skipped-script-missing'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        Write-LoggerEvent -Level WARN -Message (
+            'Daily DoH/DoT firewall reconcile skipped: Block-DoH-Firewall.ps1 not found in clone or InstallRoot\scripts.')
+        return
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-NoProfile')
+    $argList.Add('-NonInteractive')
+    $argList.Add('-WindowStyle')
+    $argList.Add('Hidden')
+    $argList.Add('-ExecutionPolicy')
+    $argList.Add('Bypass')
+    $argList.Add('-File')
+    $argList.Add($scriptPath)
+    if (-not [string]::IsNullOrWhiteSpace($providersPath)) {
+        $argList.Add('-ProvidersPath')
+        $argList.Add($providersPath)
+    }
+
+    Write-LoggerEvent ("Daily DoH/DoT firewall reconcile starting: {0}" -f $scriptPath)
+    try {
+        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
+            -Wait -PassThru -WindowStyle Hidden
+        $exitCode = 0
+        if ($null -ne $proc) {
+            $exitCode = [int]$proc.ExitCode
+        }
+        $UpdateState.LastDoHBlockUtc = [datetime]::UtcNow.ToString('o')
+        if ($exitCode -eq 0) {
+            $UpdateState.LastDoHBlockResult = 'ok'
+            Write-LoggerEvent 'Daily DoH/DoT firewall reconcile finished successfully.'
+        }
+        else {
+            $UpdateState.LastDoHBlockResult = ('exit-{0}' -f $exitCode)
+            Write-LoggerEvent -Level WARN -Message (
+                "Daily DoH/DoT firewall reconcile exited with code {0}." -f $exitCode)
+        }
+        Write-UpdateState -Path $StatePath -State $UpdateState
+    }
+    catch {
+        $UpdateState.LastDoHBlockUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastDoHBlockResult = 'error'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Daily DoH/DoT firewall reconcile failed')
+    }
 }
 
 function Update-LockSignalHiddenLauncherFromConfig {
@@ -434,6 +551,11 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             $updateState.LastResult = 'up-to-date'
             Write-UpdateState -Path $statePath -State $updateState
             Write-LoggerEvent ("Update check: already on latest commit {0}." -f $remoteSha)
+            Invoke-DailyDoHFirewallBlock `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath
             return
         }
 
@@ -454,8 +576,16 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
         $updateState.LastResult = 'updated-restarting'
         Write-UpdateState -Path $statePath -State $updateState
-        Write-LoggerEvent ("Updated installed files to commit {0}. Restarting via scheduled task." -f $newHead)
+        Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
+        # Reconcile DoH/DoT rules against the freshly pulled provider list before restart.
+        Invoke-DailyDoHFirewallBlock `
+            -InstallRoot $InstallRoot `
+            -ClonePath ([string]$Config.UpdateClonePath) `
+            -UpdateState $updateState `
+            -StatePath $statePath
+
+        Write-LoggerEvent 'Restarting via scheduled task after update.'
         Restart-LoginTimeLoggerProcess -ConfigPath $Config.ConfigPath -InstallRoot $InstallRoot -TaskName $TaskName
     }
     catch {
