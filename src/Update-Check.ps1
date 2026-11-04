@@ -2,9 +2,9 @@
 # Once per day: if online, compare local installed commit to GitHub tip;
 # if different, git pull (or clone) and restart via the scheduled task.
 # After a successful daily check (up-to-date or just updated), also run
-# scripts/Force-DnsToLocalResolver.ps1, scripts/Block-DoH-Firewall.ps1, and
-# scripts/Allow-ScpOutboundFirewall.ps1 in child processes (DNS force, DoH/DoT
-# blocks, and outbound SCP/SSH allow when ScpOnLock is enabled).
+# scripts/Force-DnsToLocalResolver.ps1, scripts/Block-DoH-Firewall.ps1,
+# scripts/Block-Vpn-Firewall.ps1, and scripts/Allow-ScpOutboundFirewall.ps1 in
+# child processes (DNS force, DoH/DoT, VPN blocks, SCP allow when enabled).
 # If offline, postpone the check by 10 minutes.
 # Only https://github.com/ldorau/log-logged-in-time(.git) is accepted.
 
@@ -64,6 +64,8 @@ function Read-UpdateState {
             LastLocalCommit      = $null
             LastDoHBlockUtc      = $null
             LastDoHBlockResult   = $null
+            LastVpnBlockUtc      = $null
+            LastVpnBlockResult   = $null
             LastDnsForceUtc      = $null
             LastDnsForceResult   = $null
             LastScpAllowUtc      = $null
@@ -81,6 +83,8 @@ function Read-UpdateState {
             LastLocalCommit    = $(if ($json.LastLocalCommit) { [string]$json.LastLocalCommit } else { $null })
             LastDoHBlockUtc    = $(if ($json.LastDoHBlockUtc) { [string]$json.LastDoHBlockUtc } else { $null })
             LastDoHBlockResult = $(if ($json.LastDoHBlockResult) { [string]$json.LastDoHBlockResult } else { $null })
+            LastVpnBlockUtc    = $(if ($json.LastVpnBlockUtc) { [string]$json.LastVpnBlockUtc } else { $null })
+            LastVpnBlockResult = $(if ($json.LastVpnBlockResult) { [string]$json.LastVpnBlockResult } else { $null })
             LastDnsForceUtc    = $(if ($json.LastDnsForceUtc) { [string]$json.LastDnsForceUtc } else { $null })
             LastDnsForceResult = $(if ($json.LastDnsForceResult) { [string]$json.LastDnsForceResult } else { $null })
             LastScpAllowUtc    = $(if ($json.LastScpAllowUtc) { [string]$json.LastScpAllowUtc } else { $null })
@@ -97,6 +101,8 @@ function Read-UpdateState {
             LastLocalCommit      = $null
             LastDoHBlockUtc      = $null
             LastDoHBlockResult   = $null
+            LastVpnBlockUtc      = $null
+            LastVpnBlockResult   = $null
             LastDnsForceUtc      = $null
             LastDnsForceResult   = $null
             LastScpAllowUtc      = $null
@@ -332,6 +338,8 @@ function Publish-InstalledFilesFromRepo {
     $helperFiles = @(
         'Block-DoH-Firewall.ps1'
         'Block-DoH-Providers.json'
+        'Block-Vpn-Firewall.ps1'
+        'Block-Vpn-Providers.json'
         'Force-DnsToLocalResolver.ps1'
         'Allow-ScpOutboundFirewall.ps1'
     )
@@ -533,6 +541,103 @@ function Invoke-DailyScpOutboundAllow {
         Write-UpdateState -Path $StatePath -State $UpdateState
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
             'Daily SCP-Allow firewall reconcile failed')
+    }
+}
+
+function Invoke-DailyVpnFirewallBlock {
+    <#
+      Runs Block-Vpn-Firewall.ps1 once after a successful daily update check.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$ClonePath,
+        [Parameter(Mandatory)]$UpdateState,
+        [Parameter(Mandatory)][string]$StatePath
+    )
+
+    $scriptPath = $null
+    $providersPath = $null
+
+    $cloneScript = $null
+    $cloneProviders = $null
+    if (-not [string]::IsNullOrWhiteSpace($ClonePath)) {
+        $cloneScript = Join-Path $ClonePath 'scripts\Block-Vpn-Firewall.ps1'
+        $cloneProviders = Join-Path $ClonePath 'scripts\Block-Vpn-Providers.json'
+    }
+    $installScript = Join-Path $InstallRoot 'scripts\Block-Vpn-Firewall.ps1'
+    $installProviders = Join-Path $InstallRoot 'scripts\Block-Vpn-Providers.json'
+
+    if ($cloneScript -and (Test-Path -LiteralPath $cloneScript)) {
+        $scriptPath = $cloneScript
+        if ($cloneProviders -and (Test-Path -LiteralPath $cloneProviders)) {
+            $providersPath = $cloneProviders
+        }
+    }
+    elseif (Test-Path -LiteralPath $installScript) {
+        $scriptPath = $installScript
+        if (Test-Path -LiteralPath $installProviders) {
+            $providersPath = $installProviders
+        }
+    }
+    else {
+        $UpdateState.LastVpnBlockUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastVpnBlockResult = 'skipped-script-missing'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        $skipMsg = 'Daily VPN firewall reconcile skipped: Block-Vpn-Firewall.ps1 not found in clone or InstallRoot\scripts.'
+        Write-LoggerEvent -Level WARN -Message $skipMsg
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'VPN-block skipped' -Body $skipMsg -AlertKey 'vpn-block-skip-script'
+        }
+        return
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-NoProfile')
+    $argList.Add('-NonInteractive')
+    $argList.Add('-WindowStyle')
+    $argList.Add('Hidden')
+    $argList.Add('-ExecutionPolicy')
+    $argList.Add('Bypass')
+    $argList.Add('-File')
+    $argList.Add($scriptPath)
+    if (-not [string]::IsNullOrWhiteSpace($providersPath)) {
+        $argList.Add('-ProvidersPath')
+        $argList.Add($providersPath)
+    }
+
+    Write-LoggerEvent ("Daily VPN firewall reconcile starting: {0}" -f $scriptPath)
+    try {
+        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
+            -Wait -PassThru -WindowStyle Hidden
+        $exitCode = 0
+        if ($null -ne $proc) {
+            $exitCode = [int]$proc.ExitCode
+        }
+        $UpdateState.LastVpnBlockUtc = [datetime]::UtcNow.ToString('o')
+        if ($exitCode -eq 0) {
+            $UpdateState.LastVpnBlockResult = 'ok'
+            Write-LoggerEvent 'Daily VPN firewall reconcile finished successfully.'
+        }
+        else {
+            $UpdateState.LastVpnBlockResult = ('exit-{0}' -f $exitCode)
+            $failMsg = ("Daily VPN firewall reconcile exited with code {0}." -f $exitCode)
+            Write-LoggerEvent -Level WARN -Message $failMsg
+            if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+                $null = Send-LoginTimeSmtpAlert -Subject 'VPN-block failed' -Body $failMsg -AlertKey 'vpn-block-exit'
+            }
+        }
+        Write-UpdateState -Path $StatePath -State $UpdateState
+    }
+    catch {
+        $UpdateState.LastVpnBlockUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastVpnBlockResult = 'error'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Daily VPN firewall reconcile failed')
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'VPN-block failed' -Body $details -AlertKey 'vpn-block-error'
+        }
     }
 }
 
@@ -821,6 +926,11 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 -ClonePath ([string]$Config.UpdateClonePath) `
                 -UpdateState $updateState `
                 -StatePath $statePath
+            Invoke-DailyVpnFirewallBlock `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath
             Invoke-DailyScpOutboundAllow `
                 -InstallRoot $InstallRoot `
                 -ClonePath ([string]$Config.UpdateClonePath) `
@@ -849,7 +959,7 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
-        # Reconcile local DNS force + DoH/DoT + SCP-Allow rules before restart.
+        # Reconcile local DNS force + DoH/DoT + VPN + SCP-Allow rules before restart.
         Invoke-DailyDnsForceLocalResolver `
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `
@@ -857,6 +967,11 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             -StatePath $statePath `
             -Config $Config
         Invoke-DailyDoHFirewallBlock `
+            -InstallRoot $InstallRoot `
+            -ClonePath ([string]$Config.UpdateClonePath) `
+            -UpdateState $updateState `
+            -StatePath $statePath
+        Invoke-DailyVpnFirewallBlock `
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `
             -UpdateState $updateState `

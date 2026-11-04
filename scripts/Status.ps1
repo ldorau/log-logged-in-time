@@ -488,6 +488,63 @@ try {
         }
     }
 
+    # --- VPN block verify (Block-Vpn-Firewall.ps1 -Verify) ---
+    $vpnCandidates = @(
+        (Join-Path $scriptDir 'Block-Vpn-Firewall.ps1')
+        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Block-Vpn-Firewall.ps1')
+    )
+    $vpnScript = $vpnCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $vpnScript) {
+        Write-Host 'VPN-Block: SKIP (Block-Vpn-Firewall.ps1 not found)' -ForegroundColor Yellow
+    }
+    else {
+        $vpnProviders = Join-Path (Split-Path -Parent $vpnScript) 'Block-Vpn-Providers.json'
+        Write-Host 'Checking VPN block via Block-Vpn-Firewall.ps1 -Verify (may take a minute)...' -ForegroundColor DarkGray
+        try {
+            $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $vpnArgs = New-Object System.Collections.Generic.List[string]
+            $vpnArgs.Add('-NoProfile')
+            $vpnArgs.Add('-NonInteractive')
+            $vpnArgs.Add('-WindowStyle')
+            $vpnArgs.Add('Hidden')
+            $vpnArgs.Add('-ExecutionPolicy')
+            $vpnArgs.Add('Bypass')
+            $vpnArgs.Add('-File')
+            $vpnArgs.Add($vpnScript)
+            $vpnArgs.Add('-Verify')
+            $vpnArgs.Add('-Quiet')
+            if (Test-Path -LiteralPath $vpnProviders) {
+                $vpnArgs.Add('-ProvidersPath')
+                $vpnArgs.Add($vpnProviders)
+            }
+
+            $vpnProc = Start-Process -FilePath $windowsPowerShell -ArgumentList $vpnArgs.ToArray() `
+                -Wait -PassThru -WindowStyle Hidden
+            $vpnExit = 1
+            if ($null -ne $vpnProc) {
+                $vpnExit = [int]$vpnProc.ExitCode
+            }
+
+            if ($vpnExit -eq 0) {
+                Write-Host 'VPN-Block: OK' -ForegroundColor Green
+            }
+            elseif ($vpnExit -eq 2) {
+                Write-Host 'VPN-Block: INCONCLUSIVE (rules/tests did not confirm a block)' -ForegroundColor Yellow
+            }
+            else {
+                $msg = 'VPN-Block: FAIL (reachable endpoints or missing/mismatched firewall rules)'
+                Write-Host $msg -ForegroundColor Red
+                Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $msg -AlertKey 'status-vpn-fail'
+            }
+        }
+        catch {
+            Write-Host ("VPN-Block: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                "VPN verify failed; script='{0}'" -f $vpnScript)
+            Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $_.Exception.Message -AlertKey 'status-vpn-error'
+        }
+    }
+
     # --- Local DNS force verify (Force-DnsToLocalResolver.ps1 -Verify) ---
     if ([string]::IsNullOrWhiteSpace($serverDns)) {
         $skipMsg = 'DNS-Force: SKIP (ServerDNS empty in config)'
