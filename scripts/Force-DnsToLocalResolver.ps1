@@ -84,8 +84,13 @@ if ($Remove -and $Verify) {
 if ([string]::IsNullOrWhiteSpace($DnsServer) -and -not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
     try {
         $cfgRaw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not [string]::IsNullOrWhiteSpace([string]$cfgRaw.ServerDNS)) {
-            $DnsServer = [string]$cfgRaw.ServerDNS.Trim()
+        $cfgServerDns = $null
+        $dnsProp = $cfgRaw.PSObject.Properties['ServerDNS']
+        if ($null -ne $dnsProp) {
+            $cfgServerDns = $dnsProp.Value
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$cfgServerDns)) {
+            $DnsServer = [string]$cfgServerDns.Trim()
         }
     }
     catch {

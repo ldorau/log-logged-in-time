@@ -402,25 +402,14 @@ function Invoke-DailyDoHFirewallBlock {
         return
     }
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = New-Object System.Collections.Generic.List[string]
-    $argList.Add('-NoProfile')
-    $argList.Add('-NonInteractive')
-    $argList.Add('-WindowStyle')
-    $argList.Add('Hidden')
-    $argList.Add('-ExecutionPolicy')
-    $argList.Add('Bypass')
-    $argList.Add('-File')
-    $argList.Add($scriptPath)
+    $scriptArgs = @()
     if (-not [string]::IsNullOrWhiteSpace($providersPath)) {
-        $argList.Add('-ProvidersPath')
-        $argList.Add($providersPath)
+        $scriptArgs = @('-ProvidersPath', $providersPath)
     }
 
     Write-LoggerEvent ("Daily DoH/DoT firewall reconcile starting: {0}" -f $scriptPath)
     try {
-        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
-            -Wait -PassThru -WindowStyle Hidden
+        $proc = Invoke-WindowsPowerShellFile -ScriptPath $scriptPath -ScriptArgument $scriptArgs
         $exitCode = 0
         if ($null -ne $proc) {
             $exitCode = [int]$proc.ExitCode
@@ -433,7 +422,8 @@ function Invoke-DailyDoHFirewallBlock {
         else {
             $UpdateState.LastDoHBlockResult = ('exit-{0}' -f $exitCode)
             Write-LoggerEvent -Level WARN -Message (
-                "Daily DoH/DoT firewall reconcile exited with code {0}." -f $exitCode)
+                ("Daily DoH/DoT firewall reconcile exited with code {0}.{1}" -f `
+                    $exitCode, (Get-PowerShellFileExitHint -ExitCode $exitCode -ScriptPath $scriptPath)))
         }
         Write-UpdateState -Path $StatePath -State $UpdateState
     }
@@ -500,25 +490,14 @@ function Invoke-DailyScpOutboundAllow {
         return
     }
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = New-Object System.Collections.Generic.List[string]
-    $argList.Add('-NoProfile')
-    $argList.Add('-NonInteractive')
-    $argList.Add('-WindowStyle')
-    $argList.Add('Hidden')
-    $argList.Add('-ExecutionPolicy')
-    $argList.Add('Bypass')
-    $argList.Add('-File')
-    $argList.Add($scriptPath)
-    $argList.Add('-RemoteHost')
-    $argList.Add([string]$Config.ScpHost)
-    $argList.Add('-RemotePort')
-    $argList.Add("$port")
+    $scriptArgs = @(
+        '-RemoteHost', [string]$Config.ScpHost,
+        '-RemotePort', "$port"
+    )
 
     Write-LoggerEvent ("Daily SCP-Allow firewall reconcile starting: {0} ({1}:{2})" -f $scriptPath, $Config.ScpHost, $port)
     try {
-        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
-            -Wait -PassThru -WindowStyle Hidden
+        $proc = Invoke-WindowsPowerShellFile -ScriptPath $scriptPath -ScriptArgument $scriptArgs
         $exitCode = 0
         if ($null -ne $proc) {
             $exitCode = [int]$proc.ExitCode
@@ -531,7 +510,8 @@ function Invoke-DailyScpOutboundAllow {
         else {
             $UpdateState.LastScpAllowResult = ('exit-{0}' -f $exitCode)
             Write-LoggerEvent -Level WARN -Message (
-                "Daily SCP-Allow firewall reconcile exited with code {0}." -f $exitCode)
+                ("Daily SCP-Allow firewall reconcile exited with code {0}.{1}" -f `
+                    $exitCode, (Get-PowerShellFileExitHint -ExitCode $exitCode -ScriptPath $scriptPath)))
         }
         Write-UpdateState -Path $StatePath -State $UpdateState
     }
@@ -591,25 +571,14 @@ function Invoke-DailyVpnFirewallBlock {
         return
     }
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = New-Object System.Collections.Generic.List[string]
-    $argList.Add('-NoProfile')
-    $argList.Add('-NonInteractive')
-    $argList.Add('-WindowStyle')
-    $argList.Add('Hidden')
-    $argList.Add('-ExecutionPolicy')
-    $argList.Add('Bypass')
-    $argList.Add('-File')
-    $argList.Add($scriptPath)
+    $scriptArgs = @()
     if (-not [string]::IsNullOrWhiteSpace($providersPath)) {
-        $argList.Add('-ProvidersPath')
-        $argList.Add($providersPath)
+        $scriptArgs = @('-ProvidersPath', $providersPath)
     }
 
     Write-LoggerEvent ("Daily VPN firewall reconcile starting: {0}" -f $scriptPath)
     try {
-        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
-            -Wait -PassThru -WindowStyle Hidden
+        $proc = Invoke-WindowsPowerShellFile -ScriptPath $scriptPath -ScriptArgument $scriptArgs
         $exitCode = 0
         if ($null -ne $proc) {
             $exitCode = [int]$proc.ExitCode
@@ -621,7 +590,8 @@ function Invoke-DailyVpnFirewallBlock {
         }
         else {
             $UpdateState.LastVpnBlockResult = ('exit-{0}' -f $exitCode)
-            $failMsg = ("Daily VPN firewall reconcile exited with code {0}." -f $exitCode)
+            $failMsg = ("Daily VPN firewall reconcile exited with code {0}.{1}" -f `
+                $exitCode, (Get-PowerShellFileExitHint -ExitCode $exitCode -ScriptPath $scriptPath))
             Write-LoggerEvent -Level WARN -Message $failMsg
             if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
                 $null = Send-LoginTimeSmtpAlert -Subject 'VPN-block failed' -Body $failMsg -AlertKey 'vpn-block-exit'
@@ -696,23 +666,11 @@ function Invoke-DailyDnsForceLocalResolver {
         return
     }
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = New-Object System.Collections.Generic.List[string]
-    $argList.Add('-NoProfile')
-    $argList.Add('-NonInteractive')
-    $argList.Add('-WindowStyle')
-    $argList.Add('Hidden')
-    $argList.Add('-ExecutionPolicy')
-    $argList.Add('Bypass')
-    $argList.Add('-File')
-    $argList.Add($scriptPath)
-    $argList.Add('-DnsServer')
-    $argList.Add($dnsServer)
+    $scriptArgs = @('-DnsServer', $dnsServer)
 
     Write-LoggerEvent ("Daily DNS-force reconcile starting: {0} (DnsServer={1})" -f $scriptPath, $dnsServer)
     try {
-        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
-            -Wait -PassThru -WindowStyle Hidden
+        $proc = Invoke-WindowsPowerShellFile -ScriptPath $scriptPath -ScriptArgument $scriptArgs
         $exitCode = 0
         if ($null -ne $proc) {
             $exitCode = [int]$proc.ExitCode
@@ -724,7 +682,8 @@ function Invoke-DailyDnsForceLocalResolver {
         }
         else {
             $UpdateState.LastDnsForceResult = ('exit-{0}' -f $exitCode)
-            $failMsg = ("Daily DNS-force reconcile exited with code {0}." -f $exitCode)
+            $failMsg = ("Daily DNS-force reconcile exited with code {0}.{1}" -f `
+                $exitCode, (Get-PowerShellFileExitHint -ExitCode $exitCode -ScriptPath $scriptPath))
             Write-LoggerEvent -Level WARN -Message $failMsg
             if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
                 $null = Send-LoginTimeSmtpAlert -Subject 'DNS-force failed' -Body $failMsg -AlertKey 'dns-force-exit'

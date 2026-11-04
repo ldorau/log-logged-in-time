@@ -35,6 +35,174 @@ function Get-DefaultAdministratorProfile {
     return (Join-Path $env:SystemDrive 'Users\Administrator')
 }
 
+function Get-OptionalPropertyValue {
+    <#
+      StrictMode-safe property read. ConvertFrom-Json omits missing keys; under
+      Set-StrictMode, $obj.Missing throws PropertyNotFoundStrict.
+    #>
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    $prop = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $prop) {
+        return $null
+    }
+    return $prop.Value
+}
+
+function ConvertTo-UInt32Code {
+    <#
+      Task Scheduler LastTaskResult is Int32. HRESULTs with the high bit set
+      appear negative (e.g. 0x800710E0 -> -2147020576); [uint32] cast throws.
+    #>
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) {
+        return [uint32]0
+    }
+    return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Value), 0)
+}
+
+function ConvertTo-StartProcessArgumentString {
+    <#
+      Start-Process -ArgumentList with a string[] joins on spaces WITHOUT quoting.
+      Paths under "C:\Program Files\..." then break (-File sees C:\Program and
+      powershell.exe exits -196608 / 0xFFFD0000). Build one quoted string instead.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argument)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $Argument) {
+        if ($null -eq $a) {
+            continue
+        }
+        $s = [string]$a
+        if ($s -match '[\s"]') {
+            $parts.Add('"' + ($s.Replace('"', '\"')) + '"')
+        }
+        else {
+            $parts.Add($s)
+        }
+    }
+    return ($parts -join ' ')
+}
+
+function Invoke-WindowsPowerShellFile {
+    <#
+      Runs powershell.exe -File <script> with correctly quoted ArgumentList so
+      InstallRoot under Program Files works.
+
+      Default: returns the Process object.
+      -CaptureOutput: redirects stdout/stderr (Write-Host is included when the
+      child has no console) and returns a PSCustomObject with ExitCode/StdOut/StdErr/Output.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string[]]$ScriptArgument = @(),
+        [switch]$CaptureOutput
+    )
+
+    if (-not (Test-Path -LiteralPath $ScriptPath)) {
+        throw ("PowerShell script not found: {0}" -f $ScriptPath)
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argTokens = New-Object System.Collections.Generic.List[string]
+    $argTokens.Add('-NoProfile')
+    $argTokens.Add('-NonInteractive')
+    $argTokens.Add('-ExecutionPolicy')
+    $argTokens.Add('Bypass')
+    $argTokens.Add('-File')
+    $argTokens.Add($ScriptPath)
+    foreach ($a in @($ScriptArgument)) {
+        if ($null -ne $a) {
+            $argTokens.Add([string]$a)
+        }
+    }
+
+    $argLine = ConvertTo-StartProcessArgumentString -Argument $argTokens.ToArray()
+
+    if (-not $CaptureOutput) {
+        return (Start-Process -FilePath $windowsPowerShell -ArgumentList $argLine `
+                -Wait -PassThru -WindowStyle Hidden)
+    }
+
+    $stamp = [guid]::NewGuid().ToString('N')
+    $stdoutFile = Join-Path $env:TEMP ("LoginTimeLogger-ps-out-{0}.txt" -f $stamp)
+    $stderrFile = Join-Path $env:TEMP ("LoginTimeLogger-ps-err-{0}.txt" -f $stamp)
+    try {
+        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argLine `
+            -Wait -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+
+        $stdout = ''
+        $stderr = ''
+        if (Test-Path -LiteralPath $stdoutFile) {
+            $stdout = [string](Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue)
+        }
+        if (Test-Path -LiteralPath $stderrFile) {
+            $stderr = [string](Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue)
+        }
+        if ($null -eq $stdout) { $stdout = '' }
+        if ($null -eq $stderr) { $stderr = '' }
+
+        $exitCode = 0
+        if ($null -ne $proc) {
+            $exitCode = [int]$proc.ExitCode
+        }
+
+        $combined = (($stdout, $stderr | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine).Trim()
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            StdOut   = $stdout.TrimEnd()
+            StdErr   = $stderr.TrimEnd()
+            Output   = $combined
+            Process  = $proc
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Limit-TextForAlert {
+    <#
+      Keeps SMTP bodies readable: prefer the tail when truncating.
+    #>
+    param(
+        [AllowNull()][string]$Text,
+        [int]$MaxChars = 12000
+    )
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
+    $t = $Text.TrimEnd()
+    if ($t.Length -le $MaxChars) {
+        return $t
+    }
+    $tail = $t.Substring($t.Length - $MaxChars)
+    return ("...[truncated {0} chars]...{1}{2}" -f ($t.Length - $MaxChars), [Environment]::NewLine, $tail)
+}
+
+function Get-PowerShellFileExitHint {
+    <#
+      powershell.exe -File returns -196608 (0xFFFD0000) when the script path cannot
+      be loaded (missing file, or Start-Process split an unquoted Program Files path).
+    #>
+    param(
+        [int]$ExitCode,
+        [string]$ScriptPath
+    )
+    if ($ExitCode -ne -196608) {
+        return ''
+    }
+    return (" exit -196608 (0xFFFD0000) usually means -File could not load the script (missing path or unquoted spaces). Script='{0}'." -f $ScriptPath)
+}
+
 function Get-DefaultErrorLogPath {
     param([string]$AdministratorProfile)
 
@@ -51,8 +219,9 @@ function Resolve-ErrorLogPathFromConfig {
     if (-not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
         try {
             $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $adminProfile = [string]$raw.AdministratorProfile
+            $cfgAdmin = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdmin)) {
+                $adminProfile = [string]$cfgAdmin
             }
         }
         catch {

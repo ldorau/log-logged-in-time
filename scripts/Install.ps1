@@ -1123,8 +1123,9 @@ try {
     }
 
     $serverDns = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ServerDNS)) {
-        $serverDns = [string]$raw.ServerDNS.Trim()
+    $cfgServerDns = Get-OptionalPropertyValue -InputObject $raw -Name 'ServerDNS'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgServerDns)) {
+        $serverDns = [string]$cfgServerDns.Trim()
     }
 
     $scpOnLockEnabledRuntime = $false

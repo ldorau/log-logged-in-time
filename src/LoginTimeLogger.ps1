@@ -102,20 +102,24 @@ Current user: $env:USERNAME
         throw (New-Object System.Exception(("Invalid config JSON at '{0}'.`r`n{1}" -f $Path, $details), $_.Exception))
     }
 
-    if ([string]::IsNullOrWhiteSpace([string]$raw.TargetUsername)) {
+    $cfgTargetUsername = Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername'
+    if ([string]::IsNullOrWhiteSpace([string]$cfgTargetUsername)) {
+        $cfgAdminHint = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+        $cfgLogHint = Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory'
         throw @"
 Config.TargetUsername is required (local SAM, DOMAIN\user, or user@upn.domain).
 Config path: $Path
-AdministratorProfile in file: $($raw.AdministratorProfile)
-LogDirectory in file: $($raw.LogDirectory)
+AdministratorProfile in file: $cfgAdminHint
+LogDirectory in file: $cfgLogHint
 "@
     }
 
     # Prefer configured admin profile (e.g. C:\Users\AdminName). Fall back to the
     # elevating user's profile when possible - do not require built-in Administrator.
     $adminHome = $null
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-        $adminHome = [string]$raw.AdministratorProfile
+    $cfgAdminProfile = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdminProfile)) {
+        $adminHome = [string]$cfgAdminProfile
     }
     elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
         ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
@@ -126,95 +130,111 @@ LogDirectory in file: $($raw.LogDirectory)
     }
 
     $logDirectory = Join-Path $adminHome 'LoginTimeLogs'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.LogDirectory)) {
-        $logDirectory = [string]$raw.LogDirectory
+    $cfgLogDir = Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgLogDir)) {
+        $logDirectory = [string]$cfgLogDir
     }
 
     $pollSeconds = 5
-    if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
-        $pollSeconds = [int]$raw.PollIntervalSeconds
+    $cfgPoll = Get-OptionalPropertyValue -InputObject $raw -Name 'PollIntervalSeconds'
+    if ($null -ne $cfgPoll -and [int]$cfgPoll -gt 0) {
+        $pollSeconds = [int]$cfgPoll
     }
 
     # Opt-in: self-update is off unless explicitly enabled (remote code as SYSTEM).
     $updateEnabled = $true
-    if ($null -ne $raw.UpdateEnabled) {
-        $updateEnabled = [bool]$raw.UpdateEnabled
+    $cfgUpdateEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateEnabled'
+    if ($null -ne $cfgUpdateEnabled) {
+        $updateEnabled = [bool]$cfgUpdateEnabled
     }
 
     $updateRepoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
-        $updateRepoUrl = [string]$raw.UpdateRepoUrl
+    $cfgUpdateRepo = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateRepoUrl'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateRepo)) {
+        $updateRepoUrl = [string]$cfgUpdateRepo
     }
 
     $updateBranch = 'main'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateBranch)) {
-        $updateBranch = [string]$raw.UpdateBranch
+    $cfgUpdateBranch = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateBranch'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateBranch)) {
+        $updateBranch = [string]$cfgUpdateBranch
     }
 
     $updateClonePath = Join-Path $adminHome 'LoginTimeLogger\repo'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateClonePath)) {
-        $updateClonePath = [string]$raw.UpdateClonePath
+    $cfgUpdateClone = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateClonePath'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateClone)) {
+        $updateClonePath = [string]$cfgUpdateClone
     }
 
     $serverDns = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ServerDNS)) {
-        $serverDns = [string]$raw.ServerDNS.Trim()
+    $cfgServerDns = Get-OptionalPropertyValue -InputObject $raw -Name 'ServerDNS'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgServerDns)) {
+        $serverDns = [string]$cfgServerDns.Trim()
     }
 
     $scpOnLockEnabled = $false
-    if ($null -ne $raw.ScpOnLockEnabled) {
-        $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
+    $cfgScpEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
+    if ($null -ne $cfgScpEnabled) {
+        $scpOnLockEnabled = [bool]$cfgScpEnabled
     }
 
     $scpHost = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)) {
-        $scpHost = [string]$raw.ScpHost
+    $cfgScpHost = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpHost)) {
+        $scpHost = [string]$cfgScpHost
     }
 
     $scpUser = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)) {
-        $scpUser = [string]$raw.ScpUser
+    $cfgScpUser = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpUser)) {
+        $scpUser = [string]$cfgScpUser
     }
 
     $scpRemoteDirectory = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)) {
-        $scpRemoteDirectory = [string]$raw.ScpRemoteDirectory
+    $cfgScpRemote = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpRemoteDirectory'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpRemote)) {
+        $scpRemoteDirectory = [string]$cfgScpRemote
     }
 
     $scpPort = 22
-    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
-        $scpPort = [int]$raw.ScpPort
+    $cfgScpPort = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpPort'
+    if ($null -ne $cfgScpPort -and [int]$cfgScpPort -gt 0) {
+        $scpPort = [int]$cfgScpPort
     }
 
     $scpIdentityFile = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
-        $scpIdentityFile = [string]$raw.ScpIdentityFile
+    $cfgScpIdentity = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpIdentity)) {
+        $scpIdentityFile = [string]$cfgScpIdentity
     }
     elseif ($scpOnLockEnabled) {
         $scpIdentityFile = Join-Path $adminHome 'LoginTimeLogger\ssh\id_ed25519'
     }
 
     $scpKnownHostsFile = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpKnownHostsFile)) {
-        $scpKnownHostsFile = [string]$raw.ScpKnownHostsFile
+    $cfgScpKnownHosts = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpKnownHostsFile'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpKnownHosts)) {
+        $scpKnownHostsFile = [string]$cfgScpKnownHosts
     }
     elseif ($scpOnLockEnabled) {
         $scpKnownHostsFile = Join-Path $adminHome 'LoginTimeLogger\ssh\known_hosts'
     }
 
     $adminUsername = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdminUsername)) {
-        $adminUsername = [string]$raw.AdminUsername
+    $cfgAdminUser = Get-OptionalPropertyValue -InputObject $raw -Name 'AdminUsername'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdminUser)) {
+        $adminUsername = [string]$cfgAdminUser
     }
 
     $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.LockSignalPath)) {
-        $lockSignalPath = [string]$raw.LockSignalPath
+    $cfgLockSignal = Get-OptionalPropertyValue -InputObject $raw -Name 'LockSignalPath'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgLockSignal)) {
+        $lockSignalPath = [string]$cfgLockSignal
     }
 
     [pscustomobject]@{
         AdminUsername        = $adminUsername
-        TargetUsername       = [string]$raw.TargetUsername
+        TargetUsername       = [string]$cfgTargetUsername
         AdministratorProfile = $adminHome
         LogDirectory         = $logDirectory
         PollIntervalSeconds  = $pollSeconds
