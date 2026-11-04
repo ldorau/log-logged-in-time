@@ -11,7 +11,7 @@
      back to reset --hard origin/<branch> if needed).
   3) Runs scripts\Install.ps1 -StartNow to copy files, re-register tasks, and
      start LoginTimeLogger (+ lock-signal when possible).
-  4) Runs scripts\Status.ps1 to show task/monitor/DoH/DNS-Force status.
+  4) Runs scripts\Status.ps1 to show task/monitor status.
 .PARAMETER ConfigPath
   Runtime config JSON. Default: path from the LoginTimeLogger task -ConfigPath
   argument.
