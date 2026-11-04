@@ -8,6 +8,7 @@
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
   "UpdateClonePath": "",
+  "ServerDNS": "",
   "ScpOnLockEnabled": false,
   "ScpHost": "",
   "ScpUser": "",

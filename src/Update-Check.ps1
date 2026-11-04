@@ -534,14 +534,28 @@ function Invoke-DailyDnsForceLocalResolver {
     <#
       Runs Force-DnsToLocalResolver.ps1 once after a successful daily update check.
       Uses a child powershell.exe so exit codes cannot stop the monitor.
+      Requires Config.ServerDNS (IPv4); skips when empty.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [string]$ClonePath,
         [Parameter(Mandatory)]$UpdateState,
         [Parameter(Mandatory)][string]$StatePath,
-        [string]$DnsServer = '192.168.0.200'
+        [Parameter(Mandatory)]$Config
     )
+
+    $dnsServer = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ServerDNS)) {
+        $dnsServer = [string]$Config.ServerDNS.Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($dnsServer)) {
+        $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastDnsForceResult = 'skipped-serverdns-empty'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        Write-LoggerEvent -Level WARN -Message (
+            'Daily DNS-force reconcile skipped: ServerDNS is empty in config.')
+        return
+    }
 
     $scriptPath = $null
     $cloneScript = $null
@@ -576,9 +590,9 @@ function Invoke-DailyDnsForceLocalResolver {
     $argList.Add('-File')
     $argList.Add($scriptPath)
     $argList.Add('-DnsServer')
-    $argList.Add($DnsServer)
+    $argList.Add($dnsServer)
 
-    Write-LoggerEvent ("Daily DNS-force reconcile starting: {0} (DnsServer={1})" -f $scriptPath, $DnsServer)
+    Write-LoggerEvent ("Daily DNS-force reconcile starting: {0} (DnsServer={1})" -f $scriptPath, $dnsServer)
     try {
         $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
             -Wait -PassThru -WindowStyle Hidden
@@ -782,7 +796,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 -InstallRoot $InstallRoot `
                 -ClonePath ([string]$Config.UpdateClonePath) `
                 -UpdateState $updateState `
-                -StatePath $statePath
+                -StatePath $statePath `
+                -Config $Config
             Invoke-DailyDoHFirewallBlock `
                 -InstallRoot $InstallRoot `
                 -ClonePath ([string]$Config.UpdateClonePath) `
@@ -821,7 +836,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `
             -UpdateState $updateState `
-            -StatePath $statePath
+            -StatePath $statePath `
+            -Config $Config
         Invoke-DailyDoHFirewallBlock `
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `

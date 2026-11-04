@@ -153,6 +153,11 @@ LogDirectory in file: $($raw.LogDirectory)
         $updateClonePath = [string]$raw.UpdateClonePath
     }
 
+    $serverDns = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ServerDNS)) {
+        $serverDns = [string]$raw.ServerDNS.Trim()
+    }
+
     $scpOnLockEnabled = $false
     if ($null -ne $raw.ScpOnLockEnabled) {
         $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
@@ -216,6 +221,7 @@ LogDirectory in file: $($raw.LogDirectory)
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
         UpdateClonePath      = $updateClonePath
+        ServerDNS            = $serverDns
         ScpOnLockEnabled     = $scpOnLockEnabled
         ScpHost              = $scpHost
         ScpUser              = $scpUser

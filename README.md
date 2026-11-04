@@ -34,6 +34,7 @@ Runs at system startup with elevated privileges (Scheduled Task as `SYSTEM`, Run
   "UpdateRepoUrl": "https://github.com/ldorau/log-logged-in-time.git",
   "UpdateBranch": "main",
   "UpdateClonePath": "",
+  "ServerDNS": "",
   "ScpOnLockEnabled": false,
   "ScpHost": "",
   "ScpUser": "",

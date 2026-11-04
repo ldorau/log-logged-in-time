@@ -20,14 +20,18 @@ Windows Firewall cannot DNAT DNS packets. This script:
 1. Sets eligible up Ethernet/Wi-Fi adapters’ DNS server list to `-DnsServer` (IPv4).
 2. Adds outbound **Block** rules for TCP/UDP 53 to all IPv4 ranges except that IP, plus IPv6 DNS blocks.
 
+Set `ServerDNS` (IPv4) in the LoginTimeLogger runtime config. The daily update
+check and Status use that value; there is no hardcoded default IP in the scripts.
+
 ```powershell
 # Elevated PowerShell, from repo root (or Program Files\LoginTimeLogger\scripts):
 .\scripts\Force-DnsToLocalResolver.ps1 -DnsServer <LAN-resolver-IPv4>
+.\scripts\Force-DnsToLocalResolver.ps1 -ConfigPath "$env:USERPROFILE\LoginTimeLogger\config.json"
 .\scripts\Force-DnsToLocalResolver.ps1 -DnsServer <LAN-resolver-IPv4> -Verify
 .\scripts\Force-DnsToLocalResolver.ps1 -Remove -RestoreDnsToDhcp
 ```
 
-Useful parameters: `-InterfaceAlias`, `-Quiet` (with `-Verify`; exit 0 = OK, 1 = FAIL), `-WhatIf`.
+Useful parameters: `-ConfigPath` (reads `ServerDNS`), `-InterfaceAlias`, `-Quiet` (with `-Verify`; exit 0 = OK, 1 = FAIL), `-WhatIf`. Daily reconcile is skipped when `ServerDNS` is empty.
 
 ## Block-DoH-Firewall.ps1
 

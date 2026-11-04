@@ -17,7 +17,12 @@
     Managed firewall rules use the "DNS-Force:" display-name prefix.
 
 .PARAMETER DnsServer
-    IPv4 address of the LAN DNS resolver.
+    IPv4 address of the LAN DNS resolver. Optional when -ConfigPath provides
+    ServerDNS (or when only -Remove is used).
+
+.PARAMETER ConfigPath
+    LoginTimeLogger runtime config JSON. When DnsServer is empty, reads
+    ServerDNS from this file.
 
 .PARAMETER Remove
     Removes rules created by this script and optionally restores adapter DNS
@@ -40,10 +45,10 @@
 
 .EXAMPLE
     # Elevated PowerShell: point DNS at the LAN resolver and lock port 53:
-    .\Force-DnsToLocalResolver.ps1
+    .\Force-DnsToLocalResolver.ps1 -DnsServer 10.0.0.1
 
 .EXAMPLE
-    .\Force-DnsToLocalResolver.ps1 -Verify
+    .\Force-DnsToLocalResolver.ps1 -ConfigPath "$env:USERPROFILE\LoginTimeLogger\config.json" -Verify
 
 .EXAMPLE
     .\Force-DnsToLocalResolver.ps1 -Remove -RestoreDnsToDhcp
@@ -53,20 +58,14 @@
     - Does not forward/NAT foreign DNS destinations; it blocks them.
     - Encrypted DNS (DoH/DoT on 443/853) is out of scope here; use
       Block-DoH-Firewall.ps1 for those endpoints.
+    - Prefer setting ServerDNS in the LoginTimeLogger config instead of a
+      hardcoded IP in scripts.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [ValidateScript({
-            try {
-                $a = [System.Net.IPAddress]::Parse($_)
-                return ($a.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork)
-            }
-            catch {
-                throw "DnsServer must be an IPv4 address."
-            }
-        })]
-    [string]$DnsServer = '192.168.0.200',
+    [string]$DnsServer = '',
+    [string]$ConfigPath = '',
 
     [switch]$Remove,
     [switch]$RestoreDnsToDhcp,
@@ -80,6 +79,33 @@ $RulePrefix = 'DNS-Force:'
 
 if ($Remove -and $Verify) {
     throw 'Specify only one of -Remove or -Verify (not both).'
+}
+
+if ([string]::IsNullOrWhiteSpace($DnsServer) -and -not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
+    try {
+        $cfgRaw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not [string]::IsNullOrWhiteSpace([string]$cfgRaw.ServerDNS)) {
+            $DnsServer = [string]$cfgRaw.ServerDNS.Trim()
+        }
+    }
+    catch {
+        throw ("Could not read ServerDNS from config '{0}': {1}" -f $ConfigPath, $_.Exception.Message)
+    }
+}
+
+if (-not $Remove) {
+    if ([string]::IsNullOrWhiteSpace($DnsServer)) {
+        throw 'DnsServer is required (pass -DnsServer or set ServerDNS in -ConfigPath).'
+    }
+    try {
+        $parsedDns = [System.Net.IPAddress]::Parse($DnsServer)
+        if ($parsedDns.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            throw 'not IPv4'
+        }
+    }
+    catch {
+        throw ("DnsServer must be an IPv4 address (got '{0}')." -f $DnsServer)
+    }
 }
 
 function Write-DnsForceHost {

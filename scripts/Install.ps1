@@ -1085,6 +1085,11 @@ try {
         $updateClonePath = [string]$raw.UpdateClonePath
     }
 
+    $serverDns = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ServerDNS)) {
+        $serverDns = [string]$raw.ServerDNS.Trim()
+    }
+
     $scpOnLockEnabledRuntime = $false
     if ($null -ne $raw.ScpOnLockEnabled) {
         $scpOnLockEnabledRuntime = [bool]$raw.ScpOnLockEnabled
@@ -1153,6 +1158,7 @@ SystemDrive: $env:SystemDrive
         UpdateRepoUrl        = $updateRepoUrl
         UpdateBranch         = $updateBranch
         UpdateClonePath      = $updateClonePath
+        ServerDNS            = $serverDns
         ScpOnLockEnabled     = $scpOnLockEnabledRuntime
         ScpHost              = $scpHost
         ScpUser              = $scpUser
