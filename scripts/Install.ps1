@@ -1280,6 +1280,7 @@ SystemDrive: $env:SystemDrive
     $dohFirewallSrc = Join-Path $repoRoot 'scripts\Block-DoH-Firewall.ps1'
     $dohProvidersSrc = Join-Path $repoRoot 'scripts\Block-DoH-Providers.json'
     $dnsForceSrc = Join-Path $repoRoot 'scripts\Force-DnsToLocalResolver.ps1'
+    $scpAllowFwSrc = Join-Path $repoRoot 'scripts\Allow-ScpOutboundFirewall.ps1'
 
     try {
         New-Item -ItemType Directory -Path $installSrc -Force | Out-Null
@@ -1301,11 +1302,26 @@ SystemDrive: $env:SystemDrive
         if (Test-Path -LiteralPath $dnsForceSrc) {
             Copy-Item -LiteralPath $dnsForceSrc -Destination (Join-Path $installScripts 'Force-DnsToLocalResolver.ps1') -Force
         }
+        if (Test-Path -LiteralPath $scpAllowFwSrc) {
+            Copy-Item -LiteralPath $scpAllowFwSrc -Destination (Join-Path $installScripts 'Allow-ScpOutboundFirewall.ps1') -Force
+        }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
             "Copying monitor files to Program Files failed; installRoot='{0}'" -f $installRoot)
         throw (New-Object System.Exception($details, $_.Exception))
+    }
+
+    if ($scpOnLockEnabledRuntime -and -not [string]::IsNullOrWhiteSpace($scpHost) -and (Test-Path -LiteralPath $scpAllowFwSrc)) {
+        try {
+            Write-Host ("Ensuring outbound SCP/SSH firewall allow to {0}:{1}..." -f $scpHost, $scpPort) -ForegroundColor Cyan
+            & $scpAllowFwSrc -RemoteHost $scpHost -RemotePort $scpPort
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Install' -Context (
+                "Allow-ScpOutboundFirewall.ps1 failed; host='{0}'; port={1}" -f $scpHost, $scpPort)
+            Write-Warning ("Could not create SCP-Allow firewall rule: {0}" -f $_.Exception.Message)
+        }
     }
 
     # Record currently installed commit hash for daily update comparisons.

@@ -2,8 +2,9 @@
 # Once per day: if online, compare local installed commit to GitHub tip;
 # if different, git pull (or clone) and restart via the scheduled task.
 # After a successful daily check (up-to-date or just updated), also run
-# scripts/Force-DnsToLocalResolver.ps1 and scripts/Block-DoH-Firewall.ps1 in
-# child processes to reconcile local-DNS forcing and DoH/DoT blocks.
+# scripts/Force-DnsToLocalResolver.ps1, scripts/Block-DoH-Firewall.ps1, and
+# scripts/Allow-ScpOutboundFirewall.ps1 in child processes (DNS force, DoH/DoT
+# blocks, and outbound SCP/SSH allow when ScpOnLock is enabled).
 # If offline, postpone the check by 10 minutes.
 # Only https://github.com/ldorau/log-logged-in-time(.git) is accepted.
 
@@ -65,6 +66,8 @@ function Read-UpdateState {
             LastDoHBlockResult   = $null
             LastDnsForceUtc      = $null
             LastDnsForceResult   = $null
+            LastScpAllowUtc      = $null
+            LastScpAllowResult   = $null
         }
     }
 
@@ -80,6 +83,8 @@ function Read-UpdateState {
             LastDoHBlockResult = $(if ($json.LastDoHBlockResult) { [string]$json.LastDoHBlockResult } else { $null })
             LastDnsForceUtc    = $(if ($json.LastDnsForceUtc) { [string]$json.LastDnsForceUtc } else { $null })
             LastDnsForceResult = $(if ($json.LastDnsForceResult) { [string]$json.LastDnsForceResult } else { $null })
+            LastScpAllowUtc    = $(if ($json.LastScpAllowUtc) { [string]$json.LastScpAllowUtc } else { $null })
+            LastScpAllowResult = $(if ($json.LastScpAllowResult) { [string]$json.LastScpAllowResult } else { $null })
         }
     }
     catch {
@@ -94,6 +99,8 @@ function Read-UpdateState {
             LastDoHBlockResult   = $null
             LastDnsForceUtc      = $null
             LastDnsForceResult   = $null
+            LastScpAllowUtc      = $null
+            LastScpAllowResult   = $null
         }
     }
 }
@@ -320,6 +327,7 @@ function Publish-InstalledFilesFromRepo {
         'Block-DoH-Firewall.ps1'
         'Block-DoH-Providers.json'
         'Force-DnsToLocalResolver.ps1'
+        'Allow-ScpOutboundFirewall.ps1'
     )
     foreach ($name in $helperFiles) {
         $from = Join-Path $scriptsSrc $name
@@ -421,6 +429,104 @@ function Invoke-DailyDoHFirewallBlock {
         Write-UpdateState -Path $StatePath -State $UpdateState
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
             'Daily DoH/DoT firewall reconcile failed')
+    }
+}
+
+function Invoke-DailyScpOutboundAllow {
+    <#
+      Runs Allow-ScpOutboundFirewall.ps1 once after a successful daily update check
+      when SCP-on-lock is enabled and ScpHost is set.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$ClonePath,
+        [Parameter(Mandatory)]$UpdateState,
+        [Parameter(Mandatory)][string]$StatePath,
+        [Parameter(Mandatory)]$Config
+    )
+
+    if (-not $Config.ScpOnLockEnabled) {
+        $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastScpAllowResult = 'skipped-scp-disabled'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) {
+        $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastScpAllowResult = 'skipped-scp-host-empty'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        Write-LoggerEvent -Level WARN -Message 'Daily SCP-Allow firewall reconcile skipped: ScpHost is empty.'
+        return
+    }
+
+    $port = 22
+    if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
+        $port = [int]$Config.ScpPort
+    }
+
+    $scriptPath = $null
+    $cloneScript = $null
+    if (-not [string]::IsNullOrWhiteSpace($ClonePath)) {
+        $cloneScript = Join-Path $ClonePath 'scripts\Allow-ScpOutboundFirewall.ps1'
+    }
+    $installScript = Join-Path $InstallRoot 'scripts\Allow-ScpOutboundFirewall.ps1'
+
+    if ($cloneScript -and (Test-Path -LiteralPath $cloneScript)) {
+        $scriptPath = $cloneScript
+    }
+    elseif (Test-Path -LiteralPath $installScript) {
+        $scriptPath = $installScript
+    }
+    else {
+        $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastScpAllowResult = 'skipped-script-missing'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        Write-LoggerEvent -Level WARN -Message (
+            'Daily SCP-Allow firewall reconcile skipped: Allow-ScpOutboundFirewall.ps1 not found in clone or InstallRoot\scripts.')
+        return
+    }
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-NoProfile')
+    $argList.Add('-NonInteractive')
+    $argList.Add('-WindowStyle')
+    $argList.Add('Hidden')
+    $argList.Add('-ExecutionPolicy')
+    $argList.Add('Bypass')
+    $argList.Add('-File')
+    $argList.Add($scriptPath)
+    $argList.Add('-RemoteHost')
+    $argList.Add([string]$Config.ScpHost)
+    $argList.Add('-RemotePort')
+    $argList.Add("$port")
+
+    Write-LoggerEvent ("Daily SCP-Allow firewall reconcile starting: {0} ({1}:{2})" -f $scriptPath, $Config.ScpHost, $port)
+    try {
+        $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $argList.ToArray() `
+            -Wait -PassThru -WindowStyle Hidden
+        $exitCode = 0
+        if ($null -ne $proc) {
+            $exitCode = [int]$proc.ExitCode
+        }
+        $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
+        if ($exitCode -eq 0) {
+            $UpdateState.LastScpAllowResult = 'ok'
+            Write-LoggerEvent 'Daily SCP-Allow firewall reconcile finished successfully.'
+        }
+        else {
+            $UpdateState.LastScpAllowResult = ('exit-{0}' -f $exitCode)
+            Write-LoggerEvent -Level WARN -Message (
+                "Daily SCP-Allow firewall reconcile exited with code {0}." -f $exitCode)
+        }
+        Write-UpdateState -Path $StatePath -State $UpdateState
+    }
+    catch {
+        $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
+        $UpdateState.LastScpAllowResult = 'error'
+        Write-UpdateState -Path $StatePath -State $UpdateState
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Daily SCP-Allow firewall reconcile failed')
     }
 }
 
@@ -682,6 +788,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 -ClonePath ([string]$Config.UpdateClonePath) `
                 -UpdateState $updateState `
                 -StatePath $statePath
+            Invoke-DailyScpOutboundAllow `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath `
+                -Config $Config
             return
         }
 
@@ -704,7 +816,7 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
-        # Reconcile local DNS force + DoH/DoT rules before restart.
+        # Reconcile local DNS force + DoH/DoT + SCP-Allow rules before restart.
         Invoke-DailyDnsForceLocalResolver `
             -InstallRoot $InstallRoot `
             -ClonePath ([string]$Config.UpdateClonePath) `
@@ -715,6 +827,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             -ClonePath ([string]$Config.UpdateClonePath) `
             -UpdateState $updateState `
             -StatePath $statePath
+        Invoke-DailyScpOutboundAllow `
+            -InstallRoot $InstallRoot `
+            -ClonePath ([string]$Config.UpdateClonePath) `
+            -UpdateState $updateState `
+            -StatePath $statePath `
+            -Config $Config
 
         Write-LoggerEvent 'Restarting via scheduled task after update.'
         Restart-LoginTimeLoggerProcess -ConfigPath $Config.ConfigPath -InstallRoot $InstallRoot -TaskName $TaskName

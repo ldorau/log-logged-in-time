@@ -44,8 +44,21 @@ Creates one outbound block rule per provider / protocol / port (TCP/UDP 443 DoH/
 
 Firewall IP blocks alone are not enough for “no DoH anywhere”: also disable browser/OS Secure DNS, and consider NRPT/policy if you need org-wide path control. Update `Block-DoH-Providers.json` when public resolver IPs change.
 
+## Allow-ScpOutboundFirewall.ps1
+
+Creates/reconciles an outbound **Allow** rule for TCP to `ScpHost:ScpPort` (prefix `SCP-Allow:`). Used when SCP-on-lock needs an explicit allow alongside tighter outbound policies.
+
+```powershell
+.\scripts\Allow-ScpOutboundFirewall.ps1 -RemoteHost <host> -RemotePort 22
+.\scripts\Allow-ScpOutboundFirewall.ps1 -ConfigPath "$env:USERPROFILE\LoginTimeLogger\config.json"
+.\scripts\Allow-ScpOutboundFirewall.ps1 -RemoteHost <host> -Verify
+.\scripts\Allow-ScpOutboundFirewall.ps1 -Remove
+```
+
+When `ScpOnLockEnabled` is true and `ScpHost` is set, Install and the daily self-update check run this helper. `Status.ps1` reports `SCP-Allow: OK/FAIL` in that case.
+
 ## How LoginTimeLogger may invoke them
 
-When self-update is enabled, after each successful **daily** update check the monitor may run both scripts as child processes (from the update clone or `Program Files\LoginTimeLogger\scripts`). `scripts\Status.ps1 -Verify` can also report DNS-Force / DNS-over-HTTP results when the scripts are present.
+When self-update is enabled, after each successful **daily** update check the monitor may run these scripts as child processes (from the update clone or `Program Files\LoginTimeLogger\scripts`). `Status.ps1` can also report DNS-Force / DNS-over-HTTP / SCP-Allow results when the scripts are present.
 
 Manual runs remain supported for machines that are not using the daily hook.

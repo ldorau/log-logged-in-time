@@ -139,6 +139,9 @@ Default known_hosts (if ScpKnownHostsFile is empty):
 Requires OpenSSH Client (scp.exe) and a private key readable by SYSTEM.
 Install.ps1 installs OpenSSH Client if missing, then validates scp.exe,
 host/user/directory, and the identity file when ScpOnLockEnabled is true.
+When enabled, Install and the daily self-update check also reconcile an
+outbound Windows Firewall Allow rule for ScpHost:ScpPort
+(scripts\Allow-ScpOutboundFirewall.ps1; prefix SCP-Allow:).
 
 
 What the installer does

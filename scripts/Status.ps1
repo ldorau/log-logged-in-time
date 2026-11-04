@@ -87,6 +87,9 @@ try {
     $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     $targetUsername = '(not set)'
     $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    $scpOnLockEnabled = $false
+    $scpHost = ''
+    $scpPort = 22
 
     if (Test-Path -LiteralPath $configPath) {
         try {
@@ -105,6 +108,15 @@ try {
             }
             if (-not [string]::IsNullOrWhiteSpace([string]$raw.LockSignalPath)) {
                 $lockSignalPath = [string]$raw.LockSignalPath
+            }
+            if ($null -ne $raw.ScpOnLockEnabled) {
+                $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)) {
+                $scpHost = [string]$raw.ScpHost
+            }
+            if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
+                $scpPort = [int]$raw.ScpPort
             }
         }
         catch {
@@ -495,6 +507,61 @@ try {
             Write-Host ("DNS-Force: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
             $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
                 "DNS-Force verify failed; script='{0}'" -f $dnsForceScript)
+        }
+    }
+
+    # --- SCP outbound allow verify (Allow-ScpOutboundFirewall.ps1 -Verify) ---
+    if (-not $scpOnLockEnabled -or [string]::IsNullOrWhiteSpace($scpHost)) {
+        Write-Host 'SCP-Allow: SKIP (ScpOnLock disabled or ScpHost empty)' -ForegroundColor DarkGray
+    }
+    else {
+        $scpAllowCandidates = @(
+            (Join-Path $scriptDir 'Allow-ScpOutboundFirewall.ps1')
+            (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Allow-ScpOutboundFirewall.ps1')
+        )
+        $scpAllowScript = $scpAllowCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $scpAllowScript) {
+            Write-Host 'SCP-Allow: SKIP (Allow-ScpOutboundFirewall.ps1 not found)' -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("Checking SCP-Allow firewall rule for {0}:{1}..." -f $scpHost, $scpPort) -ForegroundColor DarkGray
+            try {
+                $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $scpAllowArgs = New-Object System.Collections.Generic.List[string]
+                $scpAllowArgs.Add('-NoProfile')
+                $scpAllowArgs.Add('-NonInteractive')
+                $scpAllowArgs.Add('-WindowStyle')
+                $scpAllowArgs.Add('Hidden')
+                $scpAllowArgs.Add('-ExecutionPolicy')
+                $scpAllowArgs.Add('Bypass')
+                $scpAllowArgs.Add('-File')
+                $scpAllowArgs.Add($scpAllowScript)
+                $scpAllowArgs.Add('-RemoteHost')
+                $scpAllowArgs.Add($scpHost)
+                $scpAllowArgs.Add('-RemotePort')
+                $scpAllowArgs.Add("$scpPort")
+                $scpAllowArgs.Add('-Verify')
+                $scpAllowArgs.Add('-Quiet')
+
+                $scpAllowProc = Start-Process -FilePath $windowsPowerShell -ArgumentList $scpAllowArgs.ToArray() `
+                    -Wait -PassThru -WindowStyle Hidden
+                $scpAllowExit = 1
+                if ($null -ne $scpAllowProc) {
+                    $scpAllowExit = [int]$scpAllowProc.ExitCode
+                }
+
+                if ($scpAllowExit -eq 0) {
+                    Write-Host 'SCP-Allow: OK' -ForegroundColor Green
+                }
+                else {
+                    Write-Host 'SCP-Allow: FAIL (outbound Allow rule missing or mismatched)' -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host ("SCP-Allow: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                    "SCP-Allow verify failed; script='{0}'" -f $scpAllowScript)
+            }
         }
     }
 }

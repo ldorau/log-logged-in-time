@@ -83,6 +83,8 @@ SCP on lock (opt-in; ScpOnLockEnabled=false by default):
   When enabled, on each lock copies today's unlocked-time log and errors.log
   via OpenSSH scp to ScpUser@ScpHost:ScpRemoteDirectory/ using an SSH key
   (default <AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519).
+  Also reconciles an outbound firewall Allow for ScpHost:ScpPort
+  (scripts\Allow-ScpOutboundFirewall.ps1) at Install and once per daily update.
 
 
 Project layout
@@ -96,6 +98,7 @@ Project layout
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Reinstall.ps1       - git pull (optional) + Install.ps1 -StartNow
   scripts\Test-ScpOnLock.ps1  - test remote log copy (SCP on lock) + debug
+  scripts\Allow-ScpOutboundFirewall.ps1 - outbound Allow for ScpHost:ScpPort
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total
   scripts\Get-LockedTime.ps1  - estimate locked/away time from daily logs

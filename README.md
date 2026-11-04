@@ -66,6 +66,8 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 
 `Install.ps1` installs OpenSSH Client if `scp.exe` is missing and generates an ed25519 key at `ScpIdentityFile` when that file does not exist (prints the public key to add to the remote `authorized_keys`). Keys are ACL-protected for admin + `SYSTEM` only. You can also run `.\scripts\Test-ScpOnLock.ps1 -GenerateIdentity` to create the key without a full reinstall.
 
+When SCP-on-lock is enabled, Install and the daily self-update check also reconcile an outbound Windows Firewall **Allow** rule for `ScpHost:ScpPort` (`scripts/Allow-ScpOutboundFirewall.ps1`, prefix `SCP-Allow:`).
+
 ## Install
 
 ### One-file bootstrap (download only `Bootstrap-Install.ps1`)
