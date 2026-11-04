@@ -918,6 +918,45 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
+        $gitLogText = '(git log -1 unavailable)'
+        try {
+            $gitLog = Invoke-GitCommand -GitExe $gitExe -RepoPath $Config.UpdateClonePath -Arguments @('log', '-1')
+            if ($gitLog.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($gitLog.Output)) {
+                $gitLogText = $gitLog.Output.TrimEnd()
+            }
+            elseif ($gitLog.ExitCode -ne 0) {
+                $gitLogText = ("git log -1 failed (exit {0}): {1}" -f $gitLog.ExitCode, $gitLog.Output)
+            }
+        }
+        catch {
+            $gitLogText = ("git log -1 failed: {0}" -f $_.Exception.Message)
+        }
+
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $shortSha = $newHead
+            if ($shortSha.Length -gt 7) {
+                $shortSha = $shortSha.Substring(0, 7)
+            }
+            $updateBody = @(
+                'LoginTimeLogger repository was updated; installed files were published and the monitor will restart.'
+                ''
+                ('PreviousCommit: {0}' -f $(if ($localSha) { $localSha } else { '(none)' }))
+                ('NewCommit: {0}' -f $newHead)
+                ('Branch: {0}' -f $Config.UpdateBranch)
+                ('RepoUrl: {0}' -f $Config.UpdateRepoUrl)
+                ('ClonePath: {0}' -f $Config.UpdateClonePath)
+                ('InstallRoot: {0}' -f $InstallRoot)
+                ''
+                '--- git log -1 ---'
+                $gitLogText
+            ) -join [Environment]::NewLine
+            # Per-commit key so cooldown does not suppress distinct updates.
+            $null = Send-LoginTimeSmtpAlert `
+                -Subject ("Repository updated ({0})" -f $shortSha) `
+                -Body $updateBody `
+                -AlertKey ("repo-updated-{0}" -f $newHead)
+        }
+
         # Reconcile local DNS force + DoH/DoT + VPN + SCP-Allow rules before restart.
         Invoke-DailyDnsForceLocalResolver `
             -InstallRoot $InstallRoot `
