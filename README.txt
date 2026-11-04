@@ -86,6 +86,12 @@ SCP on lock (opt-in; ScpOnLockEnabled=false by default):
   Also reconciles an outbound firewall Allow for ScpHost:ScpPort
   (scripts\Allow-ScpOutboundFirewall.ps1) at Install and once per daily update.
 
+Email alerts (optional SMTP / Gmail app password):
+  <AdministratorProfile>\LoginTimeLogger\smtp.json
+  Admin + SYSTEM ACL only (target users cannot read). Enable and fill
+  host/port/from/to/username/password. Alerts on update/SCP/DNS-force/Status
+  failures and other ERROR fatals (cooldown between duplicate keys).
+
 
 Project layout
 --------------

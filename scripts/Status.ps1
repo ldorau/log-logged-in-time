@@ -30,8 +30,22 @@ else {
     throw "Common-Error.ps1 missing at '$commonErrorPath'."
 }
 
+function Send-StatusSmtpFail {
+    param(
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][string]$AlertKey
+    )
+    if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+        $null = Send-LoginTimeSmtpAlert -Subject $Subject -Body $Body -AlertKey $AlertKey
+    }
+}
+
 try {
     $null = Initialize-ErrorLog -ConfigPath $TemplateConfigPath
+    if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
+        $null = Initialize-SmtpAlerts -ConfigPath $TemplateConfigPath
+    }
     $administratorProfile = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and
         ($env:USERPROFILE -notmatch '\\System32\\config\\systemprofile$')) {
         $env:USERPROFILE
@@ -80,6 +94,9 @@ try {
 
     try {
         $null = Initialize-ErrorLog -ConfigPath $configPath
+        if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
+            $null = Initialize-SmtpAlerts -ConfigPath $configPath
+        }
     }
     catch { }
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
@@ -458,19 +475,24 @@ try {
                 Write-Host 'DNS-over-HTTP: INCONCLUSIVE (rules/tests did not confirm a block)' -ForegroundColor Yellow
             }
             else {
-                Write-Host 'DNS-over-HTTP: FAIL (reachable endpoints or missing/mismatched firewall rules)' -ForegroundColor Red
+                $msg = 'DNS-over-HTTP: FAIL (reachable endpoints or missing/mismatched firewall rules)'
+                Write-Host $msg -ForegroundColor Red
+                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $msg -AlertKey 'status-doh-fail'
             }
         }
         catch {
             Write-Host ("DNS-over-HTTP: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
             $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
                 "DoH verify failed; script='{0}'" -f $dohScript)
+            Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $_.Exception.Message -AlertKey 'status-doh-error'
         }
     }
 
     # --- Local DNS force verify (Force-DnsToLocalResolver.ps1 -Verify) ---
     if ([string]::IsNullOrWhiteSpace($serverDns)) {
-        Write-Host 'DNS-Force: SKIP (ServerDNS empty in config)' -ForegroundColor DarkGray
+        $skipMsg = 'DNS-Force: SKIP (ServerDNS empty in config)'
+        Write-Host $skipMsg -ForegroundColor DarkGray
+        Send-StatusSmtpFail -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'status-dns-force-skip'
     }
     else {
         $dnsForceCandidates = @(
@@ -479,7 +501,9 @@ try {
         )
         $dnsForceScript = $dnsForceCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
         if (-not $dnsForceScript) {
-            Write-Host 'DNS-Force: SKIP (Force-DnsToLocalResolver.ps1 not found)' -ForegroundColor Yellow
+            $skipMsg = 'DNS-Force: SKIP (Force-DnsToLocalResolver.ps1 not found)'
+            Write-Host $skipMsg -ForegroundColor Yellow
+            Send-StatusSmtpFail -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'status-dns-force-skip-script'
         }
         else {
             Write-Host ("Checking DNS-Force (local resolver {0}) via Force-DnsToLocalResolver.ps1 -Verify..." -f $serverDns) -ForegroundColor DarkGray
@@ -510,13 +534,16 @@ try {
                     Write-Host 'DNS-Force: OK' -ForegroundColor Green
                 }
                 else {
-                    Write-Host 'DNS-Force: FAIL (adapter DNS or firewall rules not forcing the LAN resolver)' -ForegroundColor Red
+                    $msg = 'DNS-Force: FAIL (adapter DNS or firewall rules not forcing the LAN resolver)'
+                    Write-Host $msg -ForegroundColor Red
+                    Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $msg -AlertKey 'status-dns-force-fail'
                 }
             }
             catch {
                 Write-Host ("DNS-Force: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
                     "DNS-Force verify failed; script='{0}'" -f $dnsForceScript)
+                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $_.Exception.Message -AlertKey 'status-dns-force-error'
             }
         }
     }
@@ -565,13 +592,16 @@ try {
                     Write-Host 'SCP-Allow: OK' -ForegroundColor Green
                 }
                 else {
-                    Write-Host 'SCP-Allow: FAIL (outbound Allow rule missing or mismatched)' -ForegroundColor Red
+                    $msg = 'SCP-Allow: FAIL (outbound Allow rule missing or mismatched)'
+                    Write-Host $msg -ForegroundColor Red
+                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' -Body $msg -AlertKey 'status-scp-allow-fail'
                 }
             }
             catch {
                 Write-Host ("SCP-Allow: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
                     "SCP-Allow verify failed; script='{0}'" -f $scpAllowScript)
+                Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' -Body $_.Exception.Message -AlertKey 'status-scp-allow-error'
             }
         }
     }

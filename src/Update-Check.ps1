@@ -320,6 +320,12 @@ function Publish-InstalledFilesFromRepo {
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
 
+    # Optional SMTP helper (older clones may lack it).
+    $smtpHelper = Join-Path $srcDir 'Common-Smtp.ps1'
+    if (Test-Path -LiteralPath $smtpHelper) {
+        Copy-Item -LiteralPath $smtpHelper -Destination (Join-Path $destDir 'Common-Smtp.ps1') -Force
+    }
+
     # Daily DNS/DoH helpers (optional for older clones; preferred when present).
     $scriptsSrc = Join-Path $ClonePath 'scripts'
     $scriptsDest = Join-Path $InstallRoot 'scripts'
@@ -552,8 +558,11 @@ function Invoke-DailyDnsForceLocalResolver {
         $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
         $UpdateState.LastDnsForceResult = 'skipped-serverdns-empty'
         Write-UpdateState -Path $StatePath -State $UpdateState
-        Write-LoggerEvent -Level WARN -Message (
-            'Daily DNS-force reconcile skipped: ServerDNS is empty in config.')
+        $skipMsg = 'Daily DNS-force reconcile skipped: ServerDNS is empty in config.'
+        Write-LoggerEvent -Level WARN -Message $skipMsg
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'dns-force-skip-serverdns'
+        }
         return
     }
 
@@ -574,8 +583,11 @@ function Invoke-DailyDnsForceLocalResolver {
         $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
         $UpdateState.LastDnsForceResult = 'skipped-script-missing'
         Write-UpdateState -Path $StatePath -State $UpdateState
-        Write-LoggerEvent -Level WARN -Message (
-            'Daily DNS-force reconcile skipped: Force-DnsToLocalResolver.ps1 not found in clone or InstallRoot\scripts.')
+        $skipMsg = 'Daily DNS-force reconcile skipped: Force-DnsToLocalResolver.ps1 not found in clone or InstallRoot\scripts.'
+        Write-LoggerEvent -Level WARN -Message $skipMsg
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'dns-force-skip-script'
+        }
         return
     }
 
@@ -607,8 +619,11 @@ function Invoke-DailyDnsForceLocalResolver {
         }
         else {
             $UpdateState.LastDnsForceResult = ('exit-{0}' -f $exitCode)
-            Write-LoggerEvent -Level WARN -Message (
-                "Daily DNS-force reconcile exited with code {0}." -f $exitCode)
+            $failMsg = ("Daily DNS-force reconcile exited with code {0}." -f $exitCode)
+            Write-LoggerEvent -Level WARN -Message $failMsg
+            if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+                $null = Send-LoginTimeSmtpAlert -Subject 'DNS-force failed' -Body $failMsg -AlertKey 'dns-force-exit'
+            }
         }
         Write-UpdateState -Path $StatePath -State $UpdateState
     }
@@ -616,8 +631,11 @@ function Invoke-DailyDnsForceLocalResolver {
         $UpdateState.LastDnsForceUtc = [datetime]::UtcNow.ToString('o')
         $UpdateState.LastDnsForceResult = 'error'
         Write-UpdateState -Path $StatePath -State $UpdateState
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+        $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
             'Daily DNS-force reconcile failed')
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'DNS-force failed' -Body $details -AlertKey 'dns-force-error'
+        }
     }
 }
 
@@ -859,6 +877,9 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
         $updateState.LastResult = 'error-postpone-10m'
         Write-UpdateState -Path $statePath -State $updateState
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context 'Update check failed; postponing 10 minutes'
+        $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context 'Update check failed; postponing 10 minutes'
+        if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
+            $null = Send-LoginTimeSmtpAlert -Subject 'Update check failed' -Body $details -AlertKey 'update-check-failed'
+        }
     }
 }

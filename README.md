@@ -69,6 +69,12 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 
 When SCP-on-lock is enabled, Install and the daily self-update check also reconcile an outbound Windows Firewall **Allow** rule for `ScpHost:ScpPort` (`scripts/Allow-ScpOutboundFirewall.ps1`, prefix `SCP-Allow:`).
 
+### Email alerts (SMTP)
+
+Optional. Install creates `<AdministratorProfile>\LoginTimeLogger\smtp.json` (admin + `SYSTEM` only; the measured user cannot read it). Template also lives at `config/smtp.json` in the repo (disabled, empty secrets).
+
+Set `Enabled` to `true` and fill `SmtpHost`, `SmtpPort`, `UseSsl`, `From`, `To`, `Username`, and `Password` (Gmail: `smtp.gmail.com`, port `587`, app password). Alerts cover update failures, SCP auth failures, DNS-force skips/failures, Status FAIL lines, and other ERROR-level fatals. Duplicate alerts for the same key are suppressed for `CooldownMinutes` (default 60).
+
 ## Install
 
 ### One-file bootstrap (download only `Bootstrap-Install.ps1`)

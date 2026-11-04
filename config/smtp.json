@@ -1,0 +1,11 @@
+{
+  "Enabled": false,
+  "SmtpHost": "smtp.gmail.com",
+  "SmtpPort": 587,
+  "UseSsl": true,
+  "From": "",
+  "To": "",
+  "Username": "",
+  "Password": "",
+  "CooldownMinutes": 60
+}

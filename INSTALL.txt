@@ -143,6 +143,16 @@ When enabled, Install and the daily self-update check also reconcile an
 outbound Windows Firewall Allow rule for ScpHost:ScpPort
 (scripts\Allow-ScpOutboundFirewall.ps1; prefix SCP-Allow:).
 
+Email alerts (optional)
+-----------------------
+Install creates <AdministratorProfile>\LoginTimeLogger\smtp.json with
+Administrator account + SYSTEM full control only (measured user cannot
+read). Repo template: config\smtp.json (Enabled=false).
+Fill SmtpHost/SmtpPort/UseSsl/From/To/Username/Password (e.g. Gmail app
+password on smtp.gmail.com:587), set Enabled=true. Sends on update
+failures, SCP auth failures, DNS-force skips/failures, Status FAIL, and
+other ERROR-level fatals. CooldownMinutes limits duplicate alerts.
+
 
 What the installer does
 -----------------------

@@ -999,6 +999,41 @@ function Set-ProtectedSshDirectory {
     }
 }
 
+function Set-ProtectedAdminOnlyFile {
+    <#
+      Single file: admin + SYSTEM full control only (no target/Users read).
+      Used for smtp.json and related secrets.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$AllowedAdminSid
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Cannot ACL missing file: $Path"
+    }
+
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $null = $acl.RemoveAccessRule($rule)
+    }
+    $acl.AddAccessRule((New-SidFileSystemAccessRule `
+                -Sid $AllowedAdminSid `
+                -Rights FullControl `
+                -InheritanceFlags None `
+                -PropagationFlags None `
+                -AccessControlType Allow))
+    $acl.AddAccessRule((New-SidFileSystemAccessRule `
+                -Sid $sidSystem `
+                -Rights FullControl `
+                -InheritanceFlags None `
+                -PropagationFlags None `
+                -AccessControlType Allow))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 try {
     $currentAccount = (& whoami 2>$null | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($currentAccount)) {
@@ -1029,8 +1064,10 @@ try {
     $templateConfigPath = Join-Path $repoRoot 'config\config.json'
     $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
     $commonErrorSrc = Join-Path $repoRoot 'src\Common-Error.ps1'
+    $commonSmtpSrc = Join-Path $repoRoot 'src\Common-Smtp.ps1'
     $updateCheckSrc = Join-Path $repoRoot 'src\Update-Check.ps1'
     $scpOnLockSrc = Join-Path $repoRoot 'src\Scp-OnLock.ps1'
+    $smtpTemplateSrc = Join-Path $repoRoot 'config\smtp.json'
 
     $raw = Test-InstallPrerequisites `
         -RepoRoot $repoRoot `
@@ -1182,6 +1219,30 @@ SystemDrive: $env:SystemDrive
             -Directory $sshDir `
             -AllowedAdminSid $allowedAdminSid
 
+        # SMTP secrets: separate file, admin + SYSTEM only (target cannot read).
+        $smtpRuntimePath = Join-Path $adminAppDirectory 'smtp.json'
+        if (-not (Test-Path -LiteralPath $smtpRuntimePath)) {
+            if (Test-Path -LiteralPath $smtpTemplateSrc) {
+                Copy-Item -LiteralPath $smtpTemplateSrc -Destination $smtpRuntimePath -Force
+            }
+            else {
+                @{
+                    Enabled         = $false
+                    SmtpHost        = 'smtp.gmail.com'
+                    SmtpPort        = 587
+                    UseSsl          = $true
+                    From            = ''
+                    To              = ''
+                    Username        = ''
+                    Password        = ''
+                    CooldownMinutes = 60
+                } | ConvertTo-Json | Set-Content -LiteralPath $smtpRuntimePath -Encoding UTF8
+            }
+            Write-Host ("Created SMTP config template (disabled): {0}" -f $smtpRuntimePath) -ForegroundColor Cyan
+            Write-Host 'Edit that file as the install admin to enable Gmail app-password alerts.' -ForegroundColor Yellow
+        }
+        Set-ProtectedAdminOnlyFile -Path $smtpRuntimePath -AllowedAdminSid $allowedAdminSid
+
         if ($scpOnLockEnabledRuntime -and -not [string]::IsNullOrWhiteSpace($scpIdentityFile)) {
             if (-not (Test-Path -LiteralPath $scpIdentityFile)) {
                 Write-Host ("Generating SCP identity key: {0}" -f $scpIdentityFile) -ForegroundColor Cyan
@@ -1293,6 +1354,9 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $monitorScript -Destination (Join-Path $installSrc 'LoginTimeLogger.ps1') -Force
         Copy-Item -LiteralPath $csPath -Destination (Join-Path $installSrc 'SessionQuery.cs') -Force
         Copy-Item -LiteralPath $commonErrorSrc -Destination (Join-Path $installSrc 'Common-Error.ps1') -Force
+        if (Test-Path -LiteralPath $commonSmtpSrc) {
+            Copy-Item -LiteralPath $commonSmtpSrc -Destination (Join-Path $installSrc 'Common-Smtp.ps1') -Force
+        }
         Copy-Item -LiteralPath $updateCheckSrc -Destination (Join-Path $installSrc 'Update-Check.ps1') -Force
         Copy-Item -LiteralPath $scpOnLockSrc -Destination (Join-Path $installSrc 'Scp-OnLock.ps1') -Force
         Copy-Item -LiteralPath $lockSignalWatcherSrc -Destination (Join-Path $installSrc 'LockSignalWatcher.ps1') -Force

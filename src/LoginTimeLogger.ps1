@@ -34,6 +34,9 @@ ConfigPath argument: $ConfigPath
 }
 . $commonErrorPath
 $null = Initialize-ErrorLog -ConfigPath $ConfigPath
+if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
+    $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath
+}
 
 function Write-LoggerEvent {
     param(

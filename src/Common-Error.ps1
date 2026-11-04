@@ -4,8 +4,23 @@
 # Every error/warning is printed to the screen and appended to a separate file
 # under the Administrator profile:
 #   <AdministratorProfile>\LoginTimeLogger\errors.log
+#
+# ERROR-level messages also attempt an SMTP alert when smtp.json is enabled
+# (see Common-Smtp.ps1 beside this file).
 
 $script:LoginTimeErrorLogPath = $null
+
+# Optional SMTP helper (same folder). Missing file is fine for older installs.
+$script:LoginTimeSmtpHelperPath = Join-Path $PSScriptRoot 'Common-Smtp.ps1'
+if (-not (Test-Path -LiteralPath $script:LoginTimeSmtpHelperPath)) {
+    # When dot-sourced via full path, $PSScriptRoot may be empty in PS 5.1.
+    if ($MyInvocation.MyCommand.Path) {
+        $script:LoginTimeSmtpHelperPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Common-Smtp.ps1'
+    }
+}
+if ((Test-Path -LiteralPath $script:LoginTimeSmtpHelperPath) -and -not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
+    . $script:LoginTimeSmtpHelperPath
+}
 
 function Get-DefaultAdministratorProfile {
     # Prefer the current interactive/elevated user's profile (e.g. C:\Users\AdminName).
@@ -200,6 +215,11 @@ function Write-ErrorMessage {
     $logPath = Write-ErrorLogFile -Text $text
     if ($logPath) {
         Write-Host ("Error also logged to: {0}" -f $logPath) -ForegroundColor DarkYellow
+    }
+
+    if ($Level -eq 'ERROR' -and $Source -ne 'SmtpAlert' -and (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
+        $alertSubject = if ([string]::IsNullOrWhiteSpace($Source)) { 'Fatal error' } else { "Fatal error ($Source)" }
+        $null = Send-LoginTimeSmtpAlert -Subject $alertSubject -Body $Message -AlertKey ("fatal-{0}" -f $(if ($Source) { $Source } else { 'general' }))
     }
 
     return $Message
