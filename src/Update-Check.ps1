@@ -446,6 +446,8 @@ function Publish-InstalledFilesFromRepo {
         'Scp-OnLock.ps1'
         'LockSignalWatcher.ps1'
         'LockSignalLauncher.ps1'
+        # Required for UnlockQuotaEnabled warning + LockWorkStation in-session.
+        'Show-UnlockQuotaWarning.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name
@@ -456,7 +458,7 @@ function Publish-InstalledFilesFromRepo {
     }
 
     # Optional for older update clones (keep existing Program Files copy).
-    foreach ($optionalName in @('Common-Smtp.ps1', 'Show-UnlockQuotaWarning.ps1')) {
+    foreach ($optionalName in @('Common-Smtp.ps1')) {
         $from = Join-Path $srcDir $optionalName
         if (Test-Path -LiteralPath $from) {
             Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $optionalName) -Force
@@ -776,12 +778,19 @@ function Merge-InstalledConfigFilesFromRepo {
     <#
       After a repo self-update, add any new template fields to the installed
       config.json / smtp.json without changing existing values.
+      Pass -OptInUnlockQuotaOnExisting on unattended self-update so existing
+      installs do not start locking until UnlockQuotaEnabled is set true.
+      Restart.ps1 omits that switch so missing keys take the template default
+      (UnlockQuotaEnabled: true).
     #>
     param(
         [Parameter(Mandatory)][string]$ClonePath,
         [Parameter(Mandatory)][string]$AdminAppDirectory,
         [string]$ConfigPath = '',
-        $Config = $null
+        $Config = $null,
+        [switch]$OptInUnlockQuotaOnExisting,
+        # Restart.ps1 sets this so a failed merge cannot look like success.
+        [switch]$ThrowOnError
     )
 
     $templateConfig = Join-Path $ClonePath 'config\config.json'
@@ -817,16 +826,22 @@ function Merge-InstalledConfigFilesFromRepo {
             -TemplatePath $templateConfig `
             -DestPath $destConfig `
             -Label 'config.json' `
-            -OptInUnlockQuotaOnExisting
+            -OptInUnlockQuotaOnExisting:$OptInUnlockQuotaOnExisting
     }
     catch {
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
             'Failed merging new fields into installed config.json')
+        if ($ThrowOnError) {
+            throw
+        }
     }
 
     if ($null -eq $adminOnlySid) {
-        Write-LoggerEvent -Level ERROR -Message (
-            "Config merge skipped (smtp.json): could not resolve admin SID; refusing to rewrite secrets file.")
+        $msg = 'Config merge skipped (smtp.json): could not resolve admin SID; refusing to rewrite secrets file.'
+        Write-LoggerEvent -Level ERROR -Message $msg
+        if ($ThrowOnError) {
+            throw $msg
+        }
     }
     else {
         try {
@@ -840,6 +855,9 @@ function Merge-InstalledConfigFilesFromRepo {
         catch {
             $null = Write-VerboseError -ErrorRecord $_ -Level Error -Source 'UpdateCheck' -Context (
                 'Failed merging new fields into installed smtp.json (ACL fail-closed)')
+            if ($ThrowOnError) {
+                throw
+            }
         }
     }
 }
@@ -1370,7 +1388,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                     -ClonePath $Config.UpdateClonePath `
                     -AdminAppDirectory $AdminAppDirectory `
                     -ConfigPath ([string]$Config.ConfigPath) `
-                    -Config $Config
+                    -Config $Config `
+                    -OptInUnlockQuotaOnExisting
             }
             Invoke-DailyDnsForceLocalResolver `
                 -InstallRoot $InstallRoot `
@@ -1405,7 +1424,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             -ClonePath $Config.UpdateClonePath `
             -AdminAppDirectory $AdminAppDirectory `
             -ConfigPath ([string]$Config.ConfigPath) `
-            -Config $Config
+            -Config $Config `
+            -OptInUnlockQuotaOnExisting
         try {
             Update-LockSignalHiddenLauncherFromConfig -Config $Config -InstallRoot $InstallRoot
         }

@@ -59,7 +59,7 @@ After publishing updated files, self-update also merges **new** fields from the 
 
 **On by default for new installs** (`UnlockQuotaEnabled: true` in the installed runtime config). If the key is **missing**, the monitor treats it as **disabled** (safe for older configs). Each time the target accumulates another `UnlockQuotaMinutes` (default **30**) of unlocked time for the day, the monitor launches a **blocking** topmost countdown window **in that user’s session** for `UnlockQuotaWarnSeconds` (default **3**), then calls `LockWorkStation` from a process created in the same session (`CreateProcessAsUser` / WTS user token). That is a real screen lock for the target user—not a SYSTEM-session lock. Set `UnlockQuotaEnabled: false` to disable.
 
-Existing installs that receive `UnlockQuota*` via self-update merge get `UnlockQuotaEnabled: false` (opt-in); set it to `true` in the runtime config to enable.
+Existing installs that receive `UnlockQuota*` via **self-update** merge get `UnlockQuotaEnabled: false` (opt-in); set it to `true` in the runtime config to enable. `Restart.ps1` merges missing keys with the template default (`true`) so an explicit admin restart turns the feature on when the keys were absent.
 
 ### SCP on lock
 

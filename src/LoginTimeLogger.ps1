@@ -536,7 +536,17 @@ function Write-State {
     try {
         $tempPath = "$Path.tmp"
         ($State | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
-        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+        # Replace in place. If destination is a zeroed/locked leftover, remove
+        # then rename so Move-Item -Force is not the only recovery path.
+        try {
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+        }
+        catch {
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+        }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Write-State failed for '{0}'" -f $Path)

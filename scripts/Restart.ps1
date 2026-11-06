@@ -4,19 +4,20 @@
 .SYNOPSIS
   Publishes monitor files (optional) and restarts the LoginTimeLogger task.
 .DESCRIPTION
-  By default copies src/scripts from the template checkout into
-  Program Files\LoginTimeLogger (same as self-update publish), merges any
-  missing config fields, then stops and starts the LoginTimeLogger task.
-  Use this after git pull when self-update is stuck. Does not git pull and
-  does not touch the lock-signal task.
+  By default copies src/scripts from this Restart.ps1 checkout into
+  Program Files\LoginTimeLogger, merges missing config fields from the
+  same checkout (not a stale UpdateClonePath), then restarts the
+  LoginTimeLogger task. Use after git pull when self-update is stuck.
+  Does not git pull and does not touch the lock-signal task.
 .PARAMETER TaskName
   Scheduled task name (default LoginTimeLogger).
 .PARAMETER ConfigPath
   Runtime config JSON. Default: path from the LoginTimeLogger task -ConfigPath
   argument, then %USERPROFILE%\LoginTimeLogger\config.json.
 .PARAMETER TemplateRoot
-  Directory that contains config\config.json and src\ (defaults to
-  UpdateClonePath from the runtime config when present, otherwise this repo).
+  Directory that contains config\config.json and src\. Default: this
+  Restart.ps1 checkout (same tree used for publish). Falls back to
+  UpdateClonePath only when this checkout has no src\LoginTimeLogger.ps1.
 .PARAMETER SkipConfigMerge
   Skip template compare/merge.
 .PARAMETER SkipPublish
@@ -134,7 +135,13 @@ function Get-MissingTemplateKeys {
     }
 }
 
-function Resolve-TemplateRoot {
+function Resolve-RestartSourceRoot {
+    <#
+      Same tree for Program Files publish and config merge.
+      Prefer the checkout that contains this Restart.ps1 so a stale
+      UpdateClonePath cannot publish new code while merging an old
+      config template (which then reports "no merge needed").
+    #>
     param(
         [string]$TemplateRoot,
         [Parameter(Mandatory)][string]$RepoRoot,
@@ -145,22 +152,27 @@ function Resolve-TemplateRoot {
         if (-not (Test-Path -LiteralPath (Join-Path $TemplateRoot 'config\config.json'))) {
             throw "TemplateRoot missing config\config.json: '$TemplateRoot'."
         }
+        if (-not (Test-Path -LiteralPath (Join-Path $TemplateRoot 'src\LoginTimeLogger.ps1'))) {
+            throw "TemplateRoot missing src\LoginTimeLogger.ps1: '$TemplateRoot'."
+        }
         return $TemplateRoot
+    }
+
+    if ((Test-Path -LiteralPath (Join-Path $RepoRoot 'config\config.json')) -and
+        (Test-Path -LiteralPath (Join-Path $RepoRoot 'src\LoginTimeLogger.ps1'))) {
+        return $RepoRoot
     }
 
     $clonePath = [string](Get-OptionalPropertyValue -InputObject $RuntimeConfig -Name 'UpdateClonePath')
     if (-not [string]::IsNullOrWhiteSpace($clonePath) -and
-        (Test-Path -LiteralPath (Join-Path $clonePath 'config\config.json'))) {
+        (Test-Path -LiteralPath (Join-Path $clonePath 'config\config.json')) -and
+        (Test-Path -LiteralPath (Join-Path $clonePath 'src\LoginTimeLogger.ps1'))) {
         return $clonePath
     }
 
-    if (Test-Path -LiteralPath (Join-Path $RepoRoot 'config\config.json')) {
-        return $RepoRoot
-    }
-
     throw @"
-Could not locate template config files (config\config.json).
-Pass -TemplateRoot to a checkout that contains them, or set UpdateClonePath in the runtime config.
+Could not locate a publish/merge source (config\config.json + src\LoginTimeLogger.ps1).
+Pass -TemplateRoot to a checkout that contains them, or repair UpdateClonePath.
 "@
 }
 
@@ -187,7 +199,6 @@ try {
     $null = Initialize-ErrorLog -ConfigPath $resolvedConfigPath
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
     Write-Host '=== LoginTimeLogger restart ===' -ForegroundColor Cyan
-    Write-Host ("Runtime config: {0}" -f $resolvedConfigPath)
 
     $runtimeRaw = Get-Content -LiteralPath $resolvedConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $adminProfile = [string](Get-OptionalPropertyValue -InputObject $runtimeRaw -Name 'AdministratorProfile')
@@ -208,29 +219,23 @@ try {
                 -InputObject $runtimeRaw -Name 'UpdateClonePath')
     }
 
-    $templateRootResolved = Resolve-TemplateRoot `
+    # One source tree for both publish and config merge (never publish from
+    # this checkout while merging a stale UpdateClonePath template).
+    $sourceRoot = Resolve-RestartSourceRoot `
         -TemplateRoot $TemplateRoot `
         -RepoRoot $repoRoot `
         -RuntimeConfig $runtimeRaw
-    Write-Host ("Template root:  {0}" -f $templateRootResolved)
+    $templateConfigPath = Join-Path $sourceRoot 'config\config.json'
+    Write-Host ("Source root:           {0}" -f $sourceRoot)
+    Write-Host ("Template config:       {0}" -f $templateConfigPath)
+    Write-Host ("Installed/used config: {0}" -f $resolvedConfigPath)
 
     $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
     if (-not $SkipPublish) {
-        # Prefer the checkout that contains this Restart.ps1 (usually a
-        # git-pulled worktree). UpdateClonePath can be a stale shallow clone
-        # missing newer src files (e.g. Show-UnlockQuotaWarning.ps1).
-        $publishRoot = $repoRoot
-        if (-not (Test-Path -LiteralPath (Join-Path $publishRoot 'src\LoginTimeLogger.ps1'))) {
-            $publishRoot = $templateRootResolved
-        }
-        $publishSrc = Join-Path $publishRoot 'src\LoginTimeLogger.ps1'
-        if (-not (Test-Path -LiteralPath $publishSrc)) {
-            throw ("Cannot publish: missing '{0}'." -f $publishSrc)
-        }
         Write-Host ("Publishing Program Files from '{0}' into '{1}'..." -f `
-                $publishRoot, $installRoot) -ForegroundColor Cyan
+                $sourceRoot, $installRoot) -ForegroundColor Cyan
         Publish-InstalledFilesFromRepo `
-            -ClonePath $publishRoot `
+            -ClonePath $sourceRoot `
             -InstallRoot $installRoot
 
         # Record tip when possible so the next self-update is not confused.
@@ -238,8 +243,8 @@ try {
         if (Get-Command Find-GitExecutable -ErrorAction SilentlyContinue) {
             $gitExe = Find-GitExecutable
         }
-        if ($gitExe -and (Test-Path -LiteralPath (Join-Path $publishRoot '.git'))) {
-            $head = Invoke-GitCommand -GitExe $gitExe -RepoPath $publishRoot `
+        if ($gitExe -and (Test-Path -LiteralPath (Join-Path $sourceRoot '.git'))) {
+            $head = Invoke-GitCommand -GitExe $gitExe -RepoPath $sourceRoot `
                 -Arguments @('rev-parse', 'HEAD')
             if ($head.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($head.Output)) {
                 Set-InstalledCommit -InstallRoot $installRoot -CommitSha $head.Output.Trim()
@@ -263,57 +268,51 @@ try {
     }
 
     if (-not $SkipConfigMerge) {
-        $templateConfig = Join-Path $templateRootResolved 'config\config.json'
-        $templateSmtp = Join-Path $templateRootResolved 'config\smtp.json'
+        $templateConfig = Join-Path $sourceRoot 'config\config.json'
+        $templateSmtp = Join-Path $sourceRoot 'config\smtp.json'
         $destConfig = $resolvedConfigPath
         $destSmtp = Join-Path $adminAppDirectory 'smtp.json'
 
         $configDiff = Get-MissingTemplateKeys -TemplatePath $templateConfig -DestPath $destConfig
         $smtpDiff = Get-MissingTemplateKeys -TemplatePath $templateSmtp -DestPath $destSmtp
 
-        $needsMerge = $false
         if ($configDiff.TemplateMissing) {
-            Write-Host ("WARNING: template missing: {0}" -f $templateConfig) `
-                -ForegroundColor Yellow
+            throw ("Template missing: {0}" -f $templateConfig)
         }
-        elseif ($configDiff.DestMissing -or $configDiff.AddedKeys.Count -gt 0) {
-            $needsMerge = $true
-            Write-Host ("config.json differs from template (missing: {0})" -f `
+        if ($configDiff.DestMissing -or $configDiff.AddedKeys.Count -gt 0) {
+            Write-Host ("config.json missing template field(s): {0}" -f `
                     ($(if ($configDiff.AddedKeys.Count -gt 0) {
                         $configDiff.AddedKeys -join ', '
-                    } else { 'n/a' })))
+                    } else { '(entire file)' })))
         }
         else {
-            Write-Host 'config.json: no new template fields.'
+            Write-Host 'config.json: already has all template fields (merge still runs; idempotent).'
         }
 
         if ($smtpDiff.TemplateMissing) {
-            Write-Host ("WARNING: template missing: {0}" -f $templateSmtp) `
+            Write-Host ("WARNING: smtp template missing: {0}" -f $templateSmtp) `
                 -ForegroundColor Yellow
         }
         elseif ($smtpDiff.DestMissing -or $smtpDiff.AddedKeys.Count -gt 0) {
-            $needsMerge = $true
-            Write-Host ("smtp.json differs from template (missing: {0})" -f `
+            Write-Host ("smtp.json missing template field(s): {0}" -f `
                     ($(if ($smtpDiff.AddedKeys.Count -gt 0) {
                         $smtpDiff.AddedKeys -join ', '
-                    } else { 'n/a' })))
+                    } else { '(entire file)' })))
         }
         else {
-            Write-Host 'smtp.json: no new template fields.'
+            Write-Host 'smtp.json: already has all template fields (merge still runs; idempotent).'
         }
 
-        if ($needsMerge) {
-            Write-Host 'Merging missing template fields into installed configs...' `
-                -ForegroundColor Cyan
-            Merge-InstalledConfigFilesFromRepo `
-                -ClonePath $templateRootResolved `
-                -AdminAppDirectory $adminAppDirectory `
-                -ConfigPath $destConfig `
-                -Config $configForMerge
-        }
-        else {
-            Write-Host 'Installed configs already include all template fields; no merge needed.'
-        }
+        # Always merge from the same sourceRoot used for publish. Do not skip
+        # when a stale UpdateClonePath template previously looked complete.
+        Write-Host ("Merging template fields from '{0}' into installed configs..." -f `
+                $sourceRoot) -ForegroundColor Cyan
+        Merge-InstalledConfigFilesFromRepo `
+            -ClonePath $sourceRoot `
+            -AdminAppDirectory $adminAppDirectory `
+            -ConfigPath $destConfig `
+            -Config $configForMerge `
+            -ThrowOnError
     }
     else {
         Write-Host 'Skipping config compare/merge (-SkipConfigMerge).'
