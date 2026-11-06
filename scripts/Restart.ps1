@@ -2,22 +2,25 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Restarts only the LoginTimeLogger monitor scheduled task.
+  Publishes monitor files (optional) and restarts the LoginTimeLogger task.
 .DESCRIPTION
-  Compares repo template config files to the installed runtime configs and
-  merges any missing fields (existing values unchanged), then stops and
-  starts the LoginTimeLogger task. Does not reinstall Program Files, pull
-  git, or touch the lock-signal task.
+  By default copies src/scripts from the template checkout into
+  Program Files\LoginTimeLogger (same as self-update publish), merges any
+  missing config fields, then stops and starts the LoginTimeLogger task.
+  Use this after git pull when self-update is stuck. Does not git pull and
+  does not touch the lock-signal task.
 .PARAMETER TaskName
   Scheduled task name (default LoginTimeLogger).
 .PARAMETER ConfigPath
   Runtime config JSON. Default: path from the LoginTimeLogger task -ConfigPath
   argument, then %USERPROFILE%\LoginTimeLogger\config.json.
 .PARAMETER TemplateRoot
-  Directory that contains config\config.json and config\smtp.json (defaults to
+  Directory that contains config\config.json and src\ (defaults to
   UpdateClonePath from the runtime config when present, otherwise this repo).
 .PARAMETER SkipConfigMerge
-  Skip template compare/merge; only restart the task.
+  Skip template compare/merge.
+.PARAMETER SkipPublish
+  Skip copying files into Program Files; only merge/restart.
 .EXAMPLE
   .\scripts\Restart.ps1
 .EXAMPLE
@@ -28,7 +31,8 @@ param(
     [string]$TaskName = 'LoginTimeLogger',
     [string]$ConfigPath = '',
     [string]$TemplateRoot = '',
-    [switch]$SkipConfigMerge
+    [switch]$SkipConfigMerge,
+    [switch]$SkipPublish
 )
 
 Set-StrictMode -Version Latest
@@ -197,19 +201,60 @@ try {
     }
 
     $configForMerge = [pscustomobject]@{
-        AdminUsername          = $adminUsername
-        AdministratorProfile   = $adminProfile
-        ConfigPath             = $resolvedConfigPath
-        UpdateClonePath        = [string](Get-OptionalPropertyValue -InputObject $runtimeRaw -Name 'UpdateClonePath')
+        AdminUsername        = $adminUsername
+        AdministratorProfile = $adminProfile
+        ConfigPath           = $resolvedConfigPath
+        UpdateClonePath      = [string](Get-OptionalPropertyValue `
+                -InputObject $runtimeRaw -Name 'UpdateClonePath')
+    }
+
+    $templateRootResolved = Resolve-TemplateRoot `
+        -TemplateRoot $TemplateRoot `
+        -RepoRoot $repoRoot `
+        -RuntimeConfig $runtimeRaw
+    Write-Host ("Template root:  {0}" -f $templateRootResolved)
+
+    $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
+    if (-not $SkipPublish) {
+        $publishSrc = Join-Path $templateRootResolved 'src\LoginTimeLogger.ps1'
+        if (-not (Test-Path -LiteralPath $publishSrc)) {
+            throw ("Cannot publish: missing '{0}'." -f $publishSrc)
+        }
+        Write-Host ("Publishing Program Files from template into '{0}'..." -f $installRoot) `
+            -ForegroundColor Cyan
+        Publish-InstalledFilesFromRepo `
+            -ClonePath $templateRootResolved `
+            -InstallRoot $installRoot
+
+        # Record tip when possible so the next self-update is not confused.
+        $gitExe = $null
+        if (Get-Command Find-GitExecutable -ErrorAction SilentlyContinue) {
+            $gitExe = Find-GitExecutable
+        }
+        if ($gitExe -and (Test-Path -LiteralPath (Join-Path $templateRootResolved '.git'))) {
+            $head = Invoke-GitCommand -GitExe $gitExe -RepoPath $templateRootResolved `
+                -Arguments @('rev-parse', 'HEAD')
+            if ($head.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($head.Output)) {
+                Set-InstalledCommit -InstallRoot $installRoot -CommitSha $head.Output.Trim()
+                Write-Host ("installed-commit.txt <- {0}" -f $head.Output.Trim().ToLowerInvariant())
+            }
+        }
+
+        # Drop a stuck/corrupt update-state so the new monitor does not
+        # inherit a hammering NextUpdateCheckUtc=now death spiral.
+        $updateStatePath = Get-UpdateStatePath -AdminAppDirectory $adminAppDirectory
+        if (Test-Path -LiteralPath $updateStatePath) {
+            Write-Host ("Resetting update-state: {0}" -f $updateStatePath)
+        }
+        Write-UpdateState -Path $updateStatePath -State (New-UpdateStateObject `
+                -NextUpdateCheckUtc ([datetime]::UtcNow.AddMinutes(2).ToString('o')) `
+                -LastResult 'restart-published')
+    }
+    else {
+        Write-Host 'Skipping Program Files publish (-SkipPublish).'
     }
 
     if (-not $SkipConfigMerge) {
-        $templateRootResolved = Resolve-TemplateRoot `
-            -TemplateRoot $TemplateRoot `
-            -RepoRoot $repoRoot `
-            -RuntimeConfig $runtimeRaw
-        Write-Host ("Template root:  {0}" -f $templateRootResolved)
-
         $templateConfig = Join-Path $templateRootResolved 'config\config.json'
         $templateSmtp = Join-Path $templateRootResolved 'config\smtp.json'
         $destConfig = $resolvedConfigPath
@@ -220,31 +265,38 @@ try {
 
         $needsMerge = $false
         if ($configDiff.TemplateMissing) {
-            Write-Host ("WARNING: template missing: {0}" -f $templateConfig) -ForegroundColor Yellow
+            Write-Host ("WARNING: template missing: {0}" -f $templateConfig) `
+                -ForegroundColor Yellow
         }
         elseif ($configDiff.DestMissing -or $configDiff.AddedKeys.Count -gt 0) {
             $needsMerge = $true
             Write-Host ("config.json differs from template (missing: {0})" -f `
-                    ($(if ($configDiff.AddedKeys.Count -gt 0) { $configDiff.AddedKeys -join ', ' } else { 'n/a' })))
+                    ($(if ($configDiff.AddedKeys.Count -gt 0) {
+                        $configDiff.AddedKeys -join ', '
+                    } else { 'n/a' })))
         }
         else {
             Write-Host 'config.json: no new template fields.'
         }
 
         if ($smtpDiff.TemplateMissing) {
-            Write-Host ("WARNING: template missing: {0}" -f $templateSmtp) -ForegroundColor Yellow
+            Write-Host ("WARNING: template missing: {0}" -f $templateSmtp) `
+                -ForegroundColor Yellow
         }
         elseif ($smtpDiff.DestMissing -or $smtpDiff.AddedKeys.Count -gt 0) {
             $needsMerge = $true
             Write-Host ("smtp.json differs from template (missing: {0})" -f `
-                    ($(if ($smtpDiff.AddedKeys.Count -gt 0) { $smtpDiff.AddedKeys -join ', ' } else { 'n/a' })))
+                    ($(if ($smtpDiff.AddedKeys.Count -gt 0) {
+                        $smtpDiff.AddedKeys -join ', '
+                    } else { 'n/a' })))
         }
         else {
             Write-Host 'smtp.json: no new template fields.'
         }
 
         if ($needsMerge) {
-            Write-Host 'Merging missing template fields into installed configs...' -ForegroundColor Cyan
+            Write-Host 'Merging missing template fields into installed configs...' `
+                -ForegroundColor Cyan
             Merge-InstalledConfigFilesFromRepo `
                 -ClonePath $templateRootResolved `
                 -AdminAppDirectory $adminAppDirectory `

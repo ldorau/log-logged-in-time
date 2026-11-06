@@ -41,21 +41,6 @@ function Send-StatusSmtpFail {
     }
 }
 
-function Test-StatusHelperScriptCrash {
-    <#
-      Detect helper -Verify crashes (e.g. empty-string Mandatory Message)
-      so Status reports ERROR instead of a misleading firewall FAIL.
-    #>
-    param([AllowNull()][string]$CapturedOutput)
-    if ([string]::IsNullOrWhiteSpace($CapturedOutput)) {
-        return $false
-    }
-    return [bool]($CapturedOutput -match (
-        'ParameterArgumentValidationErrorEmptyStringNotAllowed|' +
-        'ParameterBindingValidationException|' +
-        'Cannot bind argument to parameter'))
-}
-
 function New-StatusVerifyAlertBody {
     <#
       Builds a diagnostic SMTP body for Status helper FAIL/ERROR (exit code,
@@ -122,11 +107,14 @@ function New-StatusVerifyAlertBody {
     if ($serviceLog) {
         try {
             $svcTail = @(Get-Content -LiteralPath $serviceLog -Tail 40 -ErrorAction Stop |
-                    Where-Object { $_ -match '\[(WARN|ERROR)\]|DNS-force|DoH|VPN|SCP-Allow|firewall|ServerDNS' })
+                    Where-Object {
+                        $_ -match '\[(WARN|ERROR)\]|SCP-Allow|firewall'
+                    })
             if ($svcTail.Count -gt 0) {
                 $lines.Add('')
                 $lines.Add(('--- service.log matches (tail filter; file={0}) ---' -f $serviceLog))
-                $lines.Add((Limit-TextForAlert -Text ($svcTail -join [Environment]::NewLine) -MaxChars 4000))
+                $lines.Add((Limit-TextForAlert -Text ($svcTail -join [Environment]::NewLine) `
+                            -MaxChars 4000))
             }
         }
         catch { }
@@ -202,7 +190,6 @@ try {
     $scpOnLockEnabled = $false
     $scpHost = ''
     $scpPort = 22
-    $serverDns = ''
 
     if (Test-Path -LiteralPath $configPath) {
         try {
@@ -225,10 +212,6 @@ try {
             $cfgLockSignal = Get-OptionalPropertyValue -InputObject $raw -Name 'LockSignalPath'
             if (-not [string]::IsNullOrWhiteSpace([string]$cfgLockSignal)) {
                 $lockSignalPath = [string]$cfgLockSignal
-            }
-            $cfgServerDns = Get-OptionalPropertyValue -InputObject $raw -Name 'ServerDNS'
-            if (-not [string]::IsNullOrWhiteSpace([string]$cfgServerDns)) {
-                $serverDns = [string]$cfgServerDns.Trim()
             }
             $cfgScpEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
             if ($null -ne $cfgScpEnabled) {
@@ -568,225 +551,9 @@ try {
         }
     }
 
-    # --- DoH / DNS-over-HTTPS verify (Block-DoH-Firewall.ps1 -Verify) ---
-    $dohCandidates = @(
-        (Join-Path $scriptDir 'Block-DoH-Firewall.ps1')
-        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Block-DoH-Firewall.ps1')
-    )
-    $dohScript = $dohCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $dohScript) {
-        Write-Host 'DNS-over-HTTP: SKIP (Block-DoH-Firewall.ps1 not found)' -ForegroundColor Yellow
-    }
-    else {
-        $dohProviders = Join-Path (Split-Path -Parent $dohScript) 'Block-DoH-Providers.json'
-        Write-Host 'Checking DNS-over-HTTP (DoH) block via Block-DoH-Firewall.ps1 -Verify (may take a minute)...' -ForegroundColor DarkGray
-        try {
-            # Omit -Quiet so FAIL emails include rule/connectivity diagnostics.
-            $dohScriptArgs = @('-Verify')
-            if (Test-Path -LiteralPath $dohProviders) {
-                $dohScriptArgs += @('-ProvidersPath', $dohProviders)
-            }
-
-            $dohResult = Invoke-WindowsPowerShellFile -ScriptPath $dohScript -ScriptArgument $dohScriptArgs -CaptureOutput
-            $dohExit = [int]$dohResult.ExitCode
-            $dohExtra = @{
-                ConfigPath = $configPath
-                IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-                    [Security.Principal.WindowsBuiltInRole]::Administrator)
-            }
-
-            if ($dohExit -eq 0) {
-                Write-Host 'DNS-over-HTTP: OK' -ForegroundColor Green
-            }
-            elseif ($dohExit -eq 2) {
-                Write-Host 'DNS-over-HTTP: INCONCLUSIVE (rules/tests did not confirm a block)' -ForegroundColor Yellow
-            }
-            elseif ($dohExit -eq -196608) {
-                $msg = 'DNS-over-HTTP: ERROR (helper failed to start)'
-                Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $dohExit -ScriptPath $dohScript)) `
-                    -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dohExit `
-                    -ScriptPath $dohScript -ProvidersPath $dohProviders `
-                    -CapturedOutput $dohResult.Output -LogDirectory $logDirectory -Extra $dohExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $body `
-                    -AlertKey 'status-doh-error'
-            }
-            elseif (Test-StatusHelperScriptCrash -CapturedOutput $dohResult.Output) {
-                $msg = 'DNS-over-HTTP: ERROR (helper script crashed during -Verify)'
-                Write-Host $msg -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dohExit `
-                    -ScriptPath $dohScript -ProvidersPath $dohProviders `
-                    -CapturedOutput $dohResult.Output -LogDirectory $logDirectory -Extra $dohExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $body `
-                    -AlertKey 'status-doh-error'
-            }
-            else {
-                $msg = 'DNS-over-HTTP: FAIL (reachable endpoints or missing/mismatched firewall rules)'
-                Write-Host $msg -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dohExit `
-                    -ScriptPath $dohScript -ProvidersPath $dohProviders `
-                    -CapturedOutput $dohResult.Output -LogDirectory $logDirectory -Extra $dohExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $body `
-                    -AlertKey 'status-doh-fail'
-            }
-        }
-        catch {
-            Write-Host ("DNS-over-HTTP: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
-            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
-                "DoH verify failed; script='{0}'" -f $dohScript)
-            $body = New-StatusVerifyAlertBody -Summary 'DNS-over-HTTP: ERROR' -ScriptPath $dohScript `
-                -ProvidersPath $dohProviders -ExceptionText ("{0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) `
-                -LogDirectory $logDirectory -Extra @{ ConfigPath = $configPath }
-            Send-StatusSmtpFail -Subject 'Status FAIL: DNS-over-HTTP' -Body $body -AlertKey 'status-doh-error'
-        }
-    }
-
-    # --- VPN block verify (Block-Vpn-Firewall.ps1 -Verify) ---
-    $vpnCandidates = @(
-        (Join-Path $scriptDir 'Block-Vpn-Firewall.ps1')
-        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Block-Vpn-Firewall.ps1')
-    )
-    $vpnScript = $vpnCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $vpnScript) {
-        Write-Host 'VPN-Block: SKIP (Block-Vpn-Firewall.ps1 not found)' -ForegroundColor Yellow
-    }
-    else {
-        $vpnProviders = Join-Path (Split-Path -Parent $vpnScript) 'Block-Vpn-Providers.json'
-        Write-Host 'Checking VPN block via Block-Vpn-Firewall.ps1 -Verify (may take a minute)...' -ForegroundColor DarkGray
-        try {
-            $vpnScriptArgs = @('-Verify')
-            if (Test-Path -LiteralPath $vpnProviders) {
-                $vpnScriptArgs += @('-ProvidersPath', $vpnProviders)
-            }
-
-            $vpnResult = Invoke-WindowsPowerShellFile -ScriptPath $vpnScript -ScriptArgument $vpnScriptArgs -CaptureOutput
-            $vpnExit = [int]$vpnResult.ExitCode
-            $vpnExtra = @{
-                ConfigPath = $configPath
-                IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-                    [Security.Principal.WindowsBuiltInRole]::Administrator)
-            }
-
-            if ($vpnExit -eq 0) {
-                Write-Host 'VPN-Block: OK' -ForegroundColor Green
-            }
-            elseif ($vpnExit -eq 2) {
-                Write-Host 'VPN-Block: INCONCLUSIVE (rules/tests did not confirm a block)' -ForegroundColor Yellow
-            }
-            elseif ($vpnExit -eq -196608) {
-                $msg = 'VPN-Block: ERROR (helper failed to start)'
-                Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $vpnExit -ScriptPath $vpnScript)) `
-                    -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $vpnExit `
-                    -ScriptPath $vpnScript -ProvidersPath $vpnProviders `
-                    -CapturedOutput $vpnResult.Output -LogDirectory $logDirectory -Extra $vpnExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $body `
-                    -AlertKey 'status-vpn-error'
-            }
-            elseif (Test-StatusHelperScriptCrash -CapturedOutput $vpnResult.Output) {
-                $msg = 'VPN-Block: ERROR (helper script crashed during -Verify)'
-                Write-Host $msg -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $vpnExit `
-                    -ScriptPath $vpnScript -ProvidersPath $vpnProviders `
-                    -CapturedOutput $vpnResult.Output -LogDirectory $logDirectory -Extra $vpnExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $body `
-                    -AlertKey 'status-vpn-error'
-            }
-            else {
-                $msg = 'VPN-Block: FAIL (reachable endpoints or missing/mismatched firewall rules)'
-                Write-Host $msg -ForegroundColor Red
-                $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $vpnExit `
-                    -ScriptPath $vpnScript -ProvidersPath $vpnProviders `
-                    -CapturedOutput $vpnResult.Output -LogDirectory $logDirectory -Extra $vpnExtra
-                Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $body `
-                    -AlertKey 'status-vpn-fail'
-            }
-        }
-        catch {
-            Write-Host ("VPN-Block: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
-            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
-                "VPN verify failed; script='{0}'" -f $vpnScript)
-            $body = New-StatusVerifyAlertBody -Summary 'VPN-Block: ERROR' -ScriptPath $vpnScript `
-                -ProvidersPath $vpnProviders -ExceptionText ("{0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) `
-                -LogDirectory $logDirectory -Extra @{ ConfigPath = $configPath }
-            Send-StatusSmtpFail -Subject 'Status FAIL: VPN-Block' -Body $body -AlertKey 'status-vpn-error'
-        }
-    }
-
-    # --- Local DNS force verify (Force-DnsToLocalResolver.ps1 -Verify) ---
-    if ([string]::IsNullOrWhiteSpace($serverDns)) {
-        $skipMsg = 'DNS-Force: SKIP (ServerDNS empty in config)'
-        Write-Host $skipMsg -ForegroundColor DarkGray
-        Send-StatusSmtpFail -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'status-dns-force-skip'
-    }
-    else {
-        $dnsForceCandidates = @(
-            (Join-Path $scriptDir 'Force-DnsToLocalResolver.ps1')
-            (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Force-DnsToLocalResolver.ps1')
-        )
-        $dnsForceScript = $dnsForceCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-        if (-not $dnsForceScript) {
-            $skipMsg = 'DNS-Force: SKIP (Force-DnsToLocalResolver.ps1 not found)'
-            Write-Host $skipMsg -ForegroundColor Yellow
-            Send-StatusSmtpFail -Subject 'DNS-force skipped' -Body $skipMsg -AlertKey 'status-dns-force-skip-script'
-        }
-        else {
-            Write-Host ("Checking DNS-Force (local resolver {0}) via Force-DnsToLocalResolver.ps1 -Verify..." -f $serverDns) -ForegroundColor DarkGray
-            try {
-                $dnsForceScriptArgs = @('-DnsServer', $serverDns, '-Verify')
-                $dnsForceResult = Invoke-WindowsPowerShellFile -ScriptPath $dnsForceScript `
-                    -ScriptArgument $dnsForceScriptArgs -CaptureOutput
-                $dnsForceExit = [int]$dnsForceResult.ExitCode
-                $dnsForceExtra = @{
-                    ConfigPath = $configPath
-                    ServerDNS  = $serverDns
-                    IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-                        [Security.Principal.WindowsBuiltInRole]::Administrator)
-                }
-
-                if ($dnsForceExit -eq 0) {
-                    Write-Host 'DNS-Force: OK' -ForegroundColor Green
-                }
-                elseif ($dnsForceExit -eq -196608) {
-                    $msg = 'DNS-Force: ERROR (helper failed to start)'
-                    Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $dnsForceExit `
-                                -ScriptPath $dnsForceScript)) -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dnsForceExit `
-                        -ScriptPath $dnsForceScript -CapturedOutput $dnsForceResult.Output `
-                        -LogDirectory $logDirectory -Extra $dnsForceExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $body `
-                        -AlertKey 'status-dns-force-error'
-                }
-                elseif (Test-StatusHelperScriptCrash -CapturedOutput $dnsForceResult.Output) {
-                    $msg = 'DNS-Force: ERROR (helper script crashed during -Verify)'
-                    Write-Host $msg -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dnsForceExit `
-                        -ScriptPath $dnsForceScript -CapturedOutput $dnsForceResult.Output `
-                        -LogDirectory $logDirectory -Extra $dnsForceExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $body `
-                        -AlertKey 'status-dns-force-error'
-                }
-                else {
-                    $msg = 'DNS-Force: FAIL (adapter DNS or firewall rules not forcing the LAN resolver)'
-                    Write-Host $msg -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $dnsForceExit `
-                        -ScriptPath $dnsForceScript -CapturedOutput $dnsForceResult.Output `
-                        -LogDirectory $logDirectory -Extra $dnsForceExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $body `
-                        -AlertKey 'status-dns-force-fail'
-                }
-            }
-            catch {
-                Write-Host ("DNS-Force: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
-                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
-                    "DNS-Force verify failed; script='{0}'" -f $dnsForceScript)
-                $body = New-StatusVerifyAlertBody -Summary 'DNS-Force: ERROR' -ScriptPath $dnsForceScript `
-                    -ExceptionText ("{0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) `
-                    -LogDirectory $logDirectory -Extra @{ ConfigPath = $configPath; ServerDNS = $serverDns }
-                Send-StatusSmtpFail -Subject 'Status FAIL: DNS-Force' -Body $body -AlertKey 'status-dns-force-error'
-            }
-        }
-    }
+    # DoH / VPN / DNS-Force -Verify is intentionally not run from Status
+    # (slow, noisy SMTP). Run those helpers manually when needed.
+    # SCP-Allow -Verify remains below (fast rule check).
 
     # --- SCP outbound allow verify (Allow-ScpOutboundFirewall.ps1 -Verify) ---
     if (-not $scpOnLockEnabled -or [string]::IsNullOrWhiteSpace($scpHost)) {
