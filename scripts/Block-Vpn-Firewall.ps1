@@ -93,7 +93,11 @@ if ($Remove -and $Verify) {
 
 function Write-VpnHost {
     param(
-        [Parameter(Mandatory)][string]$Message,
+        # Blank lines are intentional in -Verify output; Mandatory alone
+        # rejects '' (ParameterArgumentValidationErrorEmptyStringNotAllowed).
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Message,
         [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray,
         [switch]$Force
     )

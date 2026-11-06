@@ -115,7 +115,11 @@ if (-not $Remove) {
 
 function Write-DnsForceHost {
     param(
-        [Parameter(Mandatory)][string]$Message,
+        # Blank lines are intentional in -Verify output; Mandatory alone
+        # rejects '' (ParameterArgumentValidationErrorEmptyStringNotAllowed).
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Message,
         [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
     )
     if ($Quiet) {
