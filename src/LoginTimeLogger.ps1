@@ -756,19 +756,24 @@ while ($true) {
             if ($config.UnlockQuotaEnabled -and [int]$config.UnlockQuotaMinutes -gt 0) {
                 $quotaSeconds = [double]([int]$config.UnlockQuotaMinutes * 60)
                 $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
-                while ($newBucket -gt [int]$state.LastUnlockQuotaBucket) {
-                    $state.LastUnlockQuotaBucket = [int]$state.LastUnlockQuotaBucket + 1
-                    Write-State -Path $statePath -State $state
+                # At most one warning/lock per poll. Catch up the bucket only after a
+                # successful in-session launch (avoids parallel dialogs after sleep and
+                # retries when CreateProcessAsUser fails).
+                if ($newBucket -gt [int]$state.LastUnlockQuotaBucket) {
                     $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+                    $launched = $false
                     try {
-                        $null = Invoke-UnlockQuotaWarningAndLock -Config $config -WarningScriptPath $warnScript
+                        $launched = [bool](Invoke-UnlockQuotaWarningAndLock -Config $config -WarningScriptPath $warnScript)
                     }
                     catch {
+                        $launched = $false
                         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UnlockQuota' -Context (
                             'Unlock-quota warning/lock launch failed')
                     }
-                    # Re-evaluate in case multiple buckets were crossed in one poll.
-                    $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
+                    if ($launched) {
+                        $state.LastUnlockQuotaBucket = $newBucket
+                        Write-State -Path $statePath -State $state
+                    }
                 }
             }
         }

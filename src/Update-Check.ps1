@@ -511,6 +511,68 @@ function Merge-JsonConfigPreserveExisting {
     return $result
 }
 
+function Set-AdminSystemOnlyFileAcl {
+    <#
+      Admin + SYSTEM full control only (no inherited target/Users read).
+      Used after rewriting smtp.json during self-update merges.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$AllowedAdminSid
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Cannot ACL missing file: $Path"
+    }
+
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $null = $acl.RemoveAccessRule($rule)
+    }
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $AllowedAdminSid, 'FullControl', 'None', 'None', 'Allow')))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sidSystem, 'FullControl', 'None', 'None', 'Allow')))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Write-JsonFilePreserveAcl {
+    param(
+        [Parameter(Mandatory)][string]$DestPath,
+        [Parameter(Mandatory)][string]$JsonText,
+        [System.Security.Principal.SecurityIdentifier]$AdminOnlySid = $null
+    )
+
+    $priorAcl = $null
+    $destExisted = Test-Path -LiteralPath $DestPath
+    if ($destExisted) {
+        try {
+            $priorAcl = Get-Acl -LiteralPath $DestPath
+        }
+        catch {
+            $priorAcl = $null
+        }
+    }
+
+    $destDir = Split-Path -Parent $DestPath
+    if (-not [string]::IsNullOrWhiteSpace($destDir) -and -not (Test-Path -LiteralPath $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+
+    $tempPath = "$DestPath.tmp"
+    Set-Content -LiteralPath $tempPath -Value $JsonText -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $DestPath -Force
+
+    if ($null -ne $AdminOnlySid) {
+        Set-AdminSystemOnlyFileAcl -Path $DestPath -AllowedAdminSid $AdminOnlySid
+    }
+    elseif ($null -ne $priorAcl) {
+        Set-Acl -LiteralPath $DestPath -AclObject $priorAcl
+    }
+}
+
 function Merge-InstalledJsonConfigFile {
     <#
       Merges new fields from a repo template JSON into an installed config file.
@@ -520,7 +582,9 @@ function Merge-InstalledJsonConfigFile {
     param(
         [Parameter(Mandatory)][string]$TemplatePath,
         [Parameter(Mandatory)][string]$DestPath,
-        [string]$Label = 'config'
+        [string]$Label = 'config',
+        [System.Security.Principal.SecurityIdentifier]$AdminOnlySid = $null,
+        [switch]$OptInUnlockQuotaOnExisting
     )
 
     if (-not (Test-Path -LiteralPath $TemplatePath)) {
@@ -542,11 +606,7 @@ function Merge-InstalledJsonConfigFile {
     }
 
     if (-not (Test-Path -LiteralPath $DestPath)) {
-        $destDir = Split-Path -Parent $DestPath
-        if (-not [string]::IsNullOrWhiteSpace($destDir) -and -not (Test-Path -LiteralPath $destDir)) {
-            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-        }
-        Set-Content -LiteralPath $DestPath -Value $templateRaw -Encoding UTF8
+        Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $templateRaw -AdminOnlySid $AdminOnlySid
         Write-LoggerEvent ("Config merge ({0}): created missing file from template: {1}" -f $Label, $DestPath)
         return $true
     }
@@ -573,10 +633,15 @@ function Merge-InstalledJsonConfigFile {
         return $false
     }
 
+    # Existing installs must opt in to unlock-quota locking; do not force-enable via merge.
+    if ($OptInUnlockQuotaOnExisting -and ($addedKeys -contains 'UnlockQuotaEnabled')) {
+        $merged['UnlockQuotaEnabled'] = $false
+        Write-LoggerEvent (
+            "Config merge ({0}): UnlockQuotaEnabled set to false for existing install (opt-in)." -f $Label)
+    }
+
     $json = $merged | ConvertTo-Json -Depth 12
-    $tempPath = "$DestPath.tmp"
-    Set-Content -LiteralPath $tempPath -Value $json -Encoding UTF8
-    Move-Item -LiteralPath $tempPath -Destination $DestPath -Force
+    Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $json -AdminOnlySid $AdminOnlySid
     Write-LoggerEvent ("Config merge ({0}): added field(s) {1} to {2}." -f `
             $Label, ($addedKeys -join ', '), $DestPath)
     return $true
@@ -590,7 +655,8 @@ function Merge-InstalledConfigFilesFromRepo {
     param(
         [Parameter(Mandatory)][string]$ClonePath,
         [Parameter(Mandatory)][string]$AdminAppDirectory,
-        [string]$ConfigPath = ''
+        [string]$ConfigPath = '',
+        $Config = $null
     )
 
     $templateConfig = Join-Path $ClonePath 'config\config.json'
@@ -602,11 +668,31 @@ function Merge-InstalledConfigFilesFromRepo {
     }
     $destSmtp = Join-Path $AdminAppDirectory 'smtp.json'
 
+    $adminOnlySid = $null
+    if ($null -ne $Config) {
+        try {
+            $adminUser = [string](Get-OptionalPropertyValue -InputObject $Config -Name 'AdminUsername')
+            $adminProfile = [string](Get-OptionalPropertyValue -InputObject $Config -Name 'AdministratorProfile')
+            if (-not [string]::IsNullOrWhiteSpace($adminUser)) {
+                $adminOnlySid = Resolve-WindowsAccountSid -UserName $adminUser -ProfilePath $adminProfile
+            }
+            if ($null -eq $adminOnlySid -and -not [string]::IsNullOrWhiteSpace($adminProfile)) {
+                $adminOnlySid = Resolve-WindowsAccountSid -UserName $adminProfile -ProfilePath $adminProfile
+            }
+        }
+        catch {
+            $adminOnlySid = $null
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+                'Could not resolve admin SID for smtp.json ACL after config merge')
+        }
+    }
+
     try {
         $null = Merge-InstalledJsonConfigFile `
             -TemplatePath $templateConfig `
             -DestPath $destConfig `
-            -Label 'config.json'
+            -Label 'config.json' `
+            -OptInUnlockQuotaOnExisting
     }
     catch {
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
@@ -617,7 +703,8 @@ function Merge-InstalledConfigFilesFromRepo {
         $null = Merge-InstalledJsonConfigFile `
             -TemplatePath $templateSmtp `
             -DestPath $destSmtp `
-            -Label 'smtp.json'
+            -Label 'smtp.json' `
+            -AdminOnlySid $adminOnlySid
     }
     catch {
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
@@ -1175,7 +1262,8 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Merge-InstalledConfigFilesFromRepo `
             -ClonePath $Config.UpdateClonePath `
             -AdminAppDirectory $AdminAppDirectory `
-            -ConfigPath ([string]$Config.ConfigPath)
+            -ConfigPath ([string]$Config.ConfigPath) `
+            -Config $Config
         try {
             Update-LockSignalHiddenLauncherFromConfig -Config $Config -InstallRoot $InstallRoot
         }

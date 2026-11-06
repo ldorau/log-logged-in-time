@@ -53,11 +53,13 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 
 **On by default** (`UpdateEnabled: true`). Once per day the monitor compares the installed commit to the latest `main` tip on the allowlisted GitHub repo (`https://github.com/ldorau/log-logged-in-time.git` only). If they differ, it syncs the clone, refreshes Program Files, and restarts via the scheduled task. Offline checks retry every 10 minutes. Git for Windows is installed (Authenticode-verified) when updates are enabled. Set `UpdateEnabled: false` to disable.
 
-After publishing updated files, self-update also merges **new** fields from the repo templates (`config/config.json`, `config/smtp.json`) into the installed `<AdministratorProfile>\LoginTimeLogger\config.json` and `smtp.json`. Existing values are left unchanged; only missing keys (and nested missing keys) are added with template defaults.
+After publishing updated files, self-update also merges **new** fields from the repo templates (`config/config.json`, `config/smtp.json`) into the installed `<AdministratorProfile>\LoginTimeLogger\config.json` and `smtp.json`. Existing values are left unchanged; only missing keys (and nested missing keys) are added with template defaults. Rewrites preserve the previous file ACL; `smtp.json` is re-protected to admin + `SYSTEM` only.
 
 ### Unlock-time quota warning + lock
 
-**On by default** (`UnlockQuotaEnabled: true`). Each time the target accumulates another `UnlockQuotaMinutes` (default **30**) of unlocked time for the day, the monitor launches a **blocking** topmost countdown window **in that user’s session** for `UnlockQuotaWarnSeconds` (default **3**), then calls `LockWorkStation` from a process created in the same session (`CreateProcessAsUser` / WTS user token). That is a real screen lock for the target user—not a SYSTEM-session lock. Set `UnlockQuotaEnabled: false` to disable.
+**On by default for new installs** (`UnlockQuotaEnabled: true`). Each time the target accumulates another `UnlockQuotaMinutes` (default **30**) of unlocked time for the day, the monitor launches a **blocking** topmost countdown window **in that user’s session** for `UnlockQuotaWarnSeconds` (default **3**), then calls `LockWorkStation` from a process created in the same session (`CreateProcessAsUser` / WTS user token). That is a real screen lock for the target user—not a SYSTEM-session lock. Set `UnlockQuotaEnabled: false` to disable.
+
+Existing installs that receive `UnlockQuota*` via self-update merge get `UnlockQuotaEnabled: false` (opt-in); set it to `true` in the runtime config to enable.
 
 ### SCP on lock
 

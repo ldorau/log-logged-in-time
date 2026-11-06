@@ -178,36 +178,43 @@ function Get-ScpConfigObject {
     param([Parameter(Mandatory)][string]$Path)
 
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    $adminProfile = [string]$raw.AdministratorProfile
+    $adminProfile = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile')
     if ([string]::IsNullOrWhiteSpace($adminProfile)) {
         $adminProfile = $env:USERPROFILE
     }
 
-    $identity = [string]$raw.ScpIdentityFile
+    $identity = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile')
     if ([string]::IsNullOrWhiteSpace($identity)) {
         $identity = Join-Path $adminProfile 'LoginTimeLogger\ssh\id_ed25519'
     }
-    $knownHosts = [string]$raw.ScpKnownHostsFile
+    $knownHosts = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpKnownHostsFile')
     if ([string]::IsNullOrWhiteSpace($knownHosts)) {
         $knownHosts = Join-Path $adminProfile 'LoginTimeLogger\ssh\known_hosts'
     }
 
-    $logDirectory = [string]$raw.LogDirectory
+    $logDirectory = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory')
     if ([string]::IsNullOrWhiteSpace($logDirectory)) {
         $logDirectory = Join-Path $adminProfile 'LoginTimeLogs'
     }
 
     $port = 22
-    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
-        $port = [int]$raw.ScpPort
+    $cfgPort = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpPort'
+    if ($null -ne $cfgPort -and [int]$cfgPort -gt 0) {
+        $port = [int]$cfgPort
+    }
+
+    $scpEnabled = $false
+    $cfgScpEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
+    if ($null -ne $cfgScpEnabled) {
+        $scpEnabled = [bool]$cfgScpEnabled
     }
 
     return [pscustomobject]@{
         ConfigPath           = $Path
-        ScpOnLockEnabled     = [bool]$raw.ScpOnLockEnabled
-        ScpHost              = [string]$raw.ScpHost
-        ScpUser              = [string]$raw.ScpUser
-        ScpRemoteDirectory   = [string]$raw.ScpRemoteDirectory
+        ScpOnLockEnabled     = $scpEnabled
+        ScpHost              = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost')
+        ScpUser              = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser')
+        ScpRemoteDirectory   = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpRemoteDirectory')
         ScpPort              = $port
         ScpIdentityFile      = $identity
         ScpKnownHostsFile    = $knownHosts
