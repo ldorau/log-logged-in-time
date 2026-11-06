@@ -183,11 +183,121 @@ function Test-ScpOnLockConfigured {
     return $true
 }
 
+function Get-ScpOnLockMissingConfigFields {
+    param([Parameter(Mandatory)]$Config)
+
+    $missing = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) { $missing.Add('ScpHost') }
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpUser)) { $missing.Add('ScpUser') }
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpRemoteDirectory)) { $missing.Add('ScpRemoteDirectory') }
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpIdentityFile)) { $missing.Add('ScpIdentityFile') }
+    return @($missing)
+}
+
+function Get-ScpOnLockSourceFiles {
+    <#
+      Collects log files for SCP-on-lock: today's time log, errors.log, and every
+      *.log / *.csv / state.json under LogDirectory (deduped).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$TimeLogPath = '',
+        [string]$ErrorLogPath = ''
+    )
+
+    $files = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    $addFile = {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return
+        }
+        try {
+            $full = [System.IO.Path]::GetFullPath($Path)
+        }
+        catch {
+            $full = $Path
+        }
+        $key = $full.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            return
+        }
+        $seen[$key] = $true
+        $files.Add($full)
+    }
+
+    & $addFile $TimeLogPath
+    & $addFile $ErrorLogPath
+
+    $logDir = ''
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        $logDir = [string]$Config.LogDirectory
+    }
+    if (-not [string]::IsNullOrWhiteSpace($logDir) -and (Test-Path -LiteralPath $logDir)) {
+        Get-ChildItem -LiteralPath $logDir -File -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'state.json' -or
+                $_.Extension -eq '.log' -or
+                $_.Extension -eq '.csv'
+            } |
+            ForEach-Object { & $addFile $_.FullName }
+    }
+
+    return @($files)
+}
+
+function Send-ScpOnLockFailureAlert {
+    <#
+      Emails an SCP-on-lock failure with local error/service logs attached (when SMTP enabled).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)]$Config,
+        [string]$ErrorLogPath = '',
+        [string[]]$ExtraAttachment = @()
+    )
+
+    if (-not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $attachments = New-Object System.Collections.Generic.List[string]
+    $add = {
+        param([string]$Path)
+        if (-not [string]::IsNullOrWhiteSpace($Path) -and (Test-Path -LiteralPath $Path)) {
+            $attachments.Add($Path)
+        }
+    }
+
+    & $add $ErrorLogPath
+    if (Get-Command Get-ErrorLogPath -ErrorAction SilentlyContinue) {
+        try { & $add (Get-ErrorLogPath) } catch { }
+    }
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        & $add (Join-Path ([string]$Config.LogDirectory) 'service.log')
+    }
+    foreach ($extra in @($ExtraAttachment)) {
+        & $add $extra
+    }
+
+    return (Send-LoginTimeSmtpAlert `
+            -Subject 'SCP on lock failed' `
+            -Body $Body `
+            -AlertKey 'scp-on-lock-failed' `
+            -Attachment @($attachments))
+}
+
 function Invoke-ScpLogCopyOnLock {
     <#
     .SYNOPSIS
-      Copies the daily time log and error log to the configured remote via scp.
-      Failures are logged; they do not stop the monitor.
+      Copies LoginTimeLogger logs to the configured remote via scp on screen lock.
+      Includes today's time log, errors.log, service.log, summary CSV, state.json,
+      and any other *.log/*.csv under LogDirectory. Failures are logged; they do
+      not stop the monitor. Failed copies also email with error logs attached when SMTP is enabled.
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -195,7 +305,14 @@ function Invoke-ScpLogCopyOnLock {
         [Parameter(Mandatory)][string]$ErrorLogPath
     )
 
+    if (-not $Config.ScpOnLockEnabled) {
+        return
+    }
     if (-not (Test-ScpOnLockConfigured -Config $Config)) {
+        $missing = Get-ScpOnLockMissingConfigFields -Config $Config
+        Write-LoggerEvent -Level ERROR -Message (
+            ("SCP on lock skipped: ScpOnLockEnabled=true but config incomplete (missing: {0})." -f `
+                (($missing -join ', '))))
         return
     }
 
@@ -211,65 +328,70 @@ function Invoke-ScpLogCopyOnLock {
             return
         }
 
-        $files = New-Object System.Collections.Generic.List[string]
-        if (Test-Path -LiteralPath $TimeLogPath) {
-            $files.Add($TimeLogPath)
-        }
-        else {
-            Write-LoggerEvent -Level WARN -Message ("SCP on lock: time log not found yet: {0}" -f $TimeLogPath)
-        }
-        if (Test-Path -LiteralPath $ErrorLogPath) {
-            $files.Add($ErrorLogPath)
-        }
-        else {
-            Write-LoggerEvent -Level WARN -Message ("SCP on lock: error log not found yet: {0}" -f $ErrorLogPath)
-        }
+        $files = @(Get-ScpOnLockSourceFiles -Config $Config -TimeLogPath $TimeLogPath -ErrorLogPath $ErrorLogPath)
         if ($files.Count -eq 0) {
-            Write-LoggerEvent -Level WARN -Message 'SCP on lock skipped: neither time log nor error log exists.'
+            Write-LoggerEvent -Level WARN -Message (
+                ("SCP on lock skipped: no log files found (TimeLog='{0}'; ErrorLog='{1}'; LogDirectory='{2}')." -f `
+                    $TimeLogPath, $ErrorLogPath, $Config.LogDirectory))
             return
         }
 
-        $remoteDir = [string]$Config.ScpRemoteDirectory
+        $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim()
         if (-not $remoteDir.EndsWith('/')) {
             $remoteDir = $remoteDir + '/'
         }
-        $remoteTarget = '{0}@{1}:{2}' -f $Config.ScpUser, $Config.ScpHost, $remoteDir
+        $scpHost = ([string]$Config.ScpHost).Trim()
+        $scpUser = ([string]$Config.ScpUser).Trim()
+        $remoteTarget = '{0}@{1}:{2}' -f $scpUser, $scpHost, $remoteDir
 
         $port = 22
         if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
             $port = [int]$Config.ScpPort
         }
 
-        $args = New-Object System.Collections.Generic.List[string]
-        $args.Add('-i')
-        $args.Add($Config.ScpIdentityFile)
-        $args.Add('-P')
-        $args.Add("$port")
-        $args.Add('-o')
-        $args.Add('BatchMode=yes')
-        $args.Add('-o')
-        $args.Add('IdentitiesOnly=yes')
-        $args.Add('-o')
-        $args.Add('PreferredAuthentications=publickey')
-        $args.Add('-o')
-        $args.Add('StrictHostKeyChecking=accept-new')
+        # Do not name this $args (PowerShell automatic variable).
+        $scpArgList = New-Object System.Collections.Generic.List[string]
+        $scpArgList.Add('-i')
+        $scpArgList.Add(([string]$Config.ScpIdentityFile).Trim())
+        $scpArgList.Add('-P')
+        $scpArgList.Add("$port")
+        $scpArgList.Add('-o')
+        $scpArgList.Add('BatchMode=yes')
+        $scpArgList.Add('-o')
+        $scpArgList.Add('IdentitiesOnly=yes')
+        $scpArgList.Add('-o')
+        $scpArgList.Add('PreferredAuthentications=publickey')
+        $scpArgList.Add('-o')
+        $scpArgList.Add('StrictHostKeyChecking=accept-new')
         if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpKnownHostsFile)) {
-            $args.Add('-o')
-            $args.Add(('UserKnownHostsFile={0}' -f $Config.ScpKnownHostsFile))
+            $scpArgList.Add('-o')
+            $scpArgList.Add(('UserKnownHostsFile={0}' -f ([string]$Config.ScpKnownHostsFile).Trim()))
         }
-        $args.Add('-o')
-        $args.Add('ConnectTimeout=15')
+        $scpArgList.Add('-o')
+        $scpArgList.Add('ConnectTimeout=20')
         foreach ($f in $files) {
-            $args.Add($f)
+            $scpArgList.Add($f)
         }
-        $args.Add($remoteTarget)
+        $scpArgList.Add($remoteTarget)
 
-        Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1}" -f $files.Count, $remoteTarget)
+        Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1}: {2}" -f `
+                $files.Count, $remoteTarget, ($files -join '; '))
 
         $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.out' -f [guid]::NewGuid().ToString('N'))
         $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.err' -f [guid]::NewGuid().ToString('N'))
         try {
-            $proc = Start-Process -FilePath $scpExe -ArgumentList $args.ToArray() `
+            $argLine = $null
+            if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
+                $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
+            }
+            if ([string]::IsNullOrWhiteSpace($argLine)) {
+                # Fallback: still better than $args automatic-variable confusion.
+                $argLine = ($scpArgList | ForEach-Object {
+                        if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+                    }) -join ' '
+            }
+
+            $proc = Start-Process -FilePath $scpExe -ArgumentList $argLine `
                 -Wait -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput $outFile -RedirectStandardError $errFile
             $stdout = ''
@@ -280,29 +402,53 @@ function Invoke-ScpLogCopyOnLock {
             if (Test-Path -LiteralPath $errFile) {
                 $stderr = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
-            if ($proc.ExitCode -ne 0) {
-                $msg = ("SCP on lock failed (exit {0}). stderr={1} stdout={2}" -f `
-                        $proc.ExitCode, ("$stderr").Trim(), ("$stdout").Trim())
+            $exitCode = -1
+            if ($null -ne $proc) {
+                $exitCode = [int]$proc.ExitCode
+            }
+            if ($exitCode -ne 0) {
+                $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `
+                        $exitCode, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
                 if (Test-ScpAuthFailure -StdErr "$stderr") {
                     $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
                     if (-not [string]::IsNullOrWhiteSpace($pub)) {
                         $msg = $msg + ("`r`nRemote rejected public key auth. Append this line to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
-                                $Config.ScpUser, $pub)
+                                $scpUser, $pub)
                     }
                     else {
                         $msg = $msg + "`r`nRemote rejected public key auth; ensure ScpIdentityFile.pub is in remote authorized_keys."
                     }
                 }
-                Write-LoggerEvent -Level ERROR -Message $msg
+                # WARN: still records to errors.log / service.log, but avoids a second attachment-less SMTP from ERROR.
+                Write-LoggerEvent -Level WARN -Message $msg
+
+                $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    @(
+                        $msg
+                        ''
+                        '--- scp stderr ---'
+                        ("$stderr").Trim()
+                        ''
+                        '--- scp stdout ---'
+                        ("$stdout").Trim()
+                    ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                    $null = Send-ScpOnLockFailureAlert -Body $msg -Config $Config `
+                        -ErrorLogPath $ErrorLogPath -ExtraAttachment @($diagPath)
+                }
+                finally {
+                    Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                }
                 return
             }
-            Write-LoggerEvent ("SCP on lock succeeded: {0}" -f ($files -join ', '))
+            Write-LoggerEvent ("SCP on lock succeeded ({0} file(s)): {1}" -f $files.Count, ($files -join '; '))
         }
         finally {
             Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpOnLock' -Context 'SCP on lock failed'
+        $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpOnLock' -Context 'SCP on lock failed'
+        $null = Send-ScpOnLockFailureAlert -Body $details -Config $Config -ErrorLogPath $ErrorLogPath
     }
 }

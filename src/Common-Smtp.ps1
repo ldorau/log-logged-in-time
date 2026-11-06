@@ -199,6 +199,7 @@ function Set-SmtpAlertCooldownStamp {
 function Send-LoginTimeSmtpAlert {
     <#
       Sends an email when smtp.json is Enabled and complete.
+      Optional -Attachment paths are included when the files exist (size-capped).
       Failures are swallowed (logged to errors.log when possible) so alerts never stop the monitor.
     #>
     [CmdletBinding()]
@@ -206,7 +207,9 @@ function Send-LoginTimeSmtpAlert {
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
         [string]$AlertKey = '',
-        [string]$SmtpConfigPath = ''
+        [string]$SmtpConfigPath = '',
+        [string[]]$Attachment = @(),
+        [int]$MaxAttachmentBytes = 5242880
     )
 
     try {
@@ -239,7 +242,45 @@ function Send-LoginTimeSmtpAlert {
         $cred = New-Object System.Management.Automation.PSCredential ($cfg.Username, $secure)
 
         $computer = $env:COMPUTERNAME
-        $fullSubject = '[LoginTimeLogger] {0} ({1})' -f $Subject, $computer
+        $attachmentNotes = New-Object System.Collections.Generic.List[string]
+        $attachmentPaths = New-Object System.Collections.Generic.List[string]
+        $seenAttach = @{}
+        foreach ($candidate in @($Attachment)) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) {
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $candidate)) {
+                $attachmentNotes.Add(("missing: {0}" -f $candidate))
+                continue
+            }
+            try {
+                $full = [System.IO.Path]::GetFullPath($candidate)
+            }
+            catch {
+                $full = $candidate
+            }
+            $attachKey = $full.ToLowerInvariant()
+            if ($seenAttach.ContainsKey($attachKey)) {
+                continue
+            }
+            $seenAttach[$attachKey] = $true
+            $item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+            if (-not $item) {
+                $attachmentNotes.Add(("missing: {0}" -f $full))
+                continue
+            }
+            if ($item.PSIsContainer) {
+                $attachmentNotes.Add(("skipped (not a file): {0}" -f $full))
+                continue
+            }
+            if ($MaxAttachmentBytes -gt 0 -and $item.Length -gt $MaxAttachmentBytes) {
+                $attachmentNotes.Add(("skipped (too large {0} bytes): {1}" -f $item.Length, $full))
+                continue
+            }
+            $attachmentPaths.Add($full)
+            $attachmentNotes.Add(("attached: {0} ({1} bytes)" -f $full, $item.Length))
+        }
+
         $fullBody = @(
             $Body
             ''
@@ -247,18 +288,31 @@ function Send-LoginTimeSmtpAlert {
             ('User: {0}' -f $env:USERNAME)
             ('Utc: {0:o}' -f [datetime]::UtcNow)
             ('SmtpConfig: {0}' -f $cfg.ConfigPath)
-        ) -join [Environment]::NewLine
+        )
+        if ($attachmentNotes.Count -gt 0) {
+            $fullBody += ''
+            $fullBody += '--- attachments ---'
+            $fullBody += $attachmentNotes
+        }
+        $fullBodyText = $fullBody -join [Environment]::NewLine
+        $fullSubject = '[LoginTimeLogger] {0} ({1})' -f $Subject, $computer
 
-        Send-MailMessage `
-            -SmtpServer $cfg.SmtpHost `
-            -Port ([int]$cfg.SmtpPort) `
-            -UseSsl:$cfg.UseSsl `
-            -Credential $cred `
-            -From $cfg.From `
-            -To $cfg.To `
-            -Subject $fullSubject `
-            -Body $fullBody `
-            -ErrorAction Stop
+        $mailParams = @{
+            SmtpServer  = $cfg.SmtpHost
+            Port        = [int]$cfg.SmtpPort
+            UseSsl      = $cfg.UseSsl
+            Credential  = $cred
+            From        = $cfg.From
+            To          = $cfg.To
+            Subject     = $fullSubject
+            Body        = $fullBodyText
+            ErrorAction = 'Stop'
+        }
+        if ($attachmentPaths.Count -gt 0) {
+            $mailParams['Attachments'] = @($attachmentPaths)
+        }
+
+        Send-MailMessage @mailParams
 
         Set-SmtpAlertCooldownStamp -AlertKey $key
         return $true

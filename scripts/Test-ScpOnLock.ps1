@@ -305,21 +305,21 @@ function Invoke-ScpCopyForTest {
         $argList.Add(('UserKnownHostsFile={0}' -f $Config.ScpKnownHostsFile))
     }
     $argList.Add('-o')
-    $argList.Add('ConnectTimeout=15')
+    $argList.Add('ConnectTimeout=20')
     $argList.Add('-v')
     foreach ($f in $Files) {
         $argList.Add($f)
     }
     $argList.Add($remoteTarget)
 
+    $argLine = ConvertTo-StartProcessArgumentString -Argument $argList.ToArray()
     # Safe command preview: show identity path, not key contents.
-    $preview = @($scpExe) + @($argList | ForEach-Object { if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ } })
-    Write-ScpTestLine ("scp command: {0}" -f ($preview -join ' ')) -ForegroundColor DarkGray
+    Write-ScpTestLine ("scp command: {0} {1}" -f $scpExe, $argLine) -ForegroundColor DarkGray
 
     $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-test-{0}.out' -f [guid]::NewGuid().ToString('N'))
     $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-test-{0}.err' -f [guid]::NewGuid().ToString('N'))
     try {
-        $proc = Start-Process -FilePath $scpExe -ArgumentList $argList.ToArray() `
+        $proc = Start-Process -FilePath $scpExe -ArgumentList $argLine `
             -Wait -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $stdout = ''
@@ -336,7 +336,7 @@ function Invoke-ScpCopyForTest {
             ExitCode     = [int]$proc.ExitCode
             StdOut       = $stdout
             StdErr       = $stderr
-            ArgPreview   = ($preview -join ' ')
+            ArgPreview   = ("{0} {1}" -f $scpExe, $argLine)
         }
     }
     finally {
@@ -526,6 +526,7 @@ try {
         ScpPort            = $cfg.ScpPort
         ScpIdentityFile    = $cfg.ScpIdentityFile
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
+        LogDirectory       = $cfg.LogDirectory
     }
 
     Write-ScpTestLine ''
@@ -545,22 +546,12 @@ try {
     else {
         $todayLog = Join-Path $cfg.LogDirectory ('unlocked-time-{0:yyyy-MM-dd}.log' -f (Get-Date))
         $errorLog = Get-ErrorLogPath
-        if (Test-Path -LiteralPath $todayLog) {
-            $fileList.Add($todayLog)
-            Write-Check -Name 'Today time log' -Ok $true -Detail $todayLog
+        $selected = @(Get-ScpOnLockSourceFiles -Config $runtimeCfg -TimeLogPath $todayLog -ErrorLogPath $errorLog)
+        foreach ($f in $selected) {
+            $fileList.Add($f)
         }
-        else {
-            Write-Check -Name 'Today time log' -Ok $false -Detail ("missing: {0} (will use probe if nothing else)" -f $todayLog)
-        }
-        if ($errorLog -and (Test-Path -LiteralPath $errorLog)) {
-            $fileList.Add($errorLog)
-            Write-Check -Name 'Error log' -Ok $true -Detail $errorLog
-        }
-        else {
-            # Optional when a time log (or probe) is present; do not treat as a hard failure.
-            Write-Check -Name 'Error log' -Ok $true -Status WARN -Detail (
-                "missing: $(if ($errorLog) { $errorLog } else { '(unset)' }) (optional; not required for SCP)")
-        }
+        Write-Check -Name 'Log files selected' -Ok ($fileList.Count -gt 0) -Detail $(
+            if ($fileList.Count -gt 0) { ($fileList -join '; ') } else { 'none' })
         if ($fileList.Count -eq 0) {
             $probePath = Join-Path $env:TEMP ('LoginTimeLogger-scp-probe-{0}.txt' -f [guid]::NewGuid().ToString('N'))
             "LoginTimeLogger SCP probe (no logs present yet) $(Get-Date -Format o)" |

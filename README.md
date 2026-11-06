@@ -57,8 +57,8 @@ Unknown lock state is treated as **locked** (fail closed). The startup task uses
 
 **Off by default** (`ScpOnLockEnabled: false`). When enabled, each time the target session leaves unlocked-active (screen lock / away), the monitor runs `scp` to copy:
 
-- today’s `unlocked-time-YYYY-MM-DD.log`
-- `errors.log`
+- today’s `unlocked-time-YYYY-MM-DD.log` and `errors.log`
+- other `*.log` / `*.csv` files and `state.json` under `LogDirectory` (includes `service.log` and the summary CSV)
 
 to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`). Defaults for empty key paths:
 
