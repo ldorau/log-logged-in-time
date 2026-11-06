@@ -564,19 +564,24 @@ try {
             (Join-Path $scriptDir 'Allow-ScpOutboundFirewall.ps1')
             (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Allow-ScpOutboundFirewall.ps1')
         )
-        $scpAllowScript = $scpAllowCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        $scpAllowScript = $scpAllowCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
         if (-not $scpAllowScript) {
-            Write-Host 'SCP-Allow: SKIP (Allow-ScpOutboundFirewall.ps1 not found)' -ForegroundColor Yellow
+            Write-Host 'SCP-Allow: SKIP (Allow-ScpOutboundFirewall.ps1 not found)' `
+                -ForegroundColor Yellow
         }
         else {
-            Write-Host ("Checking SCP-Allow firewall rule for {0}:{1}..." -f $scpHost, $scpPort) -ForegroundColor DarkGray
+            Write-Host ("Checking SCP-Allow firewall rule for {0}:{1}..." -f `
+                    $scpHost, $scpPort) -ForegroundColor DarkGray
             try {
                 $scpAllowScriptArgs = @(
                     '-RemoteHost', $scpHost,
                     '-RemotePort', "$scpPort",
                     '-Verify'
                 )
-                $scpAllowResult = Invoke-WindowsPowerShellFile -ScriptPath $scpAllowScript `
+                $scpAllowResult = Invoke-WindowsPowerShellFile `
+                    -ScriptPath $scpAllowScript `
                     -ScriptArgument $scpAllowScriptArgs -CaptureOutput
                 $scpAllowExit = [int]$scpAllowResult.ExitCode
                 $scpAllowExtra = @{
@@ -592,27 +597,42 @@ try {
                 }
                 elseif ($scpAllowExit -eq -196608) {
                     $msg = 'SCP-Allow: ERROR (helper failed to start)'
-                    Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $scpAllowExit -ScriptPath $scpAllowScript)) -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
-                        -CapturedOutput $scpAllowResult.Output -LogDirectory $logDirectory -Extra $scpAllowExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' -Body $body -AlertKey 'status-scp-allow-error'
+                    Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $scpAllowExit `
+                                -ScriptPath $scpAllowScript)) -ForegroundColor Red
+                    $body = New-StatusVerifyAlertBody -Summary $msg `
+                        -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
+                        -CapturedOutput $scpAllowResult.Output `
+                        -LogDirectory $logDirectory -Extra $scpAllowExtra
+                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
+                        -Body $body -AlertKey 'status-scp-allow-error'
                 }
                 else {
                     $msg = 'SCP-Allow: FAIL (outbound Allow rule missing or mismatched)'
                     Write-Host $msg -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
-                        -CapturedOutput $scpAllowResult.Output -LogDirectory $logDirectory -Extra $scpAllowExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' -Body $body -AlertKey 'status-scp-allow-fail'
+                    $body = New-StatusVerifyAlertBody -Summary $msg `
+                        -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
+                        -CapturedOutput $scpAllowResult.Output `
+                        -LogDirectory $logDirectory -Extra $scpAllowExtra
+                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
+                        -Body $body -AlertKey 'status-scp-allow-fail'
                 }
             }
             catch {
-                Write-Host ("SCP-Allow: ERROR ({0})" -f $_.Exception.Message) -ForegroundColor Red
-                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                Write-Host ("SCP-Allow: ERROR ({0})" -f $_.Exception.Message) `
+                    -ForegroundColor Red
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning `
+                    -Source 'Status' -Context (
                     "SCP-Allow verify failed; script='{0}'" -f $scpAllowScript)
-                $body = New-StatusVerifyAlertBody -Summary 'SCP-Allow: ERROR' -ScriptPath $scpAllowScript `
+                $body = New-StatusVerifyAlertBody -Summary 'SCP-Allow: ERROR' `
+                    -ScriptPath $scpAllowScript `
                     -ExceptionText ("{0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) `
-                    -LogDirectory $logDirectory -Extra @{ ConfigPath = $configPath; ScpHost = $scpHost; ScpPort = $scpPort }
-                Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' -Body $body -AlertKey 'status-scp-allow-error'
+                    -LogDirectory $logDirectory -Extra @{
+                        ConfigPath = $configPath
+                        ScpHost    = $scpHost
+                        ScpPort    = $scpPort
+                    }
+                Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
+                    -Body $body -AlertKey 'status-scp-allow-error'
             }
         }
     }
