@@ -422,6 +422,94 @@ function Get-SummaryPath {
     Join-Path $LogDirectory 'unlocked-time-summary.csv'
 }
 
+function New-LoggerStateObject {
+    <#
+      Always materialize every NoteProperty so StrictMode never throws on
+      $state.Date / LastUnlockQuotaBucket after a polluted Read-State return
+      (Object[]) or older JSON missing keys.
+    #>
+    param(
+        [string]$Date = '',
+        [double]$UnlockedSecondsToday = 0,
+        [bool]$LastUnlocked = $false,
+        [AllowNull()]$LastTransitionUtc = $null,
+        [int]$LastUnlockQuotaBucket = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Date)) {
+        $Date = (Get-Date).ToString('yyyy-MM-dd')
+    }
+
+    return [pscustomobject]@{
+        Date                  = [string]$Date
+        UnlockedSecondsToday  = [double]$UnlockedSecondsToday
+        LastUnlocked          = [bool]$LastUnlocked
+        LastTransitionUtc     = $(if ($LastTransitionUtc) { [string]$LastTransitionUtc } else { $null })
+        LastUnlockQuotaBucket = [int]$LastUnlockQuotaBucket
+    }
+}
+
+function ConvertTo-LoggerStateObject {
+    <#
+      Rebuild a full state object from any partial/polluted input (e.g. Object[]
+      from a historical Write-Output log line + state hashtable).
+    #>
+    param(
+        $State,
+        [int]$UnlockQuotaMinutes = 30
+    )
+
+    if ($UnlockQuotaMinutes -lt 1) {
+        $UnlockQuotaMinutes = 30
+    }
+    $quotaSeconds = [double]($UnlockQuotaMinutes * 60)
+
+    # If Read-State was polluted into Object[], prefer the last object that
+    # looks like state (has UnlockedSecondsToday or Date).
+    if ($State -is [System.Array]) {
+        $picked = $null
+        foreach ($item in $State) {
+            if ($null -eq $item) { continue }
+            if ($null -ne $item.PSObject -and (
+                    $null -ne $item.PSObject.Properties['Date'] -or
+                    $null -ne $item.PSObject.Properties['UnlockedSecondsToday'])) {
+                $picked = $item
+            }
+        }
+        $State = $picked
+    }
+
+    $date = [string](Get-OptionalPropertyValue -InputObject $State -Name 'Date')
+    $secondsRaw = Get-OptionalPropertyValue -InputObject $State -Name 'UnlockedSecondsToday'
+    $seconds = 0.0
+    if ($null -ne $secondsRaw) {
+        try { $seconds = [double]$secondsRaw } catch { $seconds = 0.0 }
+    }
+    $lastUnlockedVal = Get-OptionalPropertyValue -InputObject $State -Name 'LastUnlocked'
+    $lastUnlocked = $false
+    if ($null -ne $lastUnlockedVal) {
+        try { $lastUnlocked = [bool]$lastUnlockedVal } catch { $lastUnlocked = $false }
+    }
+    $lastTransition = Get-OptionalPropertyValue -InputObject $State -Name 'LastTransitionUtc'
+    $bucketRaw = Get-OptionalPropertyValue -InputObject $State -Name 'LastUnlockQuotaBucket'
+    if ($null -ne $bucketRaw) {
+        try { $bucket = [int]$bucketRaw } catch {
+            $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
+        }
+    }
+    else {
+        # Do not retroactively fire quotas for time already accumulated.
+        $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
+    }
+
+    return (New-LoggerStateObject `
+            -Date $date `
+            -UnlockedSecondsToday $seconds `
+            -LastUnlocked $lastUnlocked `
+            -LastTransitionUtc $lastTransition `
+            -LastUnlockQuotaBucket $bucket)
+}
+
 function Read-State {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -431,53 +519,20 @@ function Read-State {
     if ($UnlockQuotaMinutes -lt 1) {
         $UnlockQuotaMinutes = 30
     }
-    $quotaSeconds = [double]($UnlockQuotaMinutes * 60)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{
-            Date                   = (Get-Date).ToString('yyyy-MM-dd')
-            UnlockedSecondsToday   = 0
-            LastUnlocked           = $false
-            LastTransitionUtc      = $null
-            LastUnlockQuotaBucket  = 0
-        }
+        return (New-LoggerStateObject)
     }
 
     try {
         $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        $secondsRaw = Get-OptionalPropertyValue -InputObject $json -Name 'UnlockedSecondsToday'
-        $seconds = 0.0
-        if ($null -ne $secondsRaw) {
-            $seconds = [double]$secondsRaw
-        }
-        $bucketProp = $json.PSObject.Properties['LastUnlockQuotaBucket']
-        if ($null -ne $bucketProp -and $null -ne $bucketProp.Value) {
-            $bucket = [int]$bucketProp.Value
-        }
-        else {
-            # Do not retroactively fire quotas for time already accumulated before this feature.
-            $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
-        }
-        $lastTransition = Get-OptionalPropertyValue -InputObject $json -Name 'LastTransitionUtc'
-        $lastUnlockedVal = Get-OptionalPropertyValue -InputObject $json -Name 'LastUnlocked'
-        return [pscustomobject]@{
-            Date                  = [string](Get-OptionalPropertyValue -InputObject $json -Name 'Date')
-            UnlockedSecondsToday  = $seconds
-            LastUnlocked          = $(if ($null -ne $lastUnlockedVal) { [bool]$lastUnlockedVal } else { $false })
-            LastTransitionUtc     = $(if ($lastTransition) { [string]$lastTransition } else { $null })
-            LastUnlockQuotaBucket = $bucket
-        }
+        return (ConvertTo-LoggerStateObject -State $json `
+                -UnlockQuotaMinutes $UnlockQuotaMinutes)
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Read-State failed for '{0}'" -f $Path)
         $null = Write-LoggerEvent -Level WARN -Message ("Corrupt state file; starting fresh.`r`n{0}" -f $details)
-        return [pscustomobject]@{
-            Date                  = (Get-Date).ToString('yyyy-MM-dd')
-            UnlockedSecondsToday  = 0
-            LastUnlocked          = $false
-            LastTransitionUtc     = $null
-            LastUnlockQuotaBucket = 0
-        }
+        return (New-LoggerStateObject)
     }
 }
 
@@ -534,8 +589,9 @@ function Write-State {
         [Parameter(Mandatory)]$State
     )
     try {
+        $normalized = ConvertTo-LoggerStateObject -State $State
         $tempPath = "$Path.tmp"
-        ($State | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        ($normalized | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
         # Replace in place. If destination is a zeroed/locked leftover, remove
         # then rename so Move-Item -Force is not the only recovery path.
         try {
@@ -695,7 +751,9 @@ try {
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory
-    $state = Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
+    $state = ConvertTo-LoggerStateObject `
+        -State (Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)) `
+        -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
 
     $installedSrc = Join-Path $env:ProgramFiles 'LoginTimeLogger\src'
     if ([string]::Equals($scriptDir, $installedSrc, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -716,6 +774,8 @@ catch {
 
 $lastPollUtc = [datetime]::UtcNow
 $lastHeartbeatSlot = $null
+$script:LastPollErrorKey = $null
+$script:LastPollErrorUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -731,21 +791,16 @@ while ($true) {
         $nowUtc = [datetime]::UtcNow
         $today = $nowLocal.ToString('yyyy-MM-dd')
 
+        # Re-wrap every poll so a polluted/partial $state cannot throw
+        # PropertyNotFoundStrict on .Date under Set-StrictMode.
+        $state = ConvertTo-LoggerStateObject -State $state `
+            -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
+
         if ($state.Date -ne $today) {
             if ($state.UnlockedSecondsToday -gt 0 -or $state.LastUnlocked) {
                 Write-DayRollover -Config $config -State $state -EndedDate $state.Date
             }
-            $state = [pscustomobject]@{
-                Date                  = $today
-                UnlockedSecondsToday  = 0
-                LastUnlocked          = $false
-                LastTransitionUtc     = $null
-                LastUnlockQuotaBucket = 0
-            }
-        }
-
-        if ($null -eq $state.PSObject.Properties['LastUnlockQuotaBucket']) {
-            $state | Add-Member -NotePropertyName LastUnlockQuotaBucket -NotePropertyValue 0 -Force
+            $state = New-LoggerStateObject -Date $today
         }
 
         $elapsed = ($nowUtc - $lastPollUtc).TotalSeconds
@@ -850,9 +905,19 @@ while ($true) {
         $lastPollUtc = [datetime]::UtcNow
         $sessionLastError = $null
         try { $sessionLastError = [SessionQuery]::LastError } catch { $sessionLastError = '(unavailable)' }
-        $null = Write-VerboseError -ErrorRecord $_ -Source 'LoginTimeLogger' -Context (
-            "Poll loop error; target='{0}'; logDir='{1}'; statePath='{2}'; SessionQuery.LastError='{3}'" -f `
-                $config.TargetUsername, $config.LogDirectory, $statePath, $sessionLastError)
+        # Throttle identical poll failures (a StrictMode death spiral previously
+        # wrote tens of MB to errors.log at every 5s poll).
+        $errKey = [string]$_.Exception.Message
+        $nowErr = [datetime]::UtcNow
+        $logThis = ($errKey -ne $script:LastPollErrorKey) -or
+            (($nowErr - $script:LastPollErrorUtc).TotalMinutes -ge 5)
+        if ($logThis) {
+            $script:LastPollErrorKey = $errKey
+            $script:LastPollErrorUtc = $nowErr
+            $null = Write-VerboseError -ErrorRecord $_ -Source 'LoginTimeLogger' -Context (
+                "Poll loop error; target='{0}'; logDir='{1}'; statePath='{2}'; SessionQuery.LastError='{3}'" -f `
+                    $config.TargetUsername, $config.LogDirectory, $statePath, $sessionLastError)
+        }
     }
 
     Start-Sleep -Seconds $config.PollIntervalSeconds

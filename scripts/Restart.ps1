@@ -68,6 +68,33 @@ function Write-LoggerEvent {
 
 . $updateCheckPath
 
+function Test-LooksLikeRuntimeConfigPath {
+    <#
+      Reject accidental positional args (e.g. shell redirection leftovers like
+      '*>' and a .log path when Restart was launched as:
+        powershell -File Restart.ps1 *> Restart.log
+      those bind to -TaskName / -ConfigPath and must not be treated as config).
+    #>
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    $trimmed = $Path.Trim()
+    if ($trimmed -eq '*>' -or $trimmed -eq '*' -or $trimmed -match '^[<>|&]') {
+        return $false
+    }
+    $leaf = Split-Path -Leaf $trimmed
+    if ($leaf -notmatch '(?i)\.json$') {
+        return $false
+    }
+    # Common false positives from redirected console output.
+    if ($leaf -match '(?i)(Restart|errors|service|update-state)\.log\.json$') {
+        return $false
+    }
+    return $true
+}
+
 function Resolve-RuntimeConfigPath {
     param(
         [string]$ConfigPath,
@@ -75,10 +102,17 @@ function Resolve-RuntimeConfigPath {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
-        if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        if (-not (Test-LooksLikeRuntimeConfigPath -Path $ConfigPath)) {
+            Write-Host ("WARNING: Ignoring invalid -ConfigPath '{0}' (expected a .json runtime config)." -f `
+                    $ConfigPath) -ForegroundColor Yellow
+            $ConfigPath = ''
+        }
+        elseif (-not (Test-Path -LiteralPath $ConfigPath)) {
             throw "ConfigPath not found: '$ConfigPath'."
         }
-        return $ConfigPath
+        else {
+            return $ConfigPath
+        }
     }
 
     $fromTask = Get-LoginTimeLoggerRuntimeConfigPath -TaskName $TaskName
@@ -195,6 +229,15 @@ function Start-LoginTimeLoggerTask {
 }
 
 try {
+    # Positional junk from 'powershell -File Restart.ps1 *> out.log' binds here.
+    if ($TaskName -eq '*>' -or $TaskName -match '[<>|&]' -or
+        $TaskName -match '(?i)\.(log|ps1|txt|json)$' -or
+        $TaskName -match '[\\/]') {
+        Write-Host ("WARNING: Ignoring invalid -TaskName '{0}'; using 'LoginTimeLogger'." -f `
+                $TaskName) -ForegroundColor Yellow
+        $TaskName = 'LoginTimeLogger'
+    }
+
     $resolvedConfigPath = Resolve-RuntimeConfigPath -ConfigPath $ConfigPath -TaskName $TaskName
     $null = Initialize-ErrorLog -ConfigPath $resolvedConfigPath
     Write-Host ("Error log file: {0}" -f (Get-ErrorLogPath))
