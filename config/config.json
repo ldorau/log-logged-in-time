@@ -15,5 +15,8 @@
   "ScpRemoteDirectory": "",
   "ScpPort": 22,
   "ScpIdentityFile": "",
-  "ScpKnownHostsFile": ""
+  "ScpKnownHostsFile": "",
+  "UnlockQuotaEnabled": true,
+  "UnlockQuotaMinutes": 30,
+  "UnlockQuotaWarnSeconds": 3
 }

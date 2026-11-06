@@ -317,6 +317,7 @@ function Publish-InstalledFilesFromRepo {
         'Scp-OnLock.ps1'
         'LockSignalWatcher.ps1'
         'LockSignalLauncher.ps1'
+        'Show-UnlockQuotaWarning.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name

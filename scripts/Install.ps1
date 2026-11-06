@@ -554,6 +554,7 @@ function Test-InstallPrerequisites {
         'Scp-OnLock.ps1'         = (Join-Path $RepoRoot 'src\Scp-OnLock.ps1')
         'LockSignalWatcher.ps1'  = (Join-Path $RepoRoot 'src\LockSignalWatcher.ps1')
         'LockSignalLauncher.ps1' = (Join-Path $RepoRoot 'src\LockSignalLauncher.ps1')
+        'Show-UnlockQuotaWarning.ps1' = (Join-Path $RepoRoot 'src\Show-UnlockQuotaWarning.ps1')
     }
     foreach ($entry in $requiredFiles.GetEnumerator()) {
         $exists = Test-Path -LiteralPath $entry.Value
@@ -1197,13 +1198,16 @@ SystemDrive: $env:SystemDrive
         UpdateBranch         = $updateBranch
         UpdateClonePath      = $updateClonePath
         ServerDNS            = $serverDns
-        ScpOnLockEnabled     = $scpOnLockEnabledRuntime
-        ScpHost              = $scpHost
-        ScpUser              = $scpUser
-        ScpRemoteDirectory   = $scpRemoteDirectory
-        ScpPort              = $scpPort
-        ScpIdentityFile      = $scpIdentityFile
-        ScpKnownHostsFile    = $scpKnownHostsFile
+        ScpOnLockEnabled       = $scpOnLockEnabledRuntime
+        ScpHost                = $scpHost
+        ScpUser                = $scpUser
+        ScpRemoteDirectory     = $scpRemoteDirectory
+        ScpPort                = $scpPort
+        ScpIdentityFile        = $scpIdentityFile
+        ScpKnownHostsFile      = $scpKnownHostsFile
+        UnlockQuotaEnabled     = $(if ($null -ne $raw.UnlockQuotaEnabled) { [bool]$raw.UnlockQuotaEnabled } else { $true })
+        UnlockQuotaMinutes     = $(if ($null -ne $raw.UnlockQuotaMinutes -and [int]$raw.UnlockQuotaMinutes -gt 0) { [int]$raw.UnlockQuotaMinutes } else { 30 })
+        UnlockQuotaWarnSeconds = $(if ($null -ne $raw.UnlockQuotaWarnSeconds -and [int]$raw.UnlockQuotaWarnSeconds -gt 0) { [int]$raw.UnlockQuotaWarnSeconds } else { 3 })
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 
@@ -1364,6 +1368,10 @@ SystemDrive: $env:SystemDrive
         Copy-Item -LiteralPath $scpOnLockSrc -Destination (Join-Path $installSrc 'Scp-OnLock.ps1') -Force
         Copy-Item -LiteralPath $lockSignalWatcherSrc -Destination (Join-Path $installSrc 'LockSignalWatcher.ps1') -Force
         Copy-Item -LiteralPath $lockSignalLauncherHelper -Destination (Join-Path $installSrc 'LockSignalLauncher.ps1') -Force
+        $unlockQuotaWarnSrc = Join-Path $repoRoot 'src\Show-UnlockQuotaWarning.ps1'
+        if (Test-Path -LiteralPath $unlockQuotaWarnSrc) {
+            Copy-Item -LiteralPath $unlockQuotaWarnSrc -Destination (Join-Path $installSrc 'Show-UnlockQuotaWarning.ps1') -Force
+        }
 
         New-Item -ItemType Directory -Path $installScripts -Force | Out-Null
         if (Test-Path -LiteralPath $dohFirewallSrc) {

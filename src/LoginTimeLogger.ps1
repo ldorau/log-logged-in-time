@@ -232,26 +232,46 @@ LogDirectory in file: $cfgLogHint
         $lockSignalPath = [string]$cfgLockSignal
     }
 
+    # Every N minutes of unlocked time: warn on the target desktop, then LockWorkStation.
+    $unlockQuotaEnabled = $true
+    $cfgUnlockQuotaEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaEnabled'
+    if ($null -ne $cfgUnlockQuotaEnabled) {
+        $unlockQuotaEnabled = [bool]$cfgUnlockQuotaEnabled
+    }
+    $unlockQuotaMinutes = 30
+    $cfgUnlockQuotaMinutes = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinutes'
+    if ($null -ne $cfgUnlockQuotaMinutes -and [int]$cfgUnlockQuotaMinutes -gt 0) {
+        $unlockQuotaMinutes = [int]$cfgUnlockQuotaMinutes
+    }
+    $unlockQuotaWarnSeconds = 3
+    $cfgUnlockQuotaWarn = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaWarnSeconds'
+    if ($null -ne $cfgUnlockQuotaWarn -and [int]$cfgUnlockQuotaWarn -gt 0) {
+        $unlockQuotaWarnSeconds = [int]$cfgUnlockQuotaWarn
+    }
+
     [pscustomobject]@{
-        AdminUsername        = $adminUsername
-        TargetUsername       = [string]$cfgTargetUsername
-        AdministratorProfile = $adminHome
-        LogDirectory         = $logDirectory
-        PollIntervalSeconds  = $pollSeconds
-        ConfigPath           = $Path
-        LockSignalPath       = $lockSignalPath
-        UpdateEnabled        = $updateEnabled
-        UpdateRepoUrl        = $updateRepoUrl
-        UpdateBranch         = $updateBranch
-        UpdateClonePath      = $updateClonePath
-        ServerDNS            = $serverDns
-        ScpOnLockEnabled     = $scpOnLockEnabled
-        ScpHost              = $scpHost
-        ScpUser              = $scpUser
-        ScpRemoteDirectory   = $scpRemoteDirectory
-        ScpPort              = $scpPort
-        ScpIdentityFile      = $scpIdentityFile
-        ScpKnownHostsFile    = $scpKnownHostsFile
+        AdminUsername           = $adminUsername
+        TargetUsername          = [string]$cfgTargetUsername
+        AdministratorProfile    = $adminHome
+        LogDirectory            = $logDirectory
+        PollIntervalSeconds     = $pollSeconds
+        ConfigPath              = $Path
+        LockSignalPath          = $lockSignalPath
+        UpdateEnabled           = $updateEnabled
+        UpdateRepoUrl           = $updateRepoUrl
+        UpdateBranch            = $updateBranch
+        UpdateClonePath         = $updateClonePath
+        ServerDNS               = $serverDns
+        ScpOnLockEnabled        = $scpOnLockEnabled
+        ScpHost                 = $scpHost
+        ScpUser                 = $scpUser
+        ScpRemoteDirectory      = $scpRemoteDirectory
+        ScpPort                 = $scpPort
+        ScpIdentityFile         = $scpIdentityFile
+        ScpKnownHostsFile       = $scpKnownHostsFile
+        UnlockQuotaEnabled      = $unlockQuotaEnabled
+        UnlockQuotaMinutes      = $unlockQuotaMinutes
+        UnlockQuotaWarnSeconds  = $unlockQuotaWarnSeconds
     }
 }
 
@@ -403,32 +423,83 @@ function Read-State {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return [pscustomobject]@{
-            Date                 = (Get-Date).ToString('yyyy-MM-dd')
-            UnlockedSecondsToday = 0
-            LastUnlocked         = $false
-            LastTransitionUtc    = $null
+            Date                   = (Get-Date).ToString('yyyy-MM-dd')
+            UnlockedSecondsToday   = 0
+            LastUnlocked           = $false
+            LastTransitionUtc      = $null
+            LastUnlockQuotaBucket  = 0
         }
     }
 
     try {
         $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $seconds = [double]$json.UnlockedSecondsToday
+        $bucketProp = $json.PSObject.Properties['LastUnlockQuotaBucket']
+        if ($null -ne $bucketProp -and $null -ne $bucketProp.Value) {
+            $bucket = [int]$bucketProp.Value
+        }
+        else {
+            # Do not retroactively fire quotas for time already accumulated before this feature.
+            $bucket = [int][Math]::Floor($seconds / 1800.0)
+        }
         return [pscustomobject]@{
-            Date                 = [string]$json.Date
-            UnlockedSecondsToday = [double]$json.UnlockedSecondsToday
-            LastUnlocked         = [bool]$json.LastUnlocked
-            LastTransitionUtc    = $(if ($json.LastTransitionUtc) { [string]$json.LastTransitionUtc } else { $null })
+            Date                  = [string]$json.Date
+            UnlockedSecondsToday  = $seconds
+            LastUnlocked          = [bool]$json.LastUnlocked
+            LastTransitionUtc     = $(if ($json.LastTransitionUtc) { [string]$json.LastTransitionUtc } else { $null })
+            LastUnlockQuotaBucket = $bucket
         }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Read-State failed for '{0}'" -f $Path)
         Write-LoggerEvent -Level WARN -Message ("Corrupt state file; starting fresh.`r`n{0}" -f $details)
         return [pscustomobject]@{
-            Date                 = (Get-Date).ToString('yyyy-MM-dd')
-            UnlockedSecondsToday = 0
-            LastUnlocked         = $false
-            LastTransitionUtc    = $null
+            Date                  = (Get-Date).ToString('yyyy-MM-dd')
+            UnlockedSecondsToday  = 0
+            LastUnlocked          = $false
+            LastTransitionUtc     = $null
+            LastUnlockQuotaBucket = 0
         }
     }
+}
+
+function Invoke-UnlockQuotaWarningAndLock {
+    <#
+      Shows a blocking countdown on the target user's desktop, then LockWorkStation
+      inside that session via CreateProcessAsUser (SessionQuery.LaunchInUserSession).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$WarningScriptPath
+    )
+
+    if (-not (Test-Path -LiteralPath $WarningScriptPath)) {
+        Write-LoggerEvent -Level WARN -Message ("Unlock-quota warning script missing: {0}" -f $WarningScriptPath)
+        return $false
+    }
+
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) {
+        Write-LoggerEvent -Level WARN -Message ("Unlock-quota: powershell.exe not found at {0}" -f $psExe)
+        return $false
+    }
+
+    $minutes = [int]$Config.UnlockQuotaMinutes
+    $seconds = [int]$Config.UnlockQuotaWarnSeconds
+    # Visible STA process so the WinForms countdown appears on the target desktop.
+    $arguments = '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
+        $WarningScriptPath, $minutes, $seconds
+
+    $launchError = ''
+    $ok = [SessionQuery]::LaunchInUserSession($Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $true)
+    if (-not $ok) {
+        Write-LoggerEvent -Level WARN -Message ("Unlock-quota launch failed: {0}" -f $launchError)
+        return $false
+    }
+
+    Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; lock requested in target session." -f `
+            $seconds, $minutes)
+    return $true
 }
 
 function Write-State {
@@ -599,8 +670,8 @@ try {
         $installRoot = Split-Path -Parent $scriptDir
     }
 
-    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}" -f `
-            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath)
+    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s" -f `
+            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
@@ -629,11 +700,16 @@ while ($true) {
                 Write-DayRollover -Config $config -State $state -EndedDate $state.Date
             }
             $state = [pscustomobject]@{
-                Date                 = $today
-                UnlockedSecondsToday = 0
-                LastUnlocked         = $false
-                LastTransitionUtc    = $null
+                Date                  = $today
+                UnlockedSecondsToday  = 0
+                LastUnlocked          = $false
+                LastTransitionUtc     = $null
+                LastUnlockQuotaBucket = 0
             }
+        }
+
+        if ($null -eq $state.PSObject.Properties['LastUnlockQuotaBucket']) {
+            $state | Add-Member -NotePropertyName LastUnlockQuotaBucket -NotePropertyValue 0 -Force
         }
 
         $elapsed = ($nowUtc - $lastPollUtc).TotalSeconds
@@ -662,6 +738,25 @@ while ($true) {
 
         if ($unlocked) {
             $state.UnlockedSecondsToday += $elapsed
+
+            if ($config.UnlockQuotaEnabled -and [int]$config.UnlockQuotaMinutes -gt 0) {
+                $quotaSeconds = [double]([int]$config.UnlockQuotaMinutes * 60)
+                $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
+                while ($newBucket -gt [int]$state.LastUnlockQuotaBucket) {
+                    $state.LastUnlockQuotaBucket = [int]$state.LastUnlockQuotaBucket + 1
+                    Write-State -Path $statePath -State $state
+                    $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+                    try {
+                        $null = Invoke-UnlockQuotaWarningAndLock -Config $config -WarningScriptPath $warnScript
+                    }
+                    catch {
+                        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UnlockQuota' -Context (
+                            'Unlock-quota warning/lock launch failed')
+                    }
+                    # Re-evaluate in case multiple buckets were crossed in one poll.
+                    $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
+                }
+            }
         }
 
         if ($unlocked -ne $state.LastUnlocked) {

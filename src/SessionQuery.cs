@@ -913,4 +913,252 @@ public static class SessionQuery
             "; wtsFlags=" + wtsFlags);
         return true;
     }
+
+    // --- Launch a process in another user's interactive session (SYSTEM only) ---
+
+    private const uint TOKEN_DUPLICATE = 0x0002;
+    private const uint TOKEN_QUERY = 0x0008;
+    private const uint TOKEN_ASSIGN_PRIMARY = 0x0001;
+    private const uint TOKEN_ADJUST_DEFAULT = 0x0080;
+    private const uint TOKEN_ADJUST_SESSIONID = 0x0100;
+    private const uint MAXIMUM_ALLOWED = 0x02000000;
+    private const int SecurityImpersonation = 2;
+    private const int TokenPrimary = 1;
+    private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    private const uint STARTF_USESHOWWINDOW = 0x00000001;
+    private const short SW_HIDE = 0;
+    private const short SW_SHOWNORMAL = 1;
+    private const int CREATE_NEW_CONSOLE = 0x00000010;
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr phToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool DuplicateTokenEx(
+        IntPtr hExistingToken,
+        uint dwDesiredAccess,
+        IntPtr lpTokenAttributes,
+        int impersonationLevel,
+        int tokenType,
+        out IntPtr phNewToken);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessAsUser(
+        IntPtr hToken,
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    /// <summary>
+    /// Prefer an unlocked-active session for the account; otherwise any matching session.
+    /// </summary>
+    public static SessionStatus FindBestUserSession(string accountName)
+    {
+        if (string.IsNullOrWhiteSpace(accountName))
+        {
+            return null;
+        }
+
+        string userName;
+        string domainName;
+        bool domainRequired;
+        ParseAccountName(accountName, out userName, out domainName, out domainRequired);
+        if (string.IsNullOrWhiteSpace(userName))
+        {
+            return null;
+        }
+
+        SessionStatus fallback = null;
+        foreach (var session in GetSessions())
+        {
+            if (!SessionMatchesAccount(session, userName, domainName, domainRequired))
+            {
+                continue;
+            }
+
+            if (session.IsUnlockedActive)
+            {
+                return session;
+            }
+
+            if (fallback == null)
+            {
+                fallback = session;
+            }
+        }
+
+        return fallback;
+    }
+
+    /// <summary>
+    /// Starts a process in the target user's interactive session (requires SYSTEM / SeTcbPrivilege).
+    /// Used to show UI and call LockWorkStation on that user's desktop.
+    /// </summary>
+    /// <param name="showWindow">When true, the process is started visible (for WinForms warning UI).</param>
+    public static bool LaunchInUserSession(
+        string accountName,
+        string applicationPath,
+        string arguments,
+        out string error,
+        bool showWindow = false)
+    {
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(accountName))
+        {
+            error = "accountName is empty.";
+            SetLastError(error);
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(applicationPath) || !File.Exists(applicationPath))
+        {
+            error = "applicationPath missing: " + applicationPath;
+            SetLastError(error);
+            return false;
+        }
+
+        SessionStatus session = FindBestUserSession(accountName);
+        if (session == null)
+        {
+            error = "No interactive session found for '" + accountName + "'.";
+            SetLastError(error);
+            return false;
+        }
+
+        IntPtr userToken = IntPtr.Zero;
+        IntPtr primaryToken = IntPtr.Zero;
+        IntPtr environment = IntPtr.Zero;
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+
+        try
+        {
+            if (!WTSQueryUserToken((uint)session.SessionId, out userToken))
+            {
+                error = "WTSQueryUserToken failed for session " + session.SessionId +
+                        "; Win32Error=" + Marshal.GetLastWin32Error() +
+                        " (monitor must run as SYSTEM).";
+                SetLastError(error);
+                return false;
+            }
+
+            uint access = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY |
+                          TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID | MAXIMUM_ALLOWED;
+            if (!DuplicateTokenEx(userToken, access, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primaryToken))
+            {
+                error = "DuplicateTokenEx failed; Win32Error=" + Marshal.GetLastWin32Error();
+                SetLastError(error);
+                return false;
+            }
+
+            if (!CreateEnvironmentBlock(out environment, primaryToken, false))
+            {
+                environment = IntPtr.Zero; // non-fatal; process can inherit defaults
+            }
+
+            string commandLine = "\"" + applicationPath + "\"";
+            if (!string.IsNullOrWhiteSpace(arguments))
+            {
+                commandLine = commandLine + " " + arguments;
+            }
+
+            STARTUPINFO si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            si.lpDesktop = "winsta0\\default";
+            si.dwFlags = (int)STARTF_USESHOWWINDOW;
+            si.wShowWindow = showWindow ? SW_SHOWNORMAL : SW_HIDE;
+
+            uint flags = CREATE_UNICODE_ENVIRONMENT | (uint)CREATE_NEW_CONSOLE;
+            if (!CreateProcessAsUser(
+                    primaryToken,
+                    null,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    false,
+                    flags,
+                    environment,
+                    null,
+                    ref si,
+                    out pi))
+            {
+                error = "CreateProcessAsUser failed; Win32Error=" + Marshal.GetLastWin32Error() +
+                        "; sessionId=" + session.SessionId + "; cmd=" + commandLine;
+                SetLastError(error);
+                return false;
+            }
+
+            SetLastError(string.Empty);
+            return true;
+        }
+        finally
+        {
+            if (pi.hThread != IntPtr.Zero)
+            {
+                CloseHandle(pi.hThread);
+            }
+            if (pi.hProcess != IntPtr.Zero)
+            {
+                CloseHandle(pi.hProcess);
+            }
+            if (environment != IntPtr.Zero)
+            {
+                DestroyEnvironmentBlock(environment);
+            }
+            if (primaryToken != IntPtr.Zero)
+            {
+                CloseHandle(primaryToken);
+            }
+            if (userToken != IntPtr.Zero)
+            {
+                CloseHandle(userToken);
+            }
+        }
+    }
 }
