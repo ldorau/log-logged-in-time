@@ -30,99 +30,6 @@ else {
     throw "Common-Error.ps1 missing at '$commonErrorPath'."
 }
 
-function Send-StatusSmtpFail {
-    param(
-        [Parameter(Mandatory)][string]$Subject,
-        [Parameter(Mandatory)][string]$Body,
-        [Parameter(Mandatory)][string]$AlertKey
-    )
-    if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
-        $null = Send-LoginTimeSmtpAlert -Subject $Subject -Body $Body -AlertKey $AlertKey
-    }
-}
-
-function New-StatusVerifyAlertBody {
-    <#
-      Builds a diagnostic SMTP body for Status helper FAIL/ERROR (exit code,
-      script paths, config hints, captured verify output, recent service.log).
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Summary,
-        [int]$ExitCode = 0,
-        [string]$ScriptPath = '',
-        [string]$ProvidersPath = '',
-        [string]$CapturedOutput = '',
-        [string]$ExceptionText = '',
-        [string]$LogDirectory = '',
-        [hashtable]$Extra = @{}
-    )
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add($Summary)
-    $lines.Add('')
-    $lines.Add('--- debug ---')
-    $lines.Add(('ExitCode: {0}' -f $ExitCode))
-    if (-not [string]::IsNullOrWhiteSpace($ScriptPath)) {
-        $lines.Add(('Script: {0}' -f $ScriptPath))
-        $lines.Add(('ScriptExists: {0}' -f (Test-Path -LiteralPath $ScriptPath)))
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ProvidersPath)) {
-        $lines.Add(('ProvidersPath: {0}' -f $ProvidersPath))
-        $lines.Add(('ProvidersExists: {0}' -f (Test-Path -LiteralPath $ProvidersPath)))
-    }
-    $hint = ''
-    if (Get-Command Get-PowerShellFileExitHint -ErrorAction SilentlyContinue) {
-        $hint = Get-PowerShellFileExitHint -ExitCode $ExitCode -ScriptPath $ScriptPath
-    }
-    if (-not [string]::IsNullOrWhiteSpace($hint)) {
-        $lines.Add(('Hint:{0}' -f $hint))
-    }
-    if ($Extra -and $Extra.Count -gt 0) {
-        foreach ($key in ($Extra.Keys | Sort-Object)) {
-            $lines.Add(('{0}: {1}' -f $key, $Extra[$key]))
-        }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ExceptionText)) {
-        $lines.Add('')
-        $lines.Add('--- exception ---')
-        $lines.Add((Limit-TextForAlert -Text $ExceptionText -MaxChars 4000))
-    }
-    $lines.Add('')
-    $lines.Add('--- verify output ---')
-    $outText = Limit-TextForAlert -Text $CapturedOutput -MaxChars 12000
-    if ([string]::IsNullOrWhiteSpace($outText)) {
-        $lines.Add('(no output captured)')
-    }
-    else {
-        $lines.Add($outText)
-    }
-
-    $serviceLog = $null
-    if (-not [string]::IsNullOrWhiteSpace($LogDirectory)) {
-        $candidate = Join-Path $LogDirectory 'service.log'
-        if (Test-Path -LiteralPath $candidate) {
-            $serviceLog = $candidate
-        }
-    }
-    if ($serviceLog) {
-        try {
-            $svcTail = @(Get-Content -LiteralPath $serviceLog -Tail 40 -ErrorAction Stop |
-                    Where-Object {
-                        $_ -match '\[(WARN|ERROR)\]|SCP-Allow|firewall'
-                    })
-            if ($svcTail.Count -gt 0) {
-                $lines.Add('')
-                $lines.Add(('--- service.log matches (tail filter; file={0}) ---' -f $serviceLog))
-                $lines.Add((Limit-TextForAlert -Text ($svcTail -join [Environment]::NewLine) `
-                            -MaxChars 4000))
-            }
-        }
-        catch { }
-    }
-
-    return ($lines -join [Environment]::NewLine)
-}
-
 try {
     $null = Initialize-ErrorLog -ConfigPath $TemplateConfigPath
     if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
@@ -187,9 +94,6 @@ try {
     $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     $targetUsername = '(not set)'
     $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
-    $scpOnLockEnabled = $false
-    $scpHost = ''
-    $scpPort = 22
 
     if (Test-Path -LiteralPath $configPath) {
         try {
@@ -212,18 +116,6 @@ try {
             $cfgLockSignal = Get-OptionalPropertyValue -InputObject $raw -Name 'LockSignalPath'
             if (-not [string]::IsNullOrWhiteSpace([string]$cfgLockSignal)) {
                 $lockSignalPath = [string]$cfgLockSignal
-            }
-            $cfgScpEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
-            if ($null -ne $cfgScpEnabled) {
-                $scpOnLockEnabled = [bool]$cfgScpEnabled
-            }
-            $cfgScpHost = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost'
-            if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpHost)) {
-                $scpHost = [string]$cfgScpHost
-            }
-            $cfgScpPort = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpPort'
-            if ($null -ne $cfgScpPort -and [int]$cfgScpPort -gt 0) {
-                $scpPort = [int]$cfgScpPort
             }
         }
         catch {
@@ -551,91 +443,8 @@ try {
         }
     }
 
-    # DoH / VPN / DNS-Force -Verify is intentionally not run from Status
-    # (slow, noisy SMTP). Run those helpers manually when needed.
-    # SCP-Allow -Verify remains below (fast rule check).
-
-    # --- SCP outbound allow verify (Allow-ScpOutboundFirewall.ps1 -Verify) ---
-    if (-not $scpOnLockEnabled -or [string]::IsNullOrWhiteSpace($scpHost)) {
-        Write-Host 'SCP-Allow: SKIP (ScpOnLock disabled or ScpHost empty)' -ForegroundColor DarkGray
-    }
-    else {
-        $scpAllowCandidates = @(
-            (Join-Path $scriptDir 'Allow-ScpOutboundFirewall.ps1')
-            (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Allow-ScpOutboundFirewall.ps1')
-        )
-        $scpAllowScript = $scpAllowCandidates |
-            Where-Object { Test-Path -LiteralPath $_ } |
-            Select-Object -First 1
-        if (-not $scpAllowScript) {
-            Write-Host 'SCP-Allow: SKIP (Allow-ScpOutboundFirewall.ps1 not found)' `
-                -ForegroundColor Yellow
-        }
-        else {
-            Write-Host ("Checking SCP-Allow firewall rule for {0}:{1}..." -f `
-                    $scpHost, $scpPort) -ForegroundColor DarkGray
-            try {
-                $scpAllowScriptArgs = @(
-                    '-RemoteHost', $scpHost,
-                    '-RemotePort', "$scpPort",
-                    '-Verify'
-                )
-                $scpAllowResult = Invoke-WindowsPowerShellFile `
-                    -ScriptPath $scpAllowScript `
-                    -ScriptArgument $scpAllowScriptArgs -CaptureOutput
-                $scpAllowExit = [int]$scpAllowResult.ExitCode
-                $scpAllowExtra = @{
-                    ConfigPath = $configPath
-                    ScpHost    = $scpHost
-                    ScpPort    = $scpPort
-                    IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-                        [Security.Principal.WindowsBuiltInRole]::Administrator)
-                }
-
-                if ($scpAllowExit -eq 0) {
-                    Write-Host 'SCP-Allow: OK' -ForegroundColor Green
-                }
-                elseif ($scpAllowExit -eq -196608) {
-                    $msg = 'SCP-Allow: ERROR (helper failed to start)'
-                    Write-Host ($msg + (Get-PowerShellFileExitHint -ExitCode $scpAllowExit `
-                                -ScriptPath $scpAllowScript)) -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg `
-                        -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
-                        -CapturedOutput $scpAllowResult.Output `
-                        -LogDirectory $logDirectory -Extra $scpAllowExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
-                        -Body $body -AlertKey 'status-scp-allow-error'
-                }
-                else {
-                    $msg = 'SCP-Allow: FAIL (outbound Allow rule missing or mismatched)'
-                    Write-Host $msg -ForegroundColor Red
-                    $body = New-StatusVerifyAlertBody -Summary $msg `
-                        -ExitCode $scpAllowExit -ScriptPath $scpAllowScript `
-                        -CapturedOutput $scpAllowResult.Output `
-                        -LogDirectory $logDirectory -Extra $scpAllowExtra
-                    Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
-                        -Body $body -AlertKey 'status-scp-allow-fail'
-                }
-            }
-            catch {
-                Write-Host ("SCP-Allow: ERROR ({0})" -f $_.Exception.Message) `
-                    -ForegroundColor Red
-                $null = Write-VerboseError -ErrorRecord $_ -Level Warning `
-                    -Source 'Status' -Context (
-                    "SCP-Allow verify failed; script='{0}'" -f $scpAllowScript)
-                $body = New-StatusVerifyAlertBody -Summary 'SCP-Allow: ERROR' `
-                    -ScriptPath $scpAllowScript `
-                    -ExceptionText ("{0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) `
-                    -LogDirectory $logDirectory -Extra @{
-                        ConfigPath = $configPath
-                        ScpHost    = $scpHost
-                        ScpPort    = $scpPort
-                    }
-                Send-StatusSmtpFail -Subject 'Status FAIL: SCP-Allow' `
-                    -Body $body -AlertKey 'status-scp-allow-error'
-            }
-        }
-    }
+    # Helper -Verify (DoH / VPN / DNS-Force / SCP-Allow) is not run from
+    # Status; use those scripts manually when needed.
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'Status.ps1 failed' -Source 'Status'
