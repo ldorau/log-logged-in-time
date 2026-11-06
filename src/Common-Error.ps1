@@ -59,6 +59,9 @@ function ConvertTo-UInt32Code {
       Normalize Task Scheduler LastTaskResult (HRESULT-like) to UInt32.
       Hosts may return signed Int32 (-2147020576) or unsigned 2147946720 for
       0x800710E0; PowerShell [uint32]/[int32] casts overflow either way.
+      Prefer numeric widening before any [int32] cast so large
+      unsigned forms (string/decimal/int64) never hit
+      OverflowException.
     #>
     param([AllowNull()]$Value)
     if ($null -eq $Value) {
@@ -67,12 +70,25 @@ function ConvertTo-UInt32Code {
     if ($Value -is [uint32]) {
         return [uint32]$Value
     }
-    if ($Value -is [int32] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte]) {
+    if ($Value -is [uint16] -or $Value -is [byte]) {
+        return [uint32]$Value
+    }
+    if ($Value -is [int32] -or $Value -is [int16] -or $Value -is [sbyte]) {
         return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Value), 0)
     }
 
-    # Int64 / UInt64 / Decimal / string forms of the same HRESULT.
-    $asInt64 = [int64]$Value
+    # Int64 / UInt64 / Decimal / string / other numeric forms of the same HRESULT.
+    try {
+        $asInt64 = [int64]$Value
+    }
+    catch {
+        # Last resort: parse hex or decimal text.
+        $text = "$Value".Trim()
+        if ($text -match '^0x([0-9a-fA-F]+)$') {
+            return [uint32]([Convert]::ToUInt64($Matches[1], 16) -band [uint64]0xFFFFFFFF)
+        }
+        $asInt64 = [int64]$text
+    }
     if ($asInt64 -ge 0 -and $asInt64 -le [int64][uint32]::MaxValue) {
         return [uint32]$asInt64
     }

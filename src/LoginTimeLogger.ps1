@@ -44,7 +44,10 @@ function Write-LoggerEvent {
         [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
     )
     $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Message
-    Write-Output $line
+    # Never Write-Output: callers that both log and return
+    # (Read-UpdateState, Sync-UpdateRepository, Read-State) would
+    # otherwise receive Object[] and StrictMode property sets fail.
+    Write-Host $line
     if (-not [string]::IsNullOrWhiteSpace([string]$script:ServiceLogPath)) {
         try {
             Add-Content -LiteralPath $script:ServiceLogPath -Value $line -Encoding UTF8
@@ -467,7 +470,7 @@ function Read-State {
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Read-State failed for '{0}'" -f $Path)
-        Write-LoggerEvent -Level WARN -Message ("Corrupt state file; starting fresh.`r`n{0}" -f $details)
+        $null = Write-LoggerEvent -Level WARN -Message ("Corrupt state file; starting fresh.`r`n{0}" -f $details)
         return [pscustomobject]@{
             Date                  = (Get-Date).ToString('yyyy-MM-dd')
             UnlockedSecondsToday  = 0

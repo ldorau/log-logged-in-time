@@ -54,76 +54,163 @@ function Test-TrustedUpdateRepoUrl {
     return $script:AllowedUpdateRepoPaths -contains $path
 }
 
+function ConvertTo-OptionalUpdateStateString {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) {
+        return $null
+    }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+    return $text
+}
+
+function New-UpdateStateObject {
+    param(
+        # Untyped + AllowNull so $null stays JSON null
+        # (typed [string]$null becomes "").
+        [AllowNull()]$NextUpdateCheckUtc = $null,
+        [AllowNull()]$LastUpdateCheckUtc = $null,
+        [AllowNull()]$LastResult = 'never',
+        [AllowNull()]$LastRemoteCommit = $null,
+        [AllowNull()]$LastLocalCommit = $null,
+        [AllowNull()]$LastDoHBlockUtc = $null,
+        [AllowNull()]$LastDoHBlockResult = $null,
+        [AllowNull()]$LastVpnBlockUtc = $null,
+        [AllowNull()]$LastVpnBlockResult = $null,
+        [AllowNull()]$LastDnsForceUtc = $null,
+        [AllowNull()]$LastDnsForceResult = $null,
+        [AllowNull()]$LastScpAllowUtc = $null,
+        [AllowNull()]$LastScpAllowResult = $null
+    )
+
+    # Always materialize every NoteProperty (including nulls) so later
+    # StrictMode assignments like $state.NextUpdateCheckUtc = ... never
+    # hit PropertyAssignmentException.
+    $names = @(
+        'NextUpdateCheckUtc'
+        'LastUpdateCheckUtc'
+        'LastResult'
+        'LastRemoteCommit'
+        'LastLocalCommit'
+        'LastDoHBlockUtc'
+        'LastDoHBlockResult'
+        'LastVpnBlockUtc'
+        'LastVpnBlockResult'
+        'LastDnsForceUtc'
+        'LastDnsForceResult'
+        'LastScpAllowUtc'
+        'LastScpAllowResult'
+    )
+    $o = [pscustomobject]@{}
+    foreach ($name in $names) {
+        Add-Member -InputObject $o -NotePropertyName $name -NotePropertyValue $null
+    }
+
+    if ($NextUpdateCheckUtc) {
+        $o.NextUpdateCheckUtc = [string]$NextUpdateCheckUtc
+    }
+    else {
+        $o.NextUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
+    }
+    $o.LastUpdateCheckUtc = ConvertTo-OptionalUpdateStateString $LastUpdateCheckUtc
+    if ($LastResult) {
+        $o.LastResult = [string]$LastResult
+    }
+    else {
+        $o.LastResult = 'never'
+    }
+    $o.LastRemoteCommit = ConvertTo-OptionalUpdateStateString $LastRemoteCommit
+    $o.LastLocalCommit = ConvertTo-OptionalUpdateStateString $LastLocalCommit
+    $o.LastDoHBlockUtc = ConvertTo-OptionalUpdateStateString $LastDoHBlockUtc
+    $o.LastDoHBlockResult = ConvertTo-OptionalUpdateStateString $LastDoHBlockResult
+    $o.LastVpnBlockUtc = ConvertTo-OptionalUpdateStateString $LastVpnBlockUtc
+    $o.LastVpnBlockResult = ConvertTo-OptionalUpdateStateString $LastVpnBlockResult
+    $o.LastDnsForceUtc = ConvertTo-OptionalUpdateStateString $LastDnsForceUtc
+    $o.LastDnsForceResult = ConvertTo-OptionalUpdateStateString $LastDnsForceResult
+    $o.LastScpAllowUtc = ConvertTo-OptionalUpdateStateString $LastScpAllowUtc
+    $o.LastScpAllowResult = ConvertTo-OptionalUpdateStateString $LastScpAllowResult
+    return $o
+}
+
 function Read-UpdateState {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{
-            NextUpdateCheckUtc   = [datetime]::UtcNow.ToString('o')
-            LastUpdateCheckUtc   = $null
-            LastResult           = 'never'
-            LastRemoteCommit     = $null
-            LastLocalCommit      = $null
-            LastDoHBlockUtc      = $null
-            LastDoHBlockResult   = $null
-            LastVpnBlockUtc      = $null
-            LastVpnBlockResult   = $null
-            LastDnsForceUtc      = $null
-            LastDnsForceResult   = $null
-            LastScpAllowUtc      = $null
-            LastScpAllowResult   = $null
-        }
+        return (New-UpdateStateObject -LastResult 'never')
     }
 
     try {
-        $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        # StrictMode-safe: older update-state.json files omit fields added later.
-        $vNextDue = Get-OptionalPropertyValue -InputObject $json -Name 'NextUpdateCheckUtc'
-        $vLastCheck = Get-OptionalPropertyValue -InputObject $json -Name 'LastUpdateCheckUtc'
-        $vLastResult = Get-OptionalPropertyValue -InputObject $json -Name 'LastResult'
-        $vRemote = Get-OptionalPropertyValue -InputObject $json -Name 'LastRemoteCommit'
-        $vLocal = Get-OptionalPropertyValue -InputObject $json -Name 'LastLocalCommit'
-        $vDoHUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastDoHBlockUtc'
-        $vDoHRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastDoHBlockResult'
-        $vVpnUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastVpnBlockUtc'
-        $vVpnRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastVpnBlockResult'
-        $vDnsUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastDnsForceUtc'
-        $vDnsRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastDnsForceResult'
-        $vScpUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastScpAllowUtc'
-        $vScpRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastScpAllowResult'
-        return [pscustomobject]@{
-            NextUpdateCheckUtc   = $(if ($vNextDue) { [string]$vNextDue } else { [datetime]::UtcNow.ToString('o') })
-            LastUpdateCheckUtc   = $(if ($vLastCheck) { [string]$vLastCheck } else { $null })
-            LastResult           = $(if ($vLastResult) { [string]$vLastResult } else { 'unknown' })
-            LastRemoteCommit     = $(if ($vRemote) { [string]$vRemote } else { $null })
-            LastLocalCommit      = $(if ($vLocal) { [string]$vLocal } else { $null })
-            LastDoHBlockUtc      = $(if ($vDoHUtc) { [string]$vDoHUtc } else { $null })
-            LastDoHBlockResult   = $(if ($vDoHRes) { [string]$vDoHRes } else { $null })
-            LastVpnBlockUtc      = $(if ($vVpnUtc) { [string]$vVpnUtc } else { $null })
-            LastVpnBlockResult   = $(if ($vVpnRes) { [string]$vVpnRes } else { $null })
-            LastDnsForceUtc      = $(if ($vDnsUtc) { [string]$vDnsUtc } else { $null })
-            LastDnsForceResult   = $(if ($vDnsRes) { [string]$vDnsRes } else { $null })
-            LastScpAllowUtc      = $(if ($vScpUtc) { [string]$vScpUtc } else { $null })
-            LastScpAllowResult   = $(if ($vScpRes) { [string]$vScpRes } else { $null })
-        }
+        $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 |
+            ConvertFrom-Json
+        # StrictMode-safe: older update-state.json files omit fields
+        # added later.
+        $vNextDue = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'NextUpdateCheckUtc'
+        $vLastCheck = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastUpdateCheckUtc'
+        $vLastResult = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastResult'
+        $vRemote = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastRemoteCommit'
+        $vLocal = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastLocalCommit'
+        $vDoHUtc = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastDoHBlockUtc'
+        $vDoHRes = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastDoHBlockResult'
+        $vVpnUtc = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastVpnBlockUtc'
+        $vVpnRes = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastVpnBlockResult'
+        $vDnsUtc = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastDnsForceUtc'
+        $vDnsRes = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastDnsForceResult'
+        $vScpUtc = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastScpAllowUtc'
+        $vScpRes = Get-OptionalPropertyValue -InputObject $json `
+            -Name 'LastScpAllowResult'
+        return (New-UpdateStateObject `
+                -NextUpdateCheckUtc $(
+                    if ($vNextDue) { [string]$vNextDue } else { $null }) `
+                -LastUpdateCheckUtc $(
+                    if ($vLastCheck) { [string]$vLastCheck } else { $null }) `
+                -LastResult $(
+                    if ($vLastResult) { [string]$vLastResult } else { 'unknown' }) `
+                -LastRemoteCommit $(
+                    if ($vRemote) { [string]$vRemote } else { $null }) `
+                -LastLocalCommit $(
+                    if ($vLocal) { [string]$vLocal } else { $null }) `
+                -LastDoHBlockUtc $(
+                    if ($vDoHUtc) { [string]$vDoHUtc } else { $null }) `
+                -LastDoHBlockResult $(
+                    if ($vDoHRes) { [string]$vDoHRes } else { $null }) `
+                -LastVpnBlockUtc $(
+                    if ($vVpnUtc) { [string]$vVpnUtc } else { $null }) `
+                -LastVpnBlockResult $(
+                    if ($vVpnRes) { [string]$vVpnRes } else { $null }) `
+                -LastDnsForceUtc $(
+                    if ($vDnsUtc) { [string]$vDnsUtc } else { $null }) `
+                -LastDnsForceResult $(
+                    if ($vDnsRes) { [string]$vDnsRes } else { $null }) `
+                -LastScpAllowUtc $(
+                    if ($vScpUtc) { [string]$vScpUtc } else { $null }) `
+                -LastScpAllowResult $(
+                    if ($vScpRes) { [string]$vScpRes } else { $null }))
     }
     catch {
-        Write-LoggerEvent -Level WARN -Message ("Corrupt update-state.json; resetting. {0}" -f $_.Exception.Message)
-        return [pscustomobject]@{
-            NextUpdateCheckUtc   = [datetime]::UtcNow.ToString('o')
-            LastUpdateCheckUtc   = $null
-            LastResult           = 'reset-corrupt'
-            LastRemoteCommit     = $null
-            LastLocalCommit      = $null
-            LastDoHBlockUtc      = $null
-            LastDoHBlockResult   = $null
-            LastVpnBlockUtc      = $null
-            LastVpnBlockResult   = $null
-            LastDnsForceUtc      = $null
-            LastDnsForceResult   = $null
-            LastScpAllowUtc      = $null
-            LastScpAllowResult   = $null
-        }
+        # Discard log output even if Write-LoggerEvent regresses to
+        # Write-Output.
+        $null = Write-LoggerEvent -Level WARN -Message (
+            "Corrupt update-state.json; resetting. {0}" -f $_.Exception.Message)
+        # Postpone 10m so a corrupt file cannot hammer update checks
+        # every poll.
+        return (New-UpdateStateObject `
+                -NextUpdateCheckUtc (
+                    [datetime]::UtcNow.AddMinutes(10).ToString('o')) `
+                -LastResult 'reset-corrupt')
     }
 }
 
@@ -136,8 +223,32 @@ function Write-UpdateState {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
+
+    function Get-StateFieldString {
+        param([Parameter(Mandatory)][string]$Name)
+        ConvertTo-OptionalUpdateStateString (
+            Get-OptionalPropertyValue -InputObject $State -Name $Name)
+    }
+
+    # Normalize to the full key set so round-trips never drop newly
+    # added fields.
+    $normalized = New-UpdateStateObject `
+        -NextUpdateCheckUtc (Get-StateFieldString 'NextUpdateCheckUtc') `
+        -LastUpdateCheckUtc (Get-StateFieldString 'LastUpdateCheckUtc') `
+        -LastResult (Get-StateFieldString 'LastResult') `
+        -LastRemoteCommit (Get-StateFieldString 'LastRemoteCommit') `
+        -LastLocalCommit (Get-StateFieldString 'LastLocalCommit') `
+        -LastDoHBlockUtc (Get-StateFieldString 'LastDoHBlockUtc') `
+        -LastDoHBlockResult (Get-StateFieldString 'LastDoHBlockResult') `
+        -LastVpnBlockUtc (Get-StateFieldString 'LastVpnBlockUtc') `
+        -LastVpnBlockResult (Get-StateFieldString 'LastVpnBlockResult') `
+        -LastDnsForceUtc (Get-StateFieldString 'LastDnsForceUtc') `
+        -LastDnsForceResult (Get-StateFieldString 'LastDnsForceResult') `
+        -LastScpAllowUtc (Get-StateFieldString 'LastScpAllowUtc') `
+        -LastScpAllowResult (Get-StateFieldString 'LastScpAllowResult')
     $tempPath = "$Path.tmp"
-    ($State | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    ($normalized | ConvertTo-Json -Depth 5) |
+        Set-Content -LiteralPath $tempPath -Encoding UTF8
     Move-Item -LiteralPath $tempPath -Destination $Path -Force
 }
 
@@ -278,7 +389,7 @@ function Sync-UpdateRepository {
     }
 
     if (-not (Test-Path -LiteralPath (Join-Path $ClonePath '.git'))) {
-        Write-LoggerEvent ("Cloning {0} (branch {1}) into {2}" -f $RepoUrl, $Branch, $ClonePath)
+        $null = Write-LoggerEvent ("Cloning {0} (branch {1}) into {2}" -f $RepoUrl, $Branch, $ClonePath)
         $clone = Invoke-GitCommand -GitExe $GitExe -Arguments @(
             'clone', '--branch', $Branch, '--single-branch', '--depth', '1', $RepoUrl, $ClonePath
         )
@@ -287,7 +398,7 @@ function Sync-UpdateRepository {
         }
     }
     else {
-        Write-LoggerEvent ("git fetch/pull in {0}" -f $ClonePath)
+        $null = Write-LoggerEvent ("git fetch/pull in {0}" -f $ClonePath)
         $fetch = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('fetch', 'origin', $Branch)
         if ($fetch.ExitCode -ne 0) {
             throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, $fetch.Output)
@@ -295,7 +406,9 @@ function Sync-UpdateRepository {
         # Unattended-safe equivalent of updating to newest tip after pull/fetch.
         $pull = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('pull', '--ff-only', 'origin', $Branch)
         if ($pull.ExitCode -ne 0) {
-            Write-LoggerEvent -Level WARN -Message ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, $pull.Output)
+            $null = Write-LoggerEvent -Level WARN -Message (
+                "git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f `
+                    $Branch, $pull.Output)
             $reset = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('reset', '--hard', ("origin/{0}" -f $Branch))
             if ($reset.ExitCode -ne 0) {
                 throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
