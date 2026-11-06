@@ -214,6 +214,58 @@ function Read-UpdateState {
     }
 }
 
+function ConvertTo-UpdateStateObject {
+    <#
+      Rebuild a full update-state object from any partial/polluted input so
+      StrictMode property sets (LastVpnBlockUtc, NextUpdateCheckUtc, ...) never
+      throw PropertyAssignmentException.
+    #>
+    param($State)
+
+    function Get-StateFieldString {
+        param([Parameter(Mandatory)][string]$Name)
+        ConvertTo-OptionalUpdateStateString (
+            Get-OptionalPropertyValue -InputObject $State -Name $Name)
+    }
+
+    return (New-UpdateStateObject `
+            -NextUpdateCheckUtc (Get-StateFieldString 'NextUpdateCheckUtc') `
+            -LastUpdateCheckUtc (Get-StateFieldString 'LastUpdateCheckUtc') `
+            -LastResult (Get-StateFieldString 'LastResult') `
+            -LastRemoteCommit (Get-StateFieldString 'LastRemoteCommit') `
+            -LastLocalCommit (Get-StateFieldString 'LastLocalCommit') `
+            -LastDoHBlockUtc (Get-StateFieldString 'LastDoHBlockUtc') `
+            -LastDoHBlockResult (Get-StateFieldString 'LastDoHBlockResult') `
+            -LastVpnBlockUtc (Get-StateFieldString 'LastVpnBlockUtc') `
+            -LastVpnBlockResult (Get-StateFieldString 'LastVpnBlockResult') `
+            -LastDnsForceUtc (Get-StateFieldString 'LastDnsForceUtc') `
+            -LastDnsForceResult (Get-StateFieldString 'LastDnsForceResult') `
+            -LastScpAllowUtc (Get-StateFieldString 'LastScpAllowUtc') `
+            -LastScpAllowResult (Get-StateFieldString 'LastScpAllowResult'))
+}
+
+function Set-UpdateStateProperty {
+    <#
+      StrictMode-safe property set: Add-Member -Force when the NoteProperty is
+      missing (incomplete JSON / polluted Read-UpdateState returns).
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][string]$Name,
+        $Value
+    )
+    if ($null -eq $State) {
+        return
+    }
+    $prop = $State.PSObject.Properties[$Name]
+    if ($null -eq $prop) {
+        Add-Member -InputObject $State -NotePropertyName $Name -NotePropertyValue $Value -Force
+    }
+    else {
+        $State.$Name = $Value
+    }
+}
+
 function Write-UpdateState {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -224,32 +276,21 @@ function Write-UpdateState {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 
-    function Get-StateFieldString {
-        param([Parameter(Mandatory)][string]$Name)
-        ConvertTo-OptionalUpdateStateString (
-            Get-OptionalPropertyValue -InputObject $State -Name $Name)
-    }
-
     # Normalize to the full key set so round-trips never drop newly
     # added fields.
-    $normalized = New-UpdateStateObject `
-        -NextUpdateCheckUtc (Get-StateFieldString 'NextUpdateCheckUtc') `
-        -LastUpdateCheckUtc (Get-StateFieldString 'LastUpdateCheckUtc') `
-        -LastResult (Get-StateFieldString 'LastResult') `
-        -LastRemoteCommit (Get-StateFieldString 'LastRemoteCommit') `
-        -LastLocalCommit (Get-StateFieldString 'LastLocalCommit') `
-        -LastDoHBlockUtc (Get-StateFieldString 'LastDoHBlockUtc') `
-        -LastDoHBlockResult (Get-StateFieldString 'LastDoHBlockResult') `
-        -LastVpnBlockUtc (Get-StateFieldString 'LastVpnBlockUtc') `
-        -LastVpnBlockResult (Get-StateFieldString 'LastVpnBlockResult') `
-        -LastDnsForceUtc (Get-StateFieldString 'LastDnsForceUtc') `
-        -LastDnsForceResult (Get-StateFieldString 'LastDnsForceResult') `
-        -LastScpAllowUtc (Get-StateFieldString 'LastScpAllowUtc') `
-        -LastScpAllowResult (Get-StateFieldString 'LastScpAllowResult')
+    $normalized = ConvertTo-UpdateStateObject -State $State
     $tempPath = "$Path.tmp"
     ($normalized | ConvertTo-Json -Depth 5) |
         Set-Content -LiteralPath $tempPath -Encoding UTF8
-    Move-Item -LiteralPath $tempPath -Destination $Path -Force
+    try {
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+    }
 }
 
 function Get-InstalledCommit {
@@ -446,8 +487,6 @@ function Publish-InstalledFilesFromRepo {
         'Scp-OnLock.ps1'
         'LockSignalWatcher.ps1'
         'LockSignalLauncher.ps1'
-        # Required for UnlockQuotaEnabled warning + LockWorkStation in-session.
-        'Show-UnlockQuotaWarning.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name
@@ -457,8 +496,10 @@ function Publish-InstalledFilesFromRepo {
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
 
-    # Optional for older update clones (keep existing Program Files copy).
-    foreach ($optionalName in @('Common-Smtp.ps1')) {
+    # Optional for older/stale update clones (keep existing Program Files copy).
+    # Show-UnlockQuotaWarning must not hard-fail Restart when UpdateClonePath
+    # lags the worktree; LoginTimeLogger already no-ops if the script is absent.
+    foreach ($optionalName in @('Common-Smtp.ps1', 'Show-UnlockQuotaWarning.ps1')) {
         $from = Join-Path $srcDir $optionalName
         if (Test-Path -LiteralPath $from) {
             Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $optionalName) -Force
@@ -874,6 +915,7 @@ function Invoke-DailyDoHFirewallBlock {
         [Parameter(Mandatory)][string]$StatePath
     )
 
+    $UpdateState = ConvertTo-UpdateStateObject -State $UpdateState
     $scriptPath = $null
     $providersPath = $null
 
@@ -955,6 +997,7 @@ function Invoke-DailyScpOutboundAllow {
         [Parameter(Mandatory)]$Config
     )
 
+    $UpdateState = ConvertTo-UpdateStateObject -State $UpdateState
     if (-not $Config.ScpOnLockEnabled) {
         $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
         $UpdateState.LastScpAllowResult = 'skipped-scp-disabled'
@@ -1041,6 +1084,7 @@ function Invoke-DailyVpnFirewallBlock {
         [Parameter(Mandatory)][string]$StatePath
     )
 
+    $UpdateState = ConvertTo-UpdateStateObject -State $UpdateState
     $scriptPath = $null
     $providersPath = $null
 
@@ -1131,6 +1175,7 @@ function Invoke-DailyDnsForceLocalResolver {
         [Parameter(Mandatory)]$Config
     )
 
+    $UpdateState = ConvertTo-UpdateStateObject -State $UpdateState
     $dnsServer = ''
     if (-not [string]::IsNullOrWhiteSpace([string]$Config.ServerDNS)) {
         $dnsServer = [string]$Config.ServerDNS.Trim()
@@ -1323,11 +1368,16 @@ function Invoke-LoginTimeLoggerUpdateCheck {
     }
 
     $statePath = Get-UpdateStatePath -AdminAppDirectory $AdminAppDirectory
-    $updateState = Read-UpdateState -Path $statePath
+    # Re-wrap every read so StrictMode sets never fail on older JSON or a
+    # polluted return (historical Write-LoggerEvent Write-Output bug).
+    $updateState = ConvertTo-UpdateStateObject -State (Read-UpdateState -Path $statePath)
 
     $nextDue = [datetime]::MinValue
     try {
-        $nextDue = [datetime]::Parse($updateState.NextUpdateCheckUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        $nextDue = [datetime]::Parse(
+            [string]$updateState.NextUpdateCheckUtc,
+            $null,
+            [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     }
     catch {
         $nextDue = [datetime]::UtcNow
@@ -1340,9 +1390,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
     Write-LoggerEvent 'Update check starting...'
 
     if (-not (Test-TrustedUpdateRepoUrl -RepoUrl $Config.UpdateRepoUrl)) {
-        $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
-        $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
-        $updateState.LastResult = 'untrusted-repo-url'
+        Set-UpdateStateProperty -State $updateState -Name 'NextUpdateCheckUtc' `
+            -Value ([datetime]::UtcNow.AddDays(1).ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastUpdateCheckUtc' `
+            -Value ([datetime]::UtcNow.ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastResult' `
+            -Value 'untrusted-repo-url'
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent -Level ERROR -Message ("Update check blocked: UpdateRepoUrl is not an allowed HTTPS GitHub repo ({0})." -f $Config.UpdateRepoUrl)
         return
@@ -1350,9 +1403,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
 
     if (-not (Test-InternetAvailable)) {
         $postpone = [datetime]::UtcNow.AddMinutes(10)
-        $updateState.NextUpdateCheckUtc = $postpone.ToString('o')
-        $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
-        $updateState.LastResult = 'offline-postpone-10m'
+        Set-UpdateStateProperty -State $updateState -Name 'NextUpdateCheckUtc' `
+            -Value ($postpone.ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastUpdateCheckUtc' `
+            -Value ([datetime]::UtcNow.ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastResult' `
+            -Value 'offline-postpone-10m'
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent -Level WARN -Message ("No internet connection; update check postponed until {0} (UTC)." -f $updateState.NextUpdateCheckUtc)
         return
@@ -1360,9 +1416,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
 
     $gitExe = Find-GitExecutable
     if (-not $gitExe) {
-        $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
-        $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
-        $updateState.LastResult = 'git-missing'
+        Set-UpdateStateProperty -State $updateState -Name 'NextUpdateCheckUtc' `
+            -Value ([datetime]::UtcNow.AddDays(1).ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastUpdateCheckUtc' `
+            -Value ([datetime]::UtcNow.ToString('o'))
+        Set-UpdateStateProperty -State $updateState -Name 'LastResult' `
+            -Value 'git-missing'
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent -Level ERROR -Message 'Update check skipped: git.exe not found on PATH or in common install locations.'
         return

@@ -36,6 +36,8 @@ function Protect-ScpPrivateKeyFile {
       OpenSSH refuses private keys that any non-caller account can read.
       The monitor runs scp as SYSTEM, so the key must be SYSTEM-only
       (admin+Users ACEs cause "UNPROTECTED PRIVATE KEY FILE").
+      Uses Set-Acl then icacls so leftover admin (e.g. InWin\dluka) ACEs
+      cannot remain after a prior Install as that user.
     #>
     param([Parameter(Mandatory)][string]$IdentityPath)
 
@@ -55,6 +57,36 @@ function Protect-ScpPrivateKeyFile {
                 [System.Security.AccessControl.FileSystemRights]::FullControl,
                 [System.Security.AccessControl.AccessControlType]::Allow)))
     Set-Acl -LiteralPath $IdentityPath -AclObject $acl
+
+    # Reinforce with icacls (OpenSSH is picky; Set-Acl alone can leave the
+    # creating admin readable on some hosts).
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    if (Test-Path -LiteralPath $icacls) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & $icacls $IdentityPath /inheritance:r 2>&1
+            $null = & $icacls $IdentityPath /grant:r '*S-1-5-18:(F)' 2>&1
+            # Drop every remaining non-SYSTEM allow ACE.
+            $acl2 = Get-Acl -LiteralPath $IdentityPath
+            foreach ($rule in @($acl2.Access)) {
+                try {
+                    $sid = $rule.IdentityReference.Translate(
+                        [System.Security.Principal.SecurityIdentifier])
+                }
+                catch {
+                    $sid = $null
+                }
+                if ($null -eq $sid -or $sid.Value -ne 'S-1-5-18') {
+                    $null = $acl2.RemoveAccessRule($rule)
+                }
+            }
+            Set-Acl -LiteralPath $IdentityPath -AclObject $acl2
+        }
+        finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
 }
 
 function New-ScpIdentityKeyFile {
