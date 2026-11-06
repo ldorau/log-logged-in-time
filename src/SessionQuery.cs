@@ -929,6 +929,18 @@ public static class SessionQuery
     private const short SW_HIDE = 0;
     private const short SW_SHOWNORMAL = 1;
     private const int CREATE_NEW_CONSOLE = 0x00000010;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const uint WAIT_OBJECT_0 = 0;
+    private const uint WAIT_TIMEOUT = 0x00000102;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
     [DllImport("wtsapi32.dll", SetLastError = true)]
     private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr phToken);
@@ -1042,13 +1054,15 @@ public static class SessionQuery
     /// Starts a process in the target user's interactive session (requires SYSTEM / SeTcbPrivilege).
     /// Used to show UI and call LockWorkStation on that user's desktop.
     /// </summary>
-    /// <param name="showWindow">When true, the process is started visible (for WinForms warning UI).</param>
+    /// <param name="showWindow">When true, start with a normal show flag; prefer false + -WindowStyle Hidden for PowerShell WinForms.</param>
+    /// <param name="waitTimeoutMs">When &gt; 0, wait for the process to exit and require exit code 0.</param>
     public static bool LaunchInUserSession(
         string accountName,
         string applicationPath,
         string arguments,
         out string error,
-        bool showWindow = false)
+        bool showWindow = false,
+        int waitTimeoutMs = 0)
     {
         error = string.Empty;
         if (string.IsNullOrWhiteSpace(accountName))
@@ -1116,7 +1130,8 @@ public static class SessionQuery
             si.dwFlags = (int)STARTF_USESHOWWINDOW;
             si.wShowWindow = showWindow ? SW_SHOWNORMAL : SW_HIDE;
 
-            uint flags = CREATE_UNICODE_ENVIRONMENT | (uint)CREATE_NEW_CONSOLE;
+            // CREATE_NO_WINDOW avoids a visible PowerShell console; WinForms can still ShowDialog.
+            uint flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
             if (!CreateProcessAsUser(
                     primaryToken,
                     null,
@@ -1134,6 +1149,39 @@ public static class SessionQuery
                         "; sessionId=" + session.SessionId + "; cmd=" + commandLine;
                 SetLastError(error);
                 return false;
+            }
+
+            if (waitTimeoutMs > 0)
+            {
+                uint wait = WaitForSingleObject(pi.hProcess, (uint)waitTimeoutMs);
+                if (wait == WAIT_TIMEOUT)
+                {
+                    TerminateProcess(pi.hProcess, 1);
+                    error = "LaunchInUserSession timed out after " + waitTimeoutMs + "ms.";
+                    SetLastError(error);
+                    return false;
+                }
+                if (wait != WAIT_OBJECT_0)
+                {
+                    error = "WaitForSingleObject failed; result=" + wait +
+                            "; Win32Error=" + Marshal.GetLastWin32Error();
+                    SetLastError(error);
+                    return false;
+                }
+
+                uint exitCode = 1;
+                if (!GetExitCodeProcess(pi.hProcess, out exitCode))
+                {
+                    error = "GetExitCodeProcess failed; Win32Error=" + Marshal.GetLastWin32Error();
+                    SetLastError(error);
+                    return false;
+                }
+                if (exitCode != 0)
+                {
+                    error = "Child process exited with code " + exitCode + ".";
+                    SetLastError(error);
+                    return false;
+                }
             }
 
             SetLastError(string.Empty);

@@ -539,20 +539,20 @@ function Set-AdminSystemOnlyFileAcl {
 }
 
 function Write-JsonFilePreserveAcl {
+    <#
+      Prefer in-place Set-Content (preserves DACL). Avoid Move-Item replace, which
+      drops a protected ACL in favor of inherited directory ACEs.
+      When -RequireAdminOnlyAcl is set, refuse to write without a resolved admin SID.
+    #>
     param(
         [Parameter(Mandatory)][string]$DestPath,
         [Parameter(Mandatory)][string]$JsonText,
-        [System.Security.Principal.SecurityIdentifier]$AdminOnlySid = $null
+        [System.Security.Principal.SecurityIdentifier]$AdminOnlySid = $null,
+        [switch]$RequireAdminOnlyAcl
     )
 
-    $priorAcl = $null
-    if (Test-Path -LiteralPath $DestPath) {
-        try {
-            $priorAcl = Get-Acl -LiteralPath $DestPath
-        }
-        catch {
-            $priorAcl = $null
-        }
+    if ($RequireAdminOnlyAcl -and $null -eq $AdminOnlySid) {
+        throw ("Refusing to write '{0}' without admin SID (would risk exposing secrets)." -f $DestPath)
     }
 
     $destDir = Split-Path -Parent $DestPath
@@ -560,15 +560,20 @@ function Write-JsonFilePreserveAcl {
         New-Item -ItemType Directory -Path $destDir -Force | Out-Null
     }
 
-    $tempPath = "$DestPath.tmp"
-    Set-Content -LiteralPath $tempPath -Value $JsonText -Encoding UTF8
-    Move-Item -LiteralPath $tempPath -Destination $DestPath -Force
+    $destExisted = Test-Path -LiteralPath $DestPath
+    if ($destExisted) {
+        # In-place rewrite keeps the existing DACL (unlike temp+Move-Item).
+        Set-Content -LiteralPath $DestPath -Value $JsonText -Encoding UTF8
+    }
+    else {
+        Set-Content -LiteralPath $DestPath -Value $JsonText -Encoding UTF8
+    }
 
     if ($null -ne $AdminOnlySid) {
         Set-AdminSystemOnlyFileAcl -Path $DestPath -AllowedAdminSid $AdminOnlySid
     }
-    elseif ($null -ne $priorAcl) {
-        Set-Acl -LiteralPath $DestPath -AclObject $priorAcl
+    elseif ($RequireAdminOnlyAcl) {
+        throw ("Refusing to leave '{0}' without admin-only ACL." -f $DestPath)
     }
 }
 
@@ -583,7 +588,8 @@ function Merge-InstalledJsonConfigFile {
         [Parameter(Mandatory)][string]$DestPath,
         [string]$Label = 'config',
         [System.Security.Principal.SecurityIdentifier]$AdminOnlySid = $null,
-        [switch]$OptInUnlockQuotaOnExisting
+        [switch]$OptInUnlockQuotaOnExisting,
+        [switch]$RequireAdminOnlyAcl
     )
 
     if (-not (Test-Path -LiteralPath $TemplatePath)) {
@@ -605,7 +611,8 @@ function Merge-InstalledJsonConfigFile {
     }
 
     if (-not (Test-Path -LiteralPath $DestPath)) {
-        Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $templateRaw -AdminOnlySid $AdminOnlySid
+        Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $templateRaw `
+            -AdminOnlySid $AdminOnlySid -RequireAdminOnlyAcl:$RequireAdminOnlyAcl
         Write-LoggerEvent ("Config merge ({0}): created missing file from template: {1}" -f $Label, $DestPath)
         return $true
     }
@@ -640,7 +647,8 @@ function Merge-InstalledJsonConfigFile {
     }
 
     $json = $merged | ConvertTo-Json -Depth 12
-    Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $json -AdminOnlySid $AdminOnlySid
+    Write-JsonFilePreserveAcl -DestPath $DestPath -JsonText $json `
+        -AdminOnlySid $AdminOnlySid -RequireAdminOnlyAcl:$RequireAdminOnlyAcl
     Write-LoggerEvent ("Config merge ({0}): added field(s) {1} to {2}." -f `
             $Label, ($addedKeys -join ', '), $DestPath)
     return $true
@@ -698,16 +706,23 @@ function Merge-InstalledConfigFilesFromRepo {
             'Failed merging new fields into installed config.json')
     }
 
-    try {
-        $null = Merge-InstalledJsonConfigFile `
-            -TemplatePath $templateSmtp `
-            -DestPath $destSmtp `
-            -Label 'smtp.json' `
-            -AdminOnlySid $adminOnlySid
+    if ($null -eq $adminOnlySid) {
+        Write-LoggerEvent -Level ERROR -Message (
+            "Config merge skipped (smtp.json): could not resolve admin SID; refusing to rewrite secrets file.")
     }
-    catch {
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
-            'Failed merging new fields into installed smtp.json')
+    else {
+        try {
+            $null = Merge-InstalledJsonConfigFile `
+                -TemplatePath $templateSmtp `
+                -DestPath $destSmtp `
+                -Label 'smtp.json' `
+                -AdminOnlySid $adminOnlySid `
+                -RequireAdminOnlyAcl
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Error -Source 'UpdateCheck' -Context (
+                'Failed merging new fields into installed smtp.json (ACL fail-closed)')
+        }
     }
 }
 
@@ -1229,6 +1244,16 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             $updateState.LastResult = 'up-to-date'
             Write-UpdateState -Path $statePath -State $updateState
             Write-LoggerEvent ("Update check: already on latest commit {0}." -f $remoteSha)
+            # Idempotent: retry config-field merges even when code is already current
+            # (covers a previously failed/skipped merge).
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.UpdateClonePath) -and
+                (Test-Path -LiteralPath ([string]$Config.UpdateClonePath))) {
+                Merge-InstalledConfigFilesFromRepo `
+                    -ClonePath $Config.UpdateClonePath `
+                    -AdminAppDirectory $AdminAppDirectory `
+                    -ConfigPath ([string]$Config.ConfigPath) `
+                    -Config $Config
+            }
             Invoke-DailyDnsForceLocalResolver `
                 -InstallRoot $InstallRoot `
                 -ClonePath ([string]$Config.UpdateClonePath) `

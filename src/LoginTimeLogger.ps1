@@ -233,7 +233,8 @@ LogDirectory in file: $cfgLogHint
     }
 
     # Every N minutes of unlocked time: warn on the target desktop, then LockWorkStation.
-    $unlockQuotaEnabled = $true
+    # Missing key => disabled (opt-in for older runtime configs). New installs write true.
+    $unlockQuotaEnabled = $false
     $cfgUnlockQuotaEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaEnabled'
     if ($null -ne $cfgUnlockQuotaEnabled) {
         $unlockQuotaEnabled = [bool]$cfgUnlockQuotaEnabled
@@ -481,10 +482,12 @@ function Invoke-UnlockQuotaWarningAndLock {
     <#
       Shows a blocking countdown on the target user's desktop, then LockWorkStation
       inside that session via CreateProcessAsUser (SessionQuery.LaunchInUserSession).
+      Waits for the child to exit successfully before the caller advances the quota bucket.
     #>
     param(
         [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$WarningScriptPath
+        [Parameter(Mandatory)][string]$WarningScriptPath,
+        [Parameter(Mandatory)][int]$ElapsedMinutes
     )
 
     if (-not (Test-Path -LiteralPath $WarningScriptPath)) {
@@ -498,21 +501,27 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
-    $minutes = [int]$Config.UnlockQuotaMinutes
+    if ($ElapsedMinutes -lt 1) {
+        $ElapsedMinutes = [int]$Config.UnlockQuotaMinutes
+    }
     $seconds = [int]$Config.UnlockQuotaWarnSeconds
-    # Visible STA process so the WinForms countdown appears on the target desktop.
-    $arguments = '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
-        $WarningScriptPath, $minutes, $seconds
+    if ($seconds -lt 1) { $seconds = 3 }
+    # Hidden console; WinForms ShowDialog still appears on the interactive desktop.
+    $arguments = '-NoProfile -NoLogo -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
+        $WarningScriptPath, $ElapsedMinutes, $seconds
 
+    # Wait for countdown + LockWorkStation + script teardown, with grace.
+    $waitMs = ($seconds * 1000) + 15000
     $launchError = ''
-    $ok = [SessionQuery]::LaunchInUserSession($Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $true)
+    $ok = [SessionQuery]::LaunchInUserSession(
+        $Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $false, $waitMs)
     if (-not $ok) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota launch failed: {0}" -f $launchError)
         return $false
     }
 
     Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; lock requested in target session." -f `
-            $seconds, $minutes)
+            $seconds, $ElapsedMinutes)
     return $true
 }
 
@@ -761,9 +770,13 @@ while ($true) {
                 # retries when CreateProcessAsUser fails).
                 if ($newBucket -gt [int]$state.LastUnlockQuotaBucket) {
                     $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+                    $elapsedMinutes = [int]($newBucket * [int]$config.UnlockQuotaMinutes)
                     $launched = $false
                     try {
-                        $launched = [bool](Invoke-UnlockQuotaWarningAndLock -Config $config -WarningScriptPath $warnScript)
+                        $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
+                                -Config $config `
+                                -WarningScriptPath $warnScript `
+                                -ElapsedMinutes $elapsedMinutes)
                     }
                     catch {
                         $launched = $false
