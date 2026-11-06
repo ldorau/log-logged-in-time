@@ -268,7 +268,7 @@ try {
     }
 
     if (-not $SkipConfigMerge) {
-        $templateConfig = Join-Path $sourceRoot 'config\config.json'
+        $templateConfig = $templateConfigPath
         $templateSmtp = Join-Path $sourceRoot 'config\smtp.json'
         $destConfig = $resolvedConfigPath
         $destSmtp = Join-Path $adminAppDirectory 'smtp.json'
