@@ -594,8 +594,9 @@ function Test-InstallPrerequisites {
             # Parameter values win over template placeholders.
             $raw.TargetUsername = $TargetUsername
             $raw.AdministratorProfile = $administratorProfile
-            if ($null -ne $raw.UpdateEnabled) {
-                $updateEnabled = [bool]$raw.UpdateEnabled
+            $cfgUpdateEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateEnabled'
+            if ($null -ne $cfgUpdateEnabled) {
+                $updateEnabled = [bool]$cfgUpdateEnabled
             }
             Write-CheckResult -Name 'Config UpdateEnabled' -Ok $true -Detail $(
                 if ($updateEnabled) { 'true (Git required)' } else { 'false (Git optional / skipped)' }
@@ -627,8 +628,11 @@ function Test-InstallPrerequisites {
     # --- git + trusted UpdateRepoUrl (only when self-update is enabled) ---
     if ($updateEnabled) {
         $repoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
-        if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
-            $repoUrl = [string]$raw.UpdateRepoUrl
+        if ($raw) {
+            $cfgRepoUrl = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateRepoUrl'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgRepoUrl)) {
+                $repoUrl = [string]$cfgRepoUrl
+            }
         }
         $repoTrusted = $false
         try {
@@ -674,8 +678,11 @@ function Test-InstallPrerequisites {
 
     # --- OpenSSH scp (only when SCP-on-lock is enabled) ---
     $scpOnLockEnabled = $false
-    if ($raw -and $null -ne $raw.ScpOnLockEnabled) {
-        $scpOnLockEnabled = [bool]$raw.ScpOnLockEnabled
+    if ($raw) {
+        $cfgScpOnLock = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
+        if ($null -ne $cfgScpOnLock) {
+            $scpOnLockEnabled = [bool]$cfgScpOnLock
+        }
     }
     if ($scpOnLockEnabled) {
         $scpPath = Find-ScpExecutable
@@ -694,12 +701,15 @@ function Test-InstallPrerequisites {
             Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail $scpPath
         }
 
-        $scpHostOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)
-        $scpUserOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)
-        $scpDirOk = $raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)
+        $scpHostVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost') } else { '' }
+        $scpUserVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser') } else { '' }
+        $scpDirVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpRemoteDirectory') } else { '' }
+        $scpHostOk = -not [string]::IsNullOrWhiteSpace($scpHostVal)
+        $scpUserOk = -not [string]::IsNullOrWhiteSpace($scpUserVal)
+        $scpDirOk = -not [string]::IsNullOrWhiteSpace($scpDirVal)
         Write-CheckResult -Name 'SCP remote host/user/directory' -Ok ($scpHostOk -and $scpUserOk -and $scpDirOk) -Detail $(
             if ($scpHostOk -and $scpUserOk -and $scpDirOk) {
-                '{0}@{1}:{2}' -f $raw.ScpUser, $raw.ScpHost, $raw.ScpRemoteDirectory
+                '{0}@{1}:{2}' -f $scpUserVal, $scpHostVal, $scpDirVal
             }
             else {
                 'set ScpHost, ScpUser, and ScpRemoteDirectory in config\config.json'
@@ -710,8 +720,9 @@ function Test-InstallPrerequisites {
         }
 
         $identityPath = $null
-        if ($raw -and -not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
-            $identityPath = [string]$raw.ScpIdentityFile
+        $scpIdentityVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile') } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($scpIdentityVal)) {
+            $identityPath = $scpIdentityVal
         }
         else {
             $identityPath = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
@@ -1102,25 +1113,30 @@ try {
     }
 
     $pollSeconds = 5
-    if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
-        $pollSeconds = [int]$raw.PollIntervalSeconds
+    $cfgPoll = Get-OptionalPropertyValue -InputObject $raw -Name 'PollIntervalSeconds'
+    if ($null -ne $cfgPoll -and [int]$cfgPoll -gt 0) {
+        $pollSeconds = [int]$cfgPoll
     }
 
     $updateEnabled = $true
-    if ($null -ne $raw.UpdateEnabled) {
-        $updateEnabled = [bool]$raw.UpdateEnabled
+    $cfgUpdateEnabledRuntime = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateEnabled'
+    if ($null -ne $cfgUpdateEnabledRuntime) {
+        $updateEnabled = [bool]$cfgUpdateEnabledRuntime
     }
     $updateRepoUrl = 'https://github.com/ldorau/log-logged-in-time.git'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateRepoUrl)) {
-        $updateRepoUrl = [string]$raw.UpdateRepoUrl
+    $cfgUpdateRepo = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateRepoUrl'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateRepo)) {
+        $updateRepoUrl = [string]$cfgUpdateRepo
     }
     $updateBranch = 'main'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateBranch)) {
-        $updateBranch = [string]$raw.UpdateBranch
+    $cfgUpdateBranch = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateBranch'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateBranch)) {
+        $updateBranch = [string]$cfgUpdateBranch
     }
     $updateClonePath = Join-Path $administratorProfile 'LoginTimeLogger\repo'
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.UpdateClonePath)) {
-        $updateClonePath = [string]$raw.UpdateClonePath
+    $cfgUpdateClone = Get-OptionalPropertyValue -InputObject $raw -Name 'UpdateClonePath'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgUpdateClone)) {
+        $updateClonePath = [string]$cfgUpdateClone
     }
 
     $serverDns = ''
@@ -1130,35 +1146,42 @@ try {
     }
 
     $scpOnLockEnabledRuntime = $false
-    if ($null -ne $raw.ScpOnLockEnabled) {
-        $scpOnLockEnabledRuntime = [bool]$raw.ScpOnLockEnabled
+    $cfgScpOnLockRuntime = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
+    if ($null -ne $cfgScpOnLockRuntime) {
+        $scpOnLockEnabledRuntime = [bool]$cfgScpOnLockRuntime
     }
     $scpHost = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpHost)) {
-        $scpHost = [string]$raw.ScpHost
+    $cfgScpHost = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpHost)) {
+        $scpHost = [string]$cfgScpHost
     }
     $scpUser = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpUser)) {
-        $scpUser = [string]$raw.ScpUser
+    $cfgScpUser = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpUser)) {
+        $scpUser = [string]$cfgScpUser
     }
     $scpRemoteDirectory = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpRemoteDirectory)) {
-        $scpRemoteDirectory = [string]$raw.ScpRemoteDirectory
+    $cfgScpRemote = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpRemoteDirectory'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpRemote)) {
+        $scpRemoteDirectory = [string]$cfgScpRemote
     }
     $scpPort = 22
-    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
-        $scpPort = [int]$raw.ScpPort
+    $cfgScpPort = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpPort'
+    if ($null -ne $cfgScpPort -and [int]$cfgScpPort -gt 0) {
+        $scpPort = [int]$cfgScpPort
     }
     $scpIdentityFile = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpIdentityFile)) {
-        $scpIdentityFile = [string]$raw.ScpIdentityFile
+    $cfgScpIdentity = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpIdentity)) {
+        $scpIdentityFile = [string]$cfgScpIdentity
     }
     elseif ($scpOnLockEnabledRuntime) {
         $scpIdentityFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
     }
     $scpKnownHostsFile = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$raw.ScpKnownHostsFile)) {
-        $scpKnownHostsFile = [string]$raw.ScpKnownHostsFile
+    $cfgScpKnownHosts = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpKnownHostsFile'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpKnownHosts)) {
+        $scpKnownHostsFile = [string]$cfgScpKnownHosts
     }
     elseif ($scpOnLockEnabledRuntime) {
         $scpKnownHostsFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\known_hosts'
@@ -1178,7 +1201,7 @@ SystemDrive: $env:SystemDrive
     $adminAppDirectory = Join-Path $administratorProfile 'LoginTimeLogger'
     $runtimeConfigPath = Join-Path $adminAppDirectory 'config.json'
 
-    $logDirectory = [string]$raw.LogDirectory
+    $logDirectory = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory')
     if ([string]::IsNullOrWhiteSpace($logDirectory)) {
         $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     }
@@ -1186,18 +1209,34 @@ SystemDrive: $env:SystemDrive
     $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
     $lockSignalTaskName = 'LoginTimeLoggerLockSignal'
 
+    $unlockQuotaEnabled = $true
+    $cfgUnlockQuotaEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaEnabled'
+    if ($null -ne $cfgUnlockQuotaEnabled) {
+        $unlockQuotaEnabled = [bool]$cfgUnlockQuotaEnabled
+    }
+    $unlockQuotaMinutes = 30
+    $cfgUnlockQuotaMinutes = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinutes'
+    if ($null -ne $cfgUnlockQuotaMinutes -and [int]$cfgUnlockQuotaMinutes -gt 0) {
+        $unlockQuotaMinutes = [int]$cfgUnlockQuotaMinutes
+    }
+    $unlockQuotaWarnSeconds = 3
+    $cfgUnlockQuotaWarn = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaWarnSeconds'
+    if ($null -ne $cfgUnlockQuotaWarn -and [int]$cfgUnlockQuotaWarn -gt 0) {
+        $unlockQuotaWarnSeconds = [int]$cfgUnlockQuotaWarn
+    }
+
     $config = [ordered]@{
-        AdminUsername        = [string]$AdminUsername
-        TargetUsername       = $targetUsername
-        AdministratorProfile = $administratorProfile
-        LogDirectory         = $logDirectory
-        PollIntervalSeconds  = $pollSeconds
-        LockSignalPath       = $lockSignalPath
-        UpdateEnabled        = $updateEnabled
-        UpdateRepoUrl        = $updateRepoUrl
-        UpdateBranch         = $updateBranch
-        UpdateClonePath      = $updateClonePath
-        ServerDNS            = $serverDns
+        AdminUsername          = [string]$AdminUsername
+        TargetUsername         = $targetUsername
+        AdministratorProfile   = $administratorProfile
+        LogDirectory           = $logDirectory
+        PollIntervalSeconds    = $pollSeconds
+        LockSignalPath         = $lockSignalPath
+        UpdateEnabled          = $updateEnabled
+        UpdateRepoUrl          = $updateRepoUrl
+        UpdateBranch           = $updateBranch
+        UpdateClonePath        = $updateClonePath
+        ServerDNS              = $serverDns
         ScpOnLockEnabled       = $scpOnLockEnabledRuntime
         ScpHost                = $scpHost
         ScpUser                = $scpUser
@@ -1205,9 +1244,9 @@ SystemDrive: $env:SystemDrive
         ScpPort                = $scpPort
         ScpIdentityFile        = $scpIdentityFile
         ScpKnownHostsFile      = $scpKnownHostsFile
-        UnlockQuotaEnabled     = $(if ($null -ne $raw.UnlockQuotaEnabled) { [bool]$raw.UnlockQuotaEnabled } else { $true })
-        UnlockQuotaMinutes     = $(if ($null -ne $raw.UnlockQuotaMinutes -and [int]$raw.UnlockQuotaMinutes -gt 0) { [int]$raw.UnlockQuotaMinutes } else { 30 })
-        UnlockQuotaWarnSeconds = $(if ($null -ne $raw.UnlockQuotaWarnSeconds -and [int]$raw.UnlockQuotaWarnSeconds -gt 0) { [int]$raw.UnlockQuotaWarnSeconds } else { 3 })
+        UnlockQuotaEnabled     = $unlockQuotaEnabled
+        UnlockQuotaMinutes     = $unlockQuotaMinutes
+        UnlockQuotaWarnSeconds = $unlockQuotaWarnSeconds
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 

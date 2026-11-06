@@ -428,12 +428,16 @@ try {
         try {
             $sig = Get-Content -LiteralPath $lockSignalPath -Raw -Encoding UTF8 | ConvertFrom-Json
             Write-Host ("Lock signal file: Locked={0}; Reason={1}; UpdatedLocal={2}; Source={3}" -f `
-                    $sig.Locked, $sig.Reason, $sig.UpdatedLocal, $sig.Source)
+                    (Get-OptionalPropertyValue -InputObject $sig -Name 'Locked'),
+                    (Get-OptionalPropertyValue -InputObject $sig -Name 'Reason'),
+                    (Get-OptionalPropertyValue -InputObject $sig -Name 'UpdatedLocal'),
+                    (Get-OptionalPropertyValue -InputObject $sig -Name 'Source'))
             Write-Host ("  path: {0}" -f $lockSignalPath)
             $ageSec = $null
-            if (-not [string]::IsNullOrWhiteSpace([string]$sig.UpdatedUtc)) {
+            $sigUpdatedUtc = Get-OptionalPropertyValue -InputObject $sig -Name 'UpdatedUtc'
+            if (-not [string]::IsNullOrWhiteSpace([string]$sigUpdatedUtc)) {
                 try {
-                    $updatedUtc = [datetime]::Parse([string]$sig.UpdatedUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                    $updatedUtc = [datetime]::Parse([string]$sigUpdatedUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
                     $ageSec = [int]([datetime]::UtcNow - $updatedUtc.ToUniversalTime()).TotalSeconds
                 }
                 catch { }
@@ -462,9 +466,14 @@ try {
     if (Test-Path -LiteralPath $statePath) {
         try {
             $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $hours = [Math]::Round(([double]$state.UnlockedSecondsToday) / 3600.0, 2)
+            $unlockedSeconds = Get-OptionalPropertyValue -InputObject $state -Name 'UnlockedSecondsToday'
+            if ($null -eq $unlockedSeconds) { $unlockedSeconds = 0 }
+            $hours = [Math]::Round(([double]$unlockedSeconds) / 3600.0, 2)
             Write-Host ("Today ({0}): {1:F0}s (~{2}h) | currently_unlocked_tracking={3}" -f `
-                    $state.Date, $state.UnlockedSecondsToday, $hours, $state.LastUnlocked)
+                    (Get-OptionalPropertyValue -InputObject $state -Name 'Date'),
+                    $unlockedSeconds,
+                    $hours,
+                    (Get-OptionalPropertyValue -InputObject $state -Name 'LastUnlocked'))
         }
         catch {
             $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (

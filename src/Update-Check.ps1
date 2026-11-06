@@ -77,20 +77,34 @@ function Read-UpdateState {
 
     try {
         $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        # StrictMode-safe: older update-state.json files omit fields added later.
+        $vNextDue = Get-OptionalPropertyValue -InputObject $json -Name 'NextUpdateCheckUtc'
+        $vLastCheck = Get-OptionalPropertyValue -InputObject $json -Name 'LastUpdateCheckUtc'
+        $vLastResult = Get-OptionalPropertyValue -InputObject $json -Name 'LastResult'
+        $vRemote = Get-OptionalPropertyValue -InputObject $json -Name 'LastRemoteCommit'
+        $vLocal = Get-OptionalPropertyValue -InputObject $json -Name 'LastLocalCommit'
+        $vDoHUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastDoHBlockUtc'
+        $vDoHRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastDoHBlockResult'
+        $vVpnUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastVpnBlockUtc'
+        $vVpnRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastVpnBlockResult'
+        $vDnsUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastDnsForceUtc'
+        $vDnsRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastDnsForceResult'
+        $vScpUtc = Get-OptionalPropertyValue -InputObject $json -Name 'LastScpAllowUtc'
+        $vScpRes = Get-OptionalPropertyValue -InputObject $json -Name 'LastScpAllowResult'
         return [pscustomobject]@{
-            NextUpdateCheckUtc = $(if ($json.NextUpdateCheckUtc) { [string]$json.NextUpdateCheckUtc } else { [datetime]::UtcNow.ToString('o') })
-            LastUpdateCheckUtc = $(if ($json.LastUpdateCheckUtc) { [string]$json.LastUpdateCheckUtc } else { $null })
-            LastResult         = $(if ($json.LastResult) { [string]$json.LastResult } else { 'unknown' })
-            LastRemoteCommit   = $(if ($json.LastRemoteCommit) { [string]$json.LastRemoteCommit } else { $null })
-            LastLocalCommit    = $(if ($json.LastLocalCommit) { [string]$json.LastLocalCommit } else { $null })
-            LastDoHBlockUtc    = $(if ($json.LastDoHBlockUtc) { [string]$json.LastDoHBlockUtc } else { $null })
-            LastDoHBlockResult = $(if ($json.LastDoHBlockResult) { [string]$json.LastDoHBlockResult } else { $null })
-            LastVpnBlockUtc    = $(if ($json.LastVpnBlockUtc) { [string]$json.LastVpnBlockUtc } else { $null })
-            LastVpnBlockResult = $(if ($json.LastVpnBlockResult) { [string]$json.LastVpnBlockResult } else { $null })
-            LastDnsForceUtc    = $(if ($json.LastDnsForceUtc) { [string]$json.LastDnsForceUtc } else { $null })
-            LastDnsForceResult = $(if ($json.LastDnsForceResult) { [string]$json.LastDnsForceResult } else { $null })
-            LastScpAllowUtc    = $(if ($json.LastScpAllowUtc) { [string]$json.LastScpAllowUtc } else { $null })
-            LastScpAllowResult = $(if ($json.LastScpAllowResult) { [string]$json.LastScpAllowResult } else { $null })
+            NextUpdateCheckUtc   = $(if ($vNextDue) { [string]$vNextDue } else { [datetime]::UtcNow.ToString('o') })
+            LastUpdateCheckUtc   = $(if ($vLastCheck) { [string]$vLastCheck } else { $null })
+            LastResult           = $(if ($vLastResult) { [string]$vLastResult } else { 'unknown' })
+            LastRemoteCommit     = $(if ($vRemote) { [string]$vRemote } else { $null })
+            LastLocalCommit      = $(if ($vLocal) { [string]$vLocal } else { $null })
+            LastDoHBlockUtc      = $(if ($vDoHUtc) { [string]$vDoHUtc } else { $null })
+            LastDoHBlockResult   = $(if ($vDoHRes) { [string]$vDoHRes } else { $null })
+            LastVpnBlockUtc      = $(if ($vVpnUtc) { [string]$vVpnUtc } else { $null })
+            LastVpnBlockResult   = $(if ($vVpnRes) { [string]$vVpnRes } else { $null })
+            LastDnsForceUtc      = $(if ($vDnsUtc) { [string]$vDnsUtc } else { $null })
+            LastDnsForceResult   = $(if ($vDnsRes) { [string]$vDnsRes } else { $null })
+            LastScpAllowUtc      = $(if ($vScpUtc) { [string]$vScpUtc } else { $null })
+            LastScpAllowResult   = $(if ($vScpRes) { [string]$vScpRes } else { $null })
         }
     }
     catch {

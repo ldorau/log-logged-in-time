@@ -987,7 +987,7 @@ public static class SessionQuery
     private static extern bool CreateProcessAsUser(
         IntPtr hToken,
         string lpApplicationName,
-        string lpCommandLine,
+        StringBuilder lpCommandLine,
         IntPtr lpProcessAttributes,
         IntPtr lpThreadAttributes,
         bool bInheritHandles,
@@ -1102,10 +1102,12 @@ public static class SessionQuery
                 environment = IntPtr.Zero; // non-fatal; process can inherit defaults
             }
 
-            string commandLine = "\"" + applicationPath + "\"";
+            // CreateProcessAsUser may mutate the command line buffer; StringBuilder is required.
+            StringBuilder commandLine = new StringBuilder();
+            commandLine.Append('"').Append(applicationPath).Append('"');
             if (!string.IsNullOrWhiteSpace(arguments))
             {
-                commandLine = commandLine + " " + arguments;
+                commandLine.Append(' ').Append(arguments);
             }
 
             STARTUPINFO si = new STARTUPINFO();

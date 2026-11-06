@@ -419,7 +419,15 @@ function Get-SummaryPath {
 }
 
 function Read-State {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$UnlockQuotaMinutes = 30
+    )
+
+    if ($UnlockQuotaMinutes -lt 1) {
+        $UnlockQuotaMinutes = 30
+    }
+    $quotaSeconds = [double]($UnlockQuotaMinutes * 60)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return [pscustomobject]@{
@@ -433,20 +441,26 @@ function Read-State {
 
     try {
         $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        $seconds = [double]$json.UnlockedSecondsToday
+        $secondsRaw = Get-OptionalPropertyValue -InputObject $json -Name 'UnlockedSecondsToday'
+        $seconds = 0.0
+        if ($null -ne $secondsRaw) {
+            $seconds = [double]$secondsRaw
+        }
         $bucketProp = $json.PSObject.Properties['LastUnlockQuotaBucket']
         if ($null -ne $bucketProp -and $null -ne $bucketProp.Value) {
             $bucket = [int]$bucketProp.Value
         }
         else {
             # Do not retroactively fire quotas for time already accumulated before this feature.
-            $bucket = [int][Math]::Floor($seconds / 1800.0)
+            $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
         }
+        $lastTransition = Get-OptionalPropertyValue -InputObject $json -Name 'LastTransitionUtc'
+        $lastUnlockedVal = Get-OptionalPropertyValue -InputObject $json -Name 'LastUnlocked'
         return [pscustomobject]@{
-            Date                  = [string]$json.Date
+            Date                  = [string](Get-OptionalPropertyValue -InputObject $json -Name 'Date')
             UnlockedSecondsToday  = $seconds
-            LastUnlocked          = [bool]$json.LastUnlocked
-            LastTransitionUtc     = $(if ($json.LastTransitionUtc) { [string]$json.LastTransitionUtc } else { $null })
+            LastUnlocked          = $(if ($null -ne $lastUnlockedVal) { [bool]$lastUnlockedVal } else { $false })
+            LastTransitionUtc     = $(if ($lastTransition) { [string]$lastTransition } else { $null })
             LastUnlockQuotaBucket = $bucket
         }
     }
@@ -659,7 +673,7 @@ try {
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory
-    $state = Read-State -Path $statePath
+    $state = Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
 
     $installedSrc = Join-Path $env:ProgramFiles 'LoginTimeLogger\src'
     if ([string]::Equals($scriptDir, $installedSrc, [System.StringComparison]::OrdinalIgnoreCase)) {

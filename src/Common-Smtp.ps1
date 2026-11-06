@@ -44,7 +44,7 @@ function Initialize-SmtpAlerts {
     elseif (-not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
         try {
             $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $admin = [string]$raw.AdministratorProfile
+            $admin = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile')
             if ([string]::IsNullOrWhiteSpace($admin)) {
                 $admin = Get-DefaultAdministratorProfile
             }
@@ -81,32 +81,37 @@ function Read-SmtpAlertConfig {
         return $null
     }
 
+    # StrictMode-safe: older smtp.json may omit newer keys (e.g. CooldownMinutes).
+    $cfgEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'Enabled'
     $enabled = $false
-    if ($null -ne $raw.Enabled) {
-        $enabled = [bool]$raw.Enabled
+    if ($null -ne $cfgEnabled) {
+        $enabled = [bool]$cfgEnabled
     }
     $port = 587
-    if ($null -ne $raw.SmtpPort -and [int]$raw.SmtpPort -gt 0) {
-        $port = [int]$raw.SmtpPort
+    $cfgPort = Get-OptionalPropertyValue -InputObject $raw -Name 'SmtpPort'
+    if ($null -ne $cfgPort -and [int]$cfgPort -gt 0) {
+        $port = [int]$cfgPort
     }
     $useSsl = $true
-    if ($null -ne $raw.UseSsl) {
-        $useSsl = [bool]$raw.UseSsl
+    $cfgUseSsl = Get-OptionalPropertyValue -InputObject $raw -Name 'UseSsl'
+    if ($null -ne $cfgUseSsl) {
+        $useSsl = [bool]$cfgUseSsl
     }
     $cooldown = 60
-    if ($null -ne $raw.CooldownMinutes -and [int]$raw.CooldownMinutes -ge 0) {
-        $cooldown = [int]$raw.CooldownMinutes
+    $cfgCooldown = Get-OptionalPropertyValue -InputObject $raw -Name 'CooldownMinutes'
+    if ($null -ne $cfgCooldown -and [int]$cfgCooldown -ge 0) {
+        $cooldown = [int]$cfgCooldown
     }
 
     return [pscustomobject]@{
         Enabled         = $enabled
-        SmtpHost        = [string]$raw.SmtpHost
+        SmtpHost        = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'SmtpHost')
         SmtpPort        = $port
         UseSsl          = $useSsl
-        From            = [string]$raw.From
-        To              = [string]$raw.To
-        Username        = [string]$raw.Username
-        Password        = [string]$raw.Password
+        From            = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'From')
+        To              = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'To')
+        Username        = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'Username')
+        Password        = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'Password')
         CooldownMinutes = $cooldown
         ConfigPath      = $Path
     }
