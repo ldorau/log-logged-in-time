@@ -446,7 +446,6 @@ function Publish-InstalledFilesFromRepo {
         'Scp-OnLock.ps1'
         'LockSignalWatcher.ps1'
         'LockSignalLauncher.ps1'
-        'Show-UnlockQuotaWarning.ps1'
     )
     foreach ($name in $required) {
         $from = Join-Path $srcDir $name
@@ -456,10 +455,16 @@ function Publish-InstalledFilesFromRepo {
         Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $name) -Force
     }
 
-    # Optional SMTP helper (older clones may lack it).
-    $smtpHelper = Join-Path $srcDir 'Common-Smtp.ps1'
-    if (Test-Path -LiteralPath $smtpHelper) {
-        Copy-Item -LiteralPath $smtpHelper -Destination (Join-Path $destDir 'Common-Smtp.ps1') -Force
+    # Optional for older update clones (keep existing Program Files copy).
+    foreach ($optionalName in @('Common-Smtp.ps1', 'Show-UnlockQuotaWarning.ps1')) {
+        $from = Join-Path $srcDir $optionalName
+        if (Test-Path -LiteralPath $from) {
+            Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $optionalName) -Force
+        }
+        else {
+            Write-LoggerEvent -Level WARN -Message (
+                "Optional src file missing in clone (skipped): {0}" -f $from)
+        }
     }
 
     # Daily DNS/DoH helpers (optional for older clones; preferred when present).

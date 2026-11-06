@@ -31,6 +31,32 @@ function Find-SshKeygenExecutable {
     return $null
 }
 
+function Protect-ScpPrivateKeyFile {
+    <#
+      OpenSSH refuses private keys that any non-caller account can read.
+      The monitor runs scp as SYSTEM, so the key must be SYSTEM-only
+      (admin+Users ACEs cause "UNPROTECTED PRIVATE KEY FILE").
+    #>
+    param([Parameter(Mandatory)][string]$IdentityPath)
+
+    if ([string]::IsNullOrWhiteSpace($IdentityPath) -or
+        -not (Test-Path -LiteralPath $IdentityPath)) {
+        return
+    }
+
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $IdentityPath
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $null = $acl.RemoveAccessRule($rule)
+    }
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sidSystem,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow)))
+    Set-Acl -LiteralPath $IdentityPath -AclObject $acl
+}
+
 function New-ScpIdentityKeyFile {
     <#
       Creates an ed25519 private key for SCP-on-lock when missing.
@@ -65,6 +91,7 @@ function New-ScpIdentityKeyFile {
 
     $pubPath = "$IdentityPath.pub"
     if (Test-Path -LiteralPath $IdentityPath) {
+        Protect-ScpPrivateKeyFile -IdentityPath $IdentityPath
         $pubText = ''
         if (Test-Path -LiteralPath $pubPath) {
             $pubText = ((Get-Content -LiteralPath $pubPath -Raw -ErrorAction SilentlyContinue) + '').Trim()
@@ -99,6 +126,8 @@ function New-ScpIdentityKeyFile {
         throw ("ssh-keygen failed (exit {0}) creating '{1}': {2}" -f `
                 $exitCode, $IdentityPath, (($output | ForEach-Object { "$_" }) -join ' '))
     }
+
+    Protect-ScpPrivateKeyFile -IdentityPath $IdentityPath
 
     $pubText = ''
     if (Test-Path -LiteralPath $pubPath) {
@@ -328,6 +357,15 @@ function Invoke-ScpLogCopyOnLock {
             return
         }
 
+        # SYSTEM-run OpenSSH rejects keys with admin/user ACEs ("too open").
+        try {
+            Protect-ScpPrivateKeyFile -IdentityPath ([string]$Config.ScpIdentityFile)
+        }
+        catch {
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP identity ACL harden failed: {0}" -f $_.Exception.Message)
+        }
+
         $files = @(Get-ScpOnLockSourceFiles -Config $Config -TimeLogPath $TimeLogPath -ErrorLogPath $ErrorLogPath)
         if ($files.Count -eq 0) {
             Write-LoggerEvent -Level WARN -Message (
@@ -409,14 +447,27 @@ function Invoke-ScpLogCopyOnLock {
             if ($exitCode -ne 0) {
                 $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `
                         $exitCode, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
-                if (Test-ScpAuthFailure -StdErr "$stderr") {
+                $badKeyAcl = '(?i)UNPROTECTED PRIVATE KEY|bad permissions|' +
+                    'Permissions for .+ are too open'
+                if ("$stderr" -match $badKeyAcl) {
+                    $msg = $msg + ("`r`nPrivate key ACL is too open for SYSTEM scp. " +
+                        "Re-run Install/Restart (Protect-ScpPrivateKeyFile) or: " +
+                        "icacls `"{0}`" /inheritance:r && " +
+                        "icacls `"{0}`" /grant:r SYSTEM:F" -f `
+                            ([string]$Config.ScpIdentityFile))
+                }
+                elseif (Test-ScpAuthFailure -StdErr "$stderr") {
                     $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
                     if (-not [string]::IsNullOrWhiteSpace($pub)) {
-                        $msg = $msg + ("`r`nRemote rejected public key auth. Append this line to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
+                        $msg = $msg + (
+                            "`r`nRemote rejected public key auth. Append this line " +
+                            "to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
                                 $scpUser, $pub)
                     }
                     else {
-                        $msg = $msg + "`r`nRemote rejected public key auth; ensure ScpIdentityFile.pub is in remote authorized_keys."
+                        $msg = $msg + (
+                            "`r`nRemote rejected public key auth; ensure " +
+                            'ScpIdentityFile.pub is in remote authorized_keys.')
                     }
                 }
                 # WARN: still records to errors.log / service.log, but avoids a second attachment-less SMTP from ERROR.

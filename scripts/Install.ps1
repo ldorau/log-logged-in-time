@@ -1293,8 +1293,9 @@ SystemDrive: $env:SystemDrive
                 $generated = New-ScpIdentityKeyFile `
                     -IdentityPath $scpIdentityFile `
                     -KnownHostsPath $scpKnownHostsFile
-                # Re-apply ACL so the new key files inherit admin/SYSTEM-only rights.
+                # Directory: admin+SYSTEM. Private key: SYSTEM-only (OpenSSH).
                 Set-ProtectedSshDirectory -Directory $sshDir -AllowedAdminSid $allowedAdminSid
+                Protect-ScpPrivateKeyFile -IdentityPath $scpIdentityFile
                 if (-not [string]::IsNullOrWhiteSpace($generated.PublicKey)) {
                     Write-Host 'Add this public key to the remote ScpUser authorized_keys file:' -ForegroundColor Yellow
                     Write-Host $generated.PublicKey -ForegroundColor Yellow
@@ -1310,6 +1311,11 @@ SystemDrive: $env:SystemDrive
                 }
                 Set-Content -LiteralPath $scpKnownHostsFile -Value '' -Encoding ASCII
                 Set-ProtectedSshDirectory -Directory $sshDir -AllowedAdminSid $allowedAdminSid
+            }
+            if ((Test-Path -LiteralPath $scpIdentityFile)) {
+                # Existing keys often inherit admin ACE from the directory ACL;
+                # OpenSSH (SYSTEM) requires SYSTEM-only on the private key.
+                Protect-ScpPrivateKeyFile -IdentityPath $scpIdentityFile
             }
         }
     }

@@ -216,14 +216,21 @@ try {
 
     $installRoot = Join-Path $env:ProgramFiles 'LoginTimeLogger'
     if (-not $SkipPublish) {
-        $publishSrc = Join-Path $templateRootResolved 'src\LoginTimeLogger.ps1'
+        # Prefer the checkout that contains this Restart.ps1 (usually a
+        # git-pulled worktree). UpdateClonePath can be a stale shallow clone
+        # missing newer src files (e.g. Show-UnlockQuotaWarning.ps1).
+        $publishRoot = $repoRoot
+        if (-not (Test-Path -LiteralPath (Join-Path $publishRoot 'src\LoginTimeLogger.ps1'))) {
+            $publishRoot = $templateRootResolved
+        }
+        $publishSrc = Join-Path $publishRoot 'src\LoginTimeLogger.ps1'
         if (-not (Test-Path -LiteralPath $publishSrc)) {
             throw ("Cannot publish: missing '{0}'." -f $publishSrc)
         }
-        Write-Host ("Publishing Program Files from template into '{0}'..." -f $installRoot) `
-            -ForegroundColor Cyan
+        Write-Host ("Publishing Program Files from '{0}' into '{1}'..." -f `
+                $publishRoot, $installRoot) -ForegroundColor Cyan
         Publish-InstalledFilesFromRepo `
-            -ClonePath $templateRootResolved `
+            -ClonePath $publishRoot `
             -InstallRoot $installRoot
 
         # Record tip when possible so the next self-update is not confused.
@@ -231,12 +238,13 @@ try {
         if (Get-Command Find-GitExecutable -ErrorAction SilentlyContinue) {
             $gitExe = Find-GitExecutable
         }
-        if ($gitExe -and (Test-Path -LiteralPath (Join-Path $templateRootResolved '.git'))) {
-            $head = Invoke-GitCommand -GitExe $gitExe -RepoPath $templateRootResolved `
+        if ($gitExe -and (Test-Path -LiteralPath (Join-Path $publishRoot '.git'))) {
+            $head = Invoke-GitCommand -GitExe $gitExe -RepoPath $publishRoot `
                 -Arguments @('rev-parse', 'HEAD')
             if ($head.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($head.Output)) {
                 Set-InstalledCommit -InstallRoot $installRoot -CommitSha $head.Output.Trim()
-                Write-Host ("installed-commit.txt <- {0}" -f $head.Output.Trim().ToLowerInvariant())
+                Write-Host ("installed-commit.txt <- {0}" -f `
+                        $head.Output.Trim().ToLowerInvariant())
             }
         }
 
