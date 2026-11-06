@@ -1,6 +1,8 @@
 # Update helper for LoginTimeLogger (dot-sourced by the monitor).
 # Once per day: if online, compare local installed commit to GitHub tip;
-# if different, git pull (or clone) and restart via the scheduled task.
+# if different, git pull (or clone), publish Program Files, merge new fields
+# from config/config.json and config/smtp.json into the installed admin
+# configs (existing values unchanged), and restart via the scheduled task.
 # After a successful daily check (up-to-date or just updated), also run
 # scripts/Force-DnsToLocalResolver.ps1, scripts/Block-DoH-Firewall.ps1,
 # scripts/Block-Vpn-Firewall.ps1, and scripts/Allow-ScpOutboundFirewall.ps1 in
@@ -354,6 +356,258 @@ function Publish-InstalledFilesFromRepo {
             New-Item -ItemType Directory -Path $scriptsDest -Force | Out-Null
         }
         Copy-Item -LiteralPath $from -Destination (Join-Path $scriptsDest $name) -Force
+    }
+}
+
+function Test-JsonConfigObject {
+    param($Value)
+    if ($null -eq $Value) {
+        return $false
+    }
+    if ($Value -is [string] -or $Value -is [ValueType]) {
+        return $false
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        return $true
+    }
+    # PSCustomObject from ConvertFrom-Json (not an array).
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        return $false
+    }
+    return ($null -ne $Value.PSObject -and $null -ne $Value.PSObject.Properties)
+}
+
+function Convert-JsonValueForWrite {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [ValueType]) {
+        return $Value
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $ordered = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $ordered[[string]$key] = Convert-JsonValueForWrite -Value $Value[$key]
+        }
+        return $ordered
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $list = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) {
+            $list.Add((Convert-JsonValueForWrite -Value $item))
+        }
+        return @($list.ToArray())
+    }
+    if ($null -ne $Value.PSObject -and $null -ne $Value.PSObject.Properties) {
+        $ordered = [ordered]@{}
+        foreach ($prop in $Value.PSObject.Properties) {
+            $ordered[$prop.Name] = Convert-JsonValueForWrite -Value $prop.Value
+        }
+        return $ordered
+    }
+    return $Value
+}
+
+function Merge-JsonConfigPreserveExisting {
+    <#
+      Adds keys present in Template but missing from Existing.
+      Never overwrites Existing values. Nested objects are merged the same way.
+      Returns [ordered] hashtable suitable for ConvertTo-Json.
+    #>
+    param(
+        $Existing,
+        $Template,
+        [System.Collections.Generic.List[string]]$AddedKeys
+    )
+
+    $result = [ordered]@{}
+
+    if ($null -ne $Existing) {
+        $existingProps = @()
+        if ($Existing -is [System.Collections.IDictionary]) {
+            foreach ($key in $Existing.Keys) {
+                $existingProps += [pscustomobject]@{ Name = [string]$key; Value = $Existing[$key] }
+            }
+        }
+        else {
+            foreach ($prop in $Existing.PSObject.Properties) {
+                $existingProps += [pscustomobject]@{ Name = $prop.Name; Value = $prop.Value }
+            }
+        }
+
+        foreach ($prop in $existingProps) {
+            $name = $prop.Name
+            $existVal = $prop.Value
+            $tmplVal = $null
+            $hasTmpl = $false
+            if ($null -ne $Template) {
+                if ($Template -is [System.Collections.IDictionary]) {
+                    if ($Template.Contains($name)) {
+                        $tmplVal = $Template[$name]
+                        $hasTmpl = $true
+                    }
+                }
+                else {
+                    $tmplProp = $Template.PSObject.Properties[$name]
+                    if ($null -ne $tmplProp) {
+                        $tmplVal = $tmplProp.Value
+                        $hasTmpl = $true
+                    }
+                }
+            }
+
+            if ($hasTmpl -and (Test-JsonConfigObject -Value $existVal) -and (Test-JsonConfigObject -Value $tmplVal)) {
+                $result[$name] = Merge-JsonConfigPreserveExisting `
+                    -Existing $existVal `
+                    -Template $tmplVal `
+                    -AddedKeys $AddedKeys
+            }
+            else {
+                $result[$name] = Convert-JsonValueForWrite -Value $existVal
+            }
+        }
+    }
+
+    if ($null -ne $Template) {
+        $templateProps = @()
+        if ($Template -is [System.Collections.IDictionary]) {
+            foreach ($key in $Template.Keys) {
+                $templateProps += [pscustomobject]@{ Name = [string]$key; Value = $Template[$key] }
+            }
+        }
+        else {
+            foreach ($prop in $Template.PSObject.Properties) {
+                $templateProps += [pscustomobject]@{ Name = $prop.Name; Value = $prop.Value }
+            }
+        }
+
+        foreach ($prop in $templateProps) {
+            if ($result.Contains($prop.Name)) {
+                continue
+            }
+            $result[$prop.Name] = Convert-JsonValueForWrite -Value $prop.Value
+            if ($null -ne $AddedKeys) {
+                $AddedKeys.Add($prop.Name)
+            }
+        }
+    }
+
+    return $result
+}
+
+function Merge-InstalledJsonConfigFile {
+    <#
+      Merges new fields from a repo template JSON into an installed config file.
+      Existing field values are never changed. Missing dest file is created from template.
+      Returns $true when the dest file was written.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$DestPath,
+        [string]$Label = 'config'
+    )
+
+    if (-not (Test-Path -LiteralPath $TemplatePath)) {
+        Write-LoggerEvent -Level WARN -Message (
+            "Config merge skipped ({0}): template missing: {1}" -f $Label, $TemplatePath)
+        return $false
+    }
+
+    $templateRaw = Get-Content -LiteralPath $TemplatePath -Raw -Encoding UTF8
+    $templateObj = $null
+    try {
+        $templateObj = $templateRaw | ConvertFrom-Json
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "Config merge skipped ({0}): template is not valid JSON ({1}): {2}" -f `
+                $Label, $TemplatePath, $_.Exception.Message)
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $DestPath)) {
+        $destDir = Split-Path -Parent $DestPath
+        if (-not [string]::IsNullOrWhiteSpace($destDir) -and -not (Test-Path -LiteralPath $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        Set-Content -LiteralPath $DestPath -Value $templateRaw -Encoding UTF8
+        Write-LoggerEvent ("Config merge ({0}): created missing file from template: {1}" -f $Label, $DestPath)
+        return $true
+    }
+
+    $existingObj = $null
+    try {
+        $existingObj = Get-Content -LiteralPath $DestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "Config merge skipped ({0}): installed file is not valid JSON ({1}): {2}" -f `
+                $Label, $DestPath, $_.Exception.Message)
+        return $false
+    }
+
+    $addedKeys = [System.Collections.Generic.List[string]]::new()
+    $merged = Merge-JsonConfigPreserveExisting `
+        -Existing $existingObj `
+        -Template $templateObj `
+        -AddedKeys $addedKeys
+
+    if ($addedKeys.Count -eq 0) {
+        Write-LoggerEvent ("Config merge ({0}): no new fields for {1}." -f $Label, $DestPath)
+        return $false
+    }
+
+    $json = $merged | ConvertTo-Json -Depth 12
+    $tempPath = "$DestPath.tmp"
+    Set-Content -LiteralPath $tempPath -Value $json -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $DestPath -Force
+    Write-LoggerEvent ("Config merge ({0}): added field(s) {1} to {2}." -f `
+            $Label, ($addedKeys -join ', '), $DestPath)
+    return $true
+}
+
+function Merge-InstalledConfigFilesFromRepo {
+    <#
+      After a repo self-update, add any new template fields to the installed
+      config.json / smtp.json without changing existing values.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClonePath,
+        [Parameter(Mandatory)][string]$AdminAppDirectory,
+        [string]$ConfigPath = ''
+    )
+
+    $templateConfig = Join-Path $ClonePath 'config\config.json'
+    $templateSmtp = Join-Path $ClonePath 'config\smtp.json'
+
+    $destConfig = $ConfigPath
+    if ([string]::IsNullOrWhiteSpace($destConfig)) {
+        $destConfig = Join-Path $AdminAppDirectory 'config.json'
+    }
+    $destSmtp = Join-Path $AdminAppDirectory 'smtp.json'
+
+    try {
+        $null = Merge-InstalledJsonConfigFile `
+            -TemplatePath $templateConfig `
+            -DestPath $destConfig `
+            -Label 'config.json'
+    }
+    catch {
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Failed merging new fields into installed config.json')
+    }
+
+    try {
+        $null = Merge-InstalledJsonConfigFile `
+            -TemplatePath $templateSmtp `
+            -DestPath $destSmtp `
+            -Label 'smtp.json'
+    }
+    catch {
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UpdateCheck' -Context (
+            'Failed merging new fields into installed smtp.json')
     }
 }
 
@@ -904,6 +1158,10 @@ function Invoke-LoginTimeLoggerUpdateCheck {
 
         $newHead = Sync-UpdateRepository -GitExe $gitExe -RepoUrl $Config.UpdateRepoUrl -Branch $Config.UpdateBranch -ClonePath $Config.UpdateClonePath
         Publish-InstalledFilesFromRepo -ClonePath $Config.UpdateClonePath -InstallRoot $InstallRoot
+        Merge-InstalledConfigFilesFromRepo `
+            -ClonePath $Config.UpdateClonePath `
+            -AdminAppDirectory $AdminAppDirectory `
+            -ConfigPath ([string]$Config.ConfigPath)
         try {
             Update-LockSignalHiddenLauncherFromConfig -Config $Config -InstallRoot $InstallRoot
         }
