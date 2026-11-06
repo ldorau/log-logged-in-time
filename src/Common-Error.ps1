@@ -56,14 +56,31 @@ function Get-OptionalPropertyValue {
 
 function ConvertTo-UInt32Code {
     <#
-      Task Scheduler LastTaskResult is Int32. HRESULTs with the high bit set
-      appear negative (e.g. 0x800710E0 -> -2147020576); [uint32] cast throws.
+      Normalize Task Scheduler LastTaskResult (HRESULT-like) to UInt32.
+      Hosts may return signed Int32 (-2147020576) or unsigned 2147946720 for
+      0x800710E0; PowerShell [uint32]/[int32] casts overflow either way.
     #>
     param([AllowNull()]$Value)
     if ($null -eq $Value) {
         return [uint32]0
     }
-    return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Value), 0)
+    if ($Value -is [uint32]) {
+        return [uint32]$Value
+    }
+    if ($Value -is [int32] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte]) {
+        return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Value), 0)
+    }
+
+    # Int64 / UInt64 / Decimal / string forms of the same HRESULT.
+    $asInt64 = [int64]$Value
+    if ($asInt64 -ge 0 -and $asInt64 -le [int64][uint32]::MaxValue) {
+        return [uint32]$asInt64
+    }
+    if ($asInt64 -lt 0 -and $asInt64 -ge [int64][int32]::MinValue) {
+        return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$asInt64), 0)
+    }
+
+    return [uint32]([uint64]($asInt64 -band [int64]0xFFFFFFFF))
 }
 
 function ConvertTo-StartProcessArgumentString {

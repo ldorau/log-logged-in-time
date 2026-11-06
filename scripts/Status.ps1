@@ -403,8 +403,17 @@ try {
     $lockSignalTask = Get-ScheduledTask -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue
     if ($lockSignalTask) {
         $lockInfo = $null
-        try { $lockInfo = Get-ScheduledTaskInfo -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue } catch { }
-        $lockLast = if ($lockInfo) { '0x{0:X8}' -f (ConvertTo-UInt32Code -Value $lockInfo.LastTaskResult) } else { '?' }
+        $lockLast = '?'
+        try {
+            $lockInfo = Get-ScheduledTaskInfo -TaskName 'LoginTimeLoggerLockSignal' -ErrorAction SilentlyContinue
+            if ($lockInfo) {
+                $lockLast = '0x{0:X8}' -f (ConvertTo-UInt32Code -Value $lockInfo.LastTaskResult)
+            }
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Status' -Context (
+                "Failed to query scheduled task 'LoginTimeLoggerLockSignal'")
+        }
         Write-Host ("Lock signal task: LoginTimeLoggerLockSignal | State: {0} | LastResult: {1}" -f `
                 $lockSignalTask.State, $lockLast)
         if ($lockSignalTask.State -ne 'Running') {
