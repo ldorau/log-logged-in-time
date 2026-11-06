@@ -133,9 +133,9 @@ function Get-AccountsFromConfig {
     param([Parameter(Mandatory)][string]$Path)
 
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    $admin = [string]$raw.AdminUsername
-    $target = [string]$raw.TargetUsername
-    $profile = [string]$raw.AdministratorProfile
+    $admin = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'AdminUsername')
+    $target = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
+    $profile = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile')
 
     if ([string]::IsNullOrWhiteSpace($admin) -and -not [string]::IsNullOrWhiteSpace($profile)) {
         $admin = Split-Path -Leaf $profile

@@ -212,11 +212,13 @@ function Get-AdminPathsFromConfig {
     if (Test-Path -LiteralPath $runtimeConfig) {
         try {
             $raw = Get-Content -LiteralPath $runtimeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $administratorProfile = [string]$raw.AdministratorProfile
+            $adminProp = $raw.PSObject.Properties['AdministratorProfile']
+            if ($null -ne $adminProp -and -not [string]::IsNullOrWhiteSpace([string]$adminProp.Value)) {
+                $administratorProfile = [string]$adminProp.Value
             }
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.LogDirectory)) {
-                $logDirectory = [string]$raw.LogDirectory
+            $logProp = $raw.PSObject.Properties['LogDirectory']
+            if ($null -ne $logProp -and -not [string]::IsNullOrWhiteSpace([string]$logProp.Value)) {
+                $logDirectory = [string]$logProp.Value
             }
             else {
                 $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
@@ -437,8 +439,9 @@ try {
         $sigPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
         if ($paths.RuntimeConfigPath -and (Test-Path -LiteralPath $paths.RuntimeConfigPath)) {
             $cfg = Get-Content -LiteralPath $paths.RuntimeConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$cfg.LockSignalPath)) {
-                $sigPath = [string]$cfg.LockSignalPath
+            $sigProp = $cfg.PSObject.Properties['LockSignalPath']
+            if ($null -ne $sigProp -and -not [string]::IsNullOrWhiteSpace([string]$sigProp.Value)) {
+                $sigPath = [string]$sigProp.Value
             }
         }
         if (Test-Path -LiteralPath $sigPath) {

@@ -125,8 +125,9 @@ function Get-ResolvedLogDirectory {
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $template = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$template.AdministratorProfile)) {
-                $administratorProfile = [string]$template.AdministratorProfile
+            $tplAdmin = Get-OptionalPropertyValue -InputObject $template -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$tplAdmin)) {
+                $administratorProfile = [string]$tplAdmin
             }
         }
         catch { }
@@ -137,14 +138,13 @@ function Get-ResolvedLogDirectory {
     if (Test-Path -LiteralPath $configPath) {
         try {
             $raw = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $administratorProfile = [string]$raw.AdministratorProfile
+            $cfgAdmin = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdmin)) {
+                $administratorProfile = [string]$cfgAdmin
             }
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.LogDirectory)) {
-                return [string]$raw.LogDirectory
-            }
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.PollIntervalSeconds)) {
-                # returned via side channel below if needed
+            $cfgLogDir = Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgLogDir)) {
+                return [string]$cfgLogDir
             }
         }
         catch { }
@@ -172,8 +172,9 @@ function Get-RuntimePollIntervalSeconds {
         if (-not (Test-Path -LiteralPath $path)) { continue }
         try {
             $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($null -ne $raw.PollIntervalSeconds -and [int]$raw.PollIntervalSeconds -gt 0) {
-                return [int]$raw.PollIntervalSeconds
+            $cfgPoll = Get-OptionalPropertyValue -InputObject $raw -Name 'PollIntervalSeconds'
+            if ($null -ne $cfgPoll -and [int]$cfgPoll -gt 0) {
+                return [int]$cfgPoll
             }
         }
         catch { }
@@ -458,7 +459,8 @@ function Invoke-AnalyzeMode {
     if ($StatePath -and (Test-Path -LiteralPath $StatePath)) {
         try {
             $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $stateSec = [double]$state.UnlockedSecondsToday
+            $stateSecRaw = Get-OptionalPropertyValue -InputObject $state -Name 'UnlockedSecondsToday'
+            $stateSec = if ($null -ne $stateSecRaw) { [double]$stateSecRaw } else { 0.0 }
             $monitorFmt = Format-Duration-MonitorStyle -Seconds $stateSec
             $hoursFmt = Format-Duration-HoursProperty -Seconds $stateSec
             Write-Host ''
@@ -528,13 +530,15 @@ function Invoke-WatchMode {
         $now = Get-Date
         try {
             $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $sec = [double]$state.UnlockedSecondsToday
+            $secRaw = Get-OptionalPropertyValue -InputObject $state -Name 'UnlockedSecondsToday'
+            $sec = if ($null -ne $secRaw) { [double]$secRaw } else { 0.0 }
             $fmt = Format-Duration-MonitorStyle -Seconds $sec
+            $lastUnlockedVal = Get-OptionalPropertyValue -InputObject $state -Name 'LastUnlocked'
             $null = $samples.Add([pscustomobject]@{
                     TimestampLocal    = $now
                     CumulativeSeconds = $sec
                     CumulativeText    = $fmt
-                    LastUnlocked      = [bool]$state.LastUnlocked
+                    LastUnlocked      = $(if ($null -ne $lastUnlockedVal) { [bool]$lastUnlockedVal } else { $false })
                 })
 
             if ($samples.Count -ge 2) {
@@ -558,7 +562,7 @@ function Invoke-WatchMode {
                 }
             }
             else {
-                Write-TestLine -Level INFO -Message ("t+0s  {0} ({1:F1}s) lastUnlocked={2}" -f $fmt, $sec, [bool]$state.LastUnlocked)
+                Write-TestLine -Level INFO -Message ("t+0s  {0} ({1:F1}s) lastUnlocked={2}" -f $fmt, $sec, $(if ($null -ne $lastUnlockedVal) { [bool]$lastUnlockedVal } else { $false }))
             }
         }
         catch {

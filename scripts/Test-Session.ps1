@@ -42,8 +42,9 @@ try {
         if (Test-Path -LiteralPath $TemplateConfigPath) {
             try {
                 $template = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                if (-not [string]::IsNullOrWhiteSpace([string]$template.AdministratorProfile)) {
-                    $administratorProfile = [string]$template.AdministratorProfile
+                $tplAdmin = Get-OptionalPropertyValue -InputObject $template -Name 'AdministratorProfile'
+                if (-not [string]::IsNullOrWhiteSpace([string]$tplAdmin)) {
+                    $administratorProfile = [string]$tplAdmin
                 }
             }
             catch {
@@ -73,7 +74,7 @@ AdministratorProfile: $administratorProfile
             throw (New-Object System.Exception($details, $_.Exception))
         }
 
-        $TargetUsername = [string]$raw.TargetUsername
+        $TargetUsername = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
         if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
             throw @"
 TargetUsername is empty in config.

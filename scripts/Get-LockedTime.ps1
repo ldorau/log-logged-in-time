@@ -80,8 +80,9 @@ function Get-DefaultLogDirectory {
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $template = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$template.AdministratorProfile)) {
-                $administratorProfile = [string]$template.AdministratorProfile
+            $tplAdmin = Get-OptionalPropertyValue -InputObject $template -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$tplAdmin)) {
+                $administratorProfile = [string]$tplAdmin
             }
         }
         catch { }
@@ -105,11 +106,13 @@ function Get-DefaultLogDirectory {
     if (Test-Path -LiteralPath $resolvedConfig) {
         try {
             $raw = Get-Content -LiteralPath $resolvedConfig -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $administratorProfile = [string]$raw.AdministratorProfile
+            $cfgAdmin = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdmin)) {
+                $administratorProfile = [string]$cfgAdmin
             }
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.LogDirectory)) {
-                return [string]$raw.LogDirectory
+            $cfgLogDir = Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgLogDir)) {
+                return [string]$cfgLogDir
             }
         }
         catch { }

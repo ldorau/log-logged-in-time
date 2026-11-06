@@ -70,14 +70,18 @@ function Resolve-ScpTargetFromConfig {
         return $null
     }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    $hostName = [string]$raw.ScpHost
+    # Avoid StrictMode PropertyNotFoundStrict when older configs omit SCP keys.
+    $hostProp = $raw.PSObject.Properties['ScpHost']
+    $hostName = if ($null -ne $hostProp) { [string]$hostProp.Value } else { '' }
     $port = 22
-    if ($null -ne $raw.ScpPort -and [int]$raw.ScpPort -gt 0) {
-        $port = [int]$raw.ScpPort
+    $portProp = $raw.PSObject.Properties['ScpPort']
+    if ($null -ne $portProp -and $null -ne $portProp.Value -and [int]$portProp.Value -gt 0) {
+        $port = [int]$portProp.Value
     }
     $enabled = $false
-    if ($null -ne $raw.ScpOnLockEnabled) {
-        $enabled = [bool]$raw.ScpOnLockEnabled
+    $enabledProp = $raw.PSObject.Properties['ScpOnLockEnabled']
+    if ($null -ne $enabledProp -and $null -ne $enabledProp.Value) {
+        $enabled = [bool]$enabledProp.Value
     }
     return [pscustomobject]@{
         Host    = $hostName

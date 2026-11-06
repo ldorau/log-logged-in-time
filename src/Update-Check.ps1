@@ -546,8 +546,7 @@ function Write-JsonFilePreserveAcl {
     )
 
     $priorAcl = $null
-    $destExisted = Test-Path -LiteralPath $DestPath
-    if ($destExisted) {
+    if (Test-Path -LiteralPath $DestPath) {
         try {
             $priorAcl = Get-Acl -LiteralPath $DestPath
         }

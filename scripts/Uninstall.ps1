@@ -42,8 +42,9 @@ try {
     if (Test-Path -LiteralPath $TemplateConfigPath) {
         try {
             $raw = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw.AdministratorProfile)) {
-                $AdministratorProfile = [string]$raw.AdministratorProfile
+            $cfgAdmin = Get-OptionalPropertyValue -InputObject $raw -Name 'AdministratorProfile'
+            if (-not [string]::IsNullOrWhiteSpace([string]$cfgAdmin)) {
+                $AdministratorProfile = [string]$cfgAdmin
                 $null = Initialize-ErrorLog -AdministratorProfile $AdministratorProfile
             }
         }
@@ -139,8 +140,9 @@ try {
         if (Test-Path -LiteralPath $TemplateConfigPath) {
             try {
                 $raw = Get-Content -LiteralPath $TemplateConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                if (-not [string]::IsNullOrWhiteSpace([string]$raw.LogDirectory)) {
-                    $logDirectory = [string]$raw.LogDirectory
+                $cfgLogDir = Get-OptionalPropertyValue -InputObject $raw -Name 'LogDirectory'
+                if (-not [string]::IsNullOrWhiteSpace([string]$cfgLogDir)) {
+                    $logDirectory = [string]$cfgLogDir
                 }
             }
             catch {
