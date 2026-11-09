@@ -129,8 +129,8 @@ SCP on lock (optional)
 ----------------------
 Disabled by default (ScpOnLockEnabled=false). When enabled, on every lock
 (or leaving unlocked-active) the monitor copies via OpenSSH scp:
-  - today's unlocked-time-YYYY-MM-DD.log
-  - errors.log
+  - the two newest unlocked-time-*.log files under LogDirectory
+  - all error logs (errors.log / *error*.log)
 to ScpUser@ScpHost:ScpRemoteDirectory/ using key-based auth only.
 Default identity file (if ScpIdentityFile is empty):
   <AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519

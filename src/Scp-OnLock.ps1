@@ -377,9 +377,9 @@ function Invoke-ScpLogCopyOnLock {
     <#
     .SYNOPSIS
       Copies LoginTimeLogger logs to the configured remote via scp on screen lock.
-      Includes today's time log, errors.log, service.log, summary CSV, state.json,
-      and any other *.log/*.csv under LogDirectory. Failures are logged; they do
-      not stop the monitor. Failed copies also email with error logs attached when SMTP is enabled.
+      Copies the two newest unlocked-time-*.log files and all error logs.
+      Failures are logged; they do not stop the monitor. Failed copies also
+      email with error logs attached when SMTP is enabled.
     #>
     param(
         [Parameter(Mandatory)]$Config,

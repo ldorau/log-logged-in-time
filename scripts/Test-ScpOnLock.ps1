@@ -4,8 +4,8 @@
   Tests whether SCP-on-lock log copy to the remote host works.
 .DESCRIPTION
   Reads the LoginTimeLogger runtime config, validates SCP settings, then
-  copies today's unlocked-time log and errors.log (or a small probe file)
-  using the same OpenSSH scp options as Scp-OnLock.ps1.
+  copies the two newest unlocked-time-*.log files and error logs (or a
+  small probe file) using the same OpenSSH scp options as Scp-OnLock.ps1.
 
   On failure, prints debugging details (scp path, identity, target, exit
   code, stdout/stderr, connectivity hints).

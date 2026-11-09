@@ -65,8 +65,8 @@ Existing installs that receive `UnlockQuota*` via **self-update** merge get `Unl
 
 **Off by default** (`ScpOnLockEnabled: false`). When enabled, each time the target session leaves unlocked-active (screen lock / away), the monitor runs `scp` to copy:
 
-- today’s `unlocked-time-YYYY-MM-DD.log` and `errors.log`
-- other `*.log` / `*.csv` files and `state.json` under `LogDirectory` (includes `service.log` and the summary CSV)
+- the **two newest** `unlocked-time-*.log` files under `LogDirectory`
+- all error logs (`errors.log` / `*error*.log`, including the configured error log path)
 
 to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`). Defaults for empty key paths:
 
