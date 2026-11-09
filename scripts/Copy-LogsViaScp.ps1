@@ -215,6 +215,7 @@ function Get-ScpConfigObject {
         ScpKnownHostsFile    = $knownHosts
         AdministratorProfile = $adminProfile
         LogDirectory         = $logDirectory
+        TargetUsername       = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
     }
 }
 
@@ -283,6 +284,7 @@ function Invoke-ScpCopyFiles {
 # --- main ---
 $copyResult = $null
 $files = @()
+$bHistoryStaged = $null
 
 try {
     $null = Initialize-ErrorLog -ConfigPath (Join-Path $repoRoot 'config\config.json')
@@ -348,11 +350,32 @@ try {
         ScpIdentityFile    = $cfg.ScpIdentityFile
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
         LogDirectory       = $cfg.LogDirectory
+        TargetUsername     = $cfg.TargetUsername
     }
 
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'Step 2: select files to copy' -ForegroundColor Cyan
-    $files = @(Get-ScpManualSourceFiles -Config $runtimeCfg -ErrorLogPath (Get-ErrorLogPath))
+    $fileList = New-Object System.Collections.Generic.List[string]
+    foreach ($f in @(Get-ScpManualSourceFiles -Config $runtimeCfg -ErrorLogPath (Get-ErrorLogPath))) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$f)) {
+            $fileList.Add([string]$f)
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($bHistoryStaged.Count -gt 0) {
+            foreach ($staged in $bHistoryStaged) {
+                $fileList.Add([string]$staged)
+            }
+            Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
+        }
+        else {
+            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
+                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
+        }
+    }
+    $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($files.Count -eq 0) {
         Write-Check -Name 'Files selected' -Ok $false -Detail 'none found under LogDirectory / error log paths'
         Write-ScpCopyLine ''
@@ -401,6 +424,14 @@ try {
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'RESULT: SCP copy succeeded.' -ForegroundColor Green
     Write-ScpCopyLine ("Uploaded {0} file(s) to {1}" -f $files.Count, $copyResult.RemoteTarget)
+
+    $clearedLogs = @(Reset-LoginTimeLoggerOperationalLogs `
+            -ErrorLogPath (Get-ErrorLogPath) `
+            -LogDirectory ([string]$cfg.LogDirectory))
+    if ($clearedLogs.Count -gt 0) {
+        Write-ScpCopyLine ("Reset log file(s): {0}" -f ($clearedLogs -join '; ')) -ForegroundColor DarkGray
+    }
+
     Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Cyan
     exit 0
 }
@@ -418,4 +449,12 @@ catch {
     }
     $null = Write-VerboseError -ErrorRecord $_ -Context 'Copy-LogsViaScp.ps1 failed' -Source 'Copy-LogsViaScp'
     exit 1
+}
+finally {
+    foreach ($staged in @($bHistoryStaged)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$staged) -and
+            (Test-Path -LiteralPath ([string]$staged))) {
+            Remove-Item -LiteralPath ([string]$staged) -Force -ErrorAction SilentlyContinue
+        }
+    }
 }

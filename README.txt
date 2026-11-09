@@ -66,6 +66,27 @@ Default location (example AdministratorProfile=C:\Users\AdminName):
   state.json                    - running total for the current day
   service.log                   - monitor diagnostics
 
+Daily log fields (unlocked-time-YYYY-MM-DD.log):
+  cumulative_today=
+    Total unlocked time so far today (current calendar day), as HH:MM:SS.
+    Appears on UNLOCKED_ACTIVE, LOCKED_OR_AWAY, and HEARTBEAT lines and
+    grows while the session is unlocked.
+
+  unlocked=
+    Meaning depends on the line type:
+      HEARTBEAT  - boolean: is the user unlocked right now? (True/False)
+      DAY_TOTAL  - duration: final unlocked total for the day that just
+                   ended (HH:MM:SS), plus hours in (1.50h)
+
+  Difference:
+    cumulative_today=     running counter for today
+    DAY_TOTAL unlocked=   same kind of counter, but the closed total for
+                          a past day (written at day rollover; the line
+                          timestamp is when rollover ran, and the line is
+                          appended to that ended day's log file)
+    On HEARTBEAT, unlocked= is not a duration — only locked/unlocked
+    status; the duration is still cumulative_today=
+
 Error log (same admin profile; separate from daily time logs):
   C:\Users\AdminName\LoginTimeLogger\errors.log
   All script errors/warnings are printed to the screen and appended here.

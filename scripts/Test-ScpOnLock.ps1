@@ -220,6 +220,7 @@ function Get-ScpConfigObject {
         ScpKnownHostsFile    = $knownHosts
         AdministratorProfile = $adminProfile
         LogDirectory         = $logDirectory
+        TargetUsername       = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
     }
 }
 
@@ -432,6 +433,7 @@ function Write-FailureDebug {
 
 # --- main ---
 $probePath = $null
+$bHistoryStaged = $null
 $copyResult = $null
 $files = @()
 
@@ -524,6 +526,7 @@ try {
         ScpIdentityFile    = $cfg.ScpIdentityFile
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
         LogDirectory       = $cfg.LogDirectory
+        TargetUsername     = $cfg.TargetUsername
     }
 
     Write-ScpTestLine ''
@@ -557,7 +560,21 @@ try {
             Write-Check -Name 'Fallback probe file' -Ok $true -Detail $probePath
         }
     }
-    $files = @($fileList)
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($bHistoryStaged.Count -gt 0) {
+            foreach ($staged in $bHistoryStaged) {
+                $fileList.Add([string]$staged)
+            }
+            Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
+        }
+        else {
+            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
+                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
+        }
+    }
+    $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 
     Write-ScpTestLine ''
     Write-ScpTestLine 'Step 3: TCP reachability' -ForegroundColor Cyan
@@ -583,6 +600,14 @@ try {
     Write-ScpTestLine ''
     Write-ScpTestLine 'RESULT: SCP-on-lock copy succeeded.' -ForegroundColor Green
     Write-ScpTestLine ("Uploaded {0} file(s) to {1}" -f $files.Count, $copyResult.RemoteTarget)
+
+    $clearedLogs = @(Reset-LoginTimeLoggerOperationalLogs `
+            -ErrorLogPath (Get-ErrorLogPath) `
+            -LogDirectory ([string]$cfg.LogDirectory))
+    if ($clearedLogs.Count -gt 0) {
+        Write-ScpTestLine ("Reset log file(s): {0}" -f ($clearedLogs -join '; ')) -ForegroundColor DarkGray
+    }
+
     Write-ScpTestLine ("Test log saved: {0}" -f $script:TestLogPath) -ForegroundColor Cyan
     exit 0
 }
@@ -611,5 +636,11 @@ catch {
 finally {
     if ($probePath -and (Test-Path -LiteralPath $probePath)) {
         Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($staged in @($bHistoryStaged)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$staged) -and
+            (Test-Path -LiteralPath ([string]$staged))) {
+            Remove-Item -LiteralPath ([string]$staged) -Force -ErrorAction SilentlyContinue
+        }
     }
 }

@@ -83,6 +83,10 @@ function Resolve-ScpTargetFromConfig {
     if ($null -ne $enabledProp -and $null -ne $enabledProp.Value) {
         $enabled = [bool]$enabledProp.Value
     }
+    # Periodic BHistory SCP is always on when ScpHost is configured.
+    if (-not $enabled -and -not [string]::IsNullOrWhiteSpace($hostName)) {
+        $enabled = $true
+    }
     return [pscustomobject]@{
         Host    = $hostName
         Port    = $port

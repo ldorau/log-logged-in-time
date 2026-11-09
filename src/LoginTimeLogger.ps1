@@ -17,6 +17,7 @@ $ErrorActionPreference = 'Stop'
 # Initialize before any Write-LoggerEvent call (StrictMode forbids reading unset script vars).
 $script:ServiceLogPath = $null
 $script:InstanceMutex = $null
+$script:InstallRoot = $null
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -205,12 +206,15 @@ LogDirectory in file: $cfgLogHint
         $scpPort = [int]$cfgScpPort
     }
 
+    # BHistory SCP is always on when the SCP endpoint is configured.
+    $scpNeedsIdentity = $scpOnLockEnabled -or -not [string]::IsNullOrWhiteSpace($scpHost)
+
     $scpIdentityFile = ''
     $cfgScpIdentity = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile'
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpIdentity)) {
         $scpIdentityFile = [string]$cfgScpIdentity
     }
-    elseif ($scpOnLockEnabled) {
+    elseif ($scpNeedsIdentity) {
         $scpIdentityFile = Join-Path $adminHome 'LoginTimeLogger\ssh\id_ed25519'
     }
 
@@ -219,7 +223,7 @@ LogDirectory in file: $cfgLogHint
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpKnownHosts)) {
         $scpKnownHostsFile = [string]$cfgScpKnownHosts
     }
-    elseif ($scpOnLockEnabled) {
+    elseif ($scpNeedsIdentity) {
         $scpKnownHostsFile = Join-Path $adminHome 'LoginTimeLogger\ssh\known_hosts'
     }
 
@@ -433,7 +437,8 @@ function New-LoggerStateObject {
         [double]$UnlockedSecondsToday = 0,
         [bool]$LastUnlocked = $false,
         [AllowNull()]$LastTransitionUtc = $null,
-        [int]$LastUnlockQuotaBucket = 0
+        [int]$LastUnlockQuotaBucket = 0,
+        [string]$InstalledCommitSha = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
@@ -446,6 +451,7 @@ function New-LoggerStateObject {
         LastUnlocked          = [bool]$LastUnlocked
         LastTransitionUtc     = $(if ($LastTransitionUtc) { [string]$LastTransitionUtc } else { $null })
         LastUnlockQuotaBucket = [int]$LastUnlockQuotaBucket
+        InstalledCommitSha    = [string]$InstalledCommitSha
     }
 }
 
@@ -502,12 +508,69 @@ function ConvertTo-LoggerStateObject {
         $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
     }
 
+    $commitSha = [string](Get-OptionalPropertyValue -InputObject $State -Name 'InstalledCommitSha')
+
     return (New-LoggerStateObject `
             -Date $date `
             -UnlockedSecondsToday $seconds `
             -LastUnlocked $lastUnlocked `
             -LastTransitionUtc $lastTransition `
-            -LastUnlockQuotaBucket $bucket)
+            -LastUnlockQuotaBucket $bucket `
+            -InstalledCommitSha $commitSha)
+}
+
+function ConvertFrom-DurationText {
+    <#
+      Parses HH:MM:SS (hours may exceed 24) into whole seconds. Returns $null if invalid.
+    #>
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+    if ($Text -match '^(?<h>\d+):(?<m>[0-5]?\d):(?<s>[0-5]?\d)$') {
+        try {
+            return [double](
+                ([int]$Matches['h'] * 3600) +
+                ([int]$Matches['m'] * 60) +
+                [int]$Matches['s'])
+        }
+        catch {
+            return $null
+        }
+    }
+    return $null
+}
+
+function Get-UnlockedSecondsFromDailyLog {
+    <#
+      Reads the newest non-zero cumulative_today=HH:MM:SS from a day log
+      (tail scan). Skips 00:00:00 so a post-corrupt reset line does not
+      hide earlier recovered time.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        $lines = @(Get-Content -LiteralPath $Path -Tail 200 -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = [string]$lines[$i]
+        if ($line -match 'cumulative_today=(?<dur>\d+:\d{2}:\d{2})') {
+            $seconds = ConvertFrom-DurationText -Text $Matches['dur']
+            if ($null -ne $seconds -and [double]$seconds -gt 0) {
+                return $seconds
+            }
+        }
+    }
+    return $null
 }
 
 function Read-State {
@@ -525,14 +588,40 @@ function Read-State {
     }
 
     try {
-        $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            throw (New-Object System.Exception('state.json is empty'))
+        }
+        $json = $raw | ConvertFrom-Json
         return (ConvertTo-LoggerStateObject -State $json `
                 -UnlockQuotaMinutes $UnlockQuotaMinutes)
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Read-State failed for '{0}'" -f $Path)
+        # Quarantine corrupt file so the next write does not fight a bad inode.
+        try {
+            $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmss')
+            Move-Item -LiteralPath $Path -Destination ("{0}.corrupt-{1}" -f $Path, $stamp) -Force `
+                -ErrorAction SilentlyContinue
+        }
+        catch { }
+
+        $fresh = New-LoggerStateObject
+        $logDir = Split-Path -Parent $Path
+        $dailyPath = Join-Path $logDir ('unlocked-time-{0:yyyy-MM-dd}.log' -f (Get-Date))
+        $recovered = Get-UnlockedSecondsFromDailyLog -Path $dailyPath
+        if ($null -ne $recovered -and [double]$recovered -gt 0) {
+            $quotaSeconds = [double]($UnlockQuotaMinutes * 60)
+            $fresh.UnlockedSecondsToday = [double]$recovered
+            $fresh.LastUnlockQuotaBucket = [int][Math]::Floor([double]$recovered / $quotaSeconds)
+            $null = Write-LoggerEvent -Level WARN -Message (
+                ("Corrupt state file; recovered UnlockedSecondsToday={0} ({1}) from '{2}'.`r`n{3}" -f `
+                    $recovered, (Format-Duration -Seconds $recovered), $dailyPath, $details))
+            return $fresh
+        }
+
         $null = Write-LoggerEvent -Level WARN -Message ("Corrupt state file; starting fresh.`r`n{0}" -f $details)
-        return (New-LoggerStateObject)
+        return $fresh
     }
 }
 
@@ -607,6 +696,28 @@ function Invoke-UnlockQuotaWarningAndLock {
     return $true
 }
 
+function Get-CurrentInstalledCommitSha {
+    <#
+      SHA from Program Files\LoginTimeLogger\installed-commit.txt when available.
+    #>
+    if ([string]::IsNullOrWhiteSpace([string]$script:InstallRoot)) {
+        return ''
+    }
+    if (-not (Get-Command Get-InstalledCommit -ErrorAction SilentlyContinue)) {
+        return ''
+    }
+    try {
+        $sha = Get-InstalledCommit -InstallRoot ([string]$script:InstallRoot)
+        if ([string]::IsNullOrWhiteSpace([string]$sha)) {
+            return ''
+        }
+        return ([string]$sha).Trim().ToLowerInvariant()
+    }
+    catch {
+        return ''
+    }
+}
+
 function Write-State {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -614,8 +725,22 @@ function Write-State {
     )
     try {
         $normalized = ConvertTo-LoggerStateObject -State $State
+        $commitSha = Get-CurrentInstalledCommitSha
+        if (-not [string]::IsNullOrWhiteSpace($commitSha)) {
+            $normalized.InstalledCommitSha = $commitSha
+        }
+        $jsonText = ($normalized | ConvertTo-Json -Depth 4)
+        # Refuse to publish non-object JSON (guards against corrupt/partial payloads).
+        $roundTrip = $jsonText | ConvertFrom-Json
+        if ($null -eq $roundTrip -or $null -eq $roundTrip.PSObject.Properties['Date']) {
+            throw (New-Object System.Exception('Write-State JSON round-trip validation failed'))
+        }
+
         $tempPath = "$Path.tmp"
-        ($normalized | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        Set-Content -LiteralPath $tempPath -Value $jsonText -Encoding UTF8
+        $verifyRaw = Get-Content -LiteralPath $tempPath -Raw -Encoding UTF8
+        $null = $verifyRaw | ConvertFrom-Json
+
         # Replace in place. If destination is a zeroed/locked leftover, remove
         # then rename so Move-Item -Force is not the only recovery path.
         try {
@@ -638,7 +763,7 @@ function Repair-UnlockedTimeSummaryCsv {
     <#
       Rewrites locale-broken summary rows where UnlockedHours used ',' as the
       decimal separator (e.g. "2026-11-02,4230,1,1751,piter" -> five fields).
-      Hours are recomputed from UnlockedSeconds with InvariantCulture.
+      UnlockedHours is always recomputed from UnlockedSeconds as HH:MM:SS.
       Returns $true when the file was rewritten.
     #>
     param([Parameter(Mandatory)][string]$Path)
@@ -687,11 +812,9 @@ function Repair-UnlockedTimeSummaryCsv {
             }
             $seconds = $secParsed
             $user = $parts[3]
-            $hoursExpected = [Math]::Round($seconds / 3600.0, 4)
-            $hoursText = $hoursExpected.ToString('0.####', $inv)
-            if (-not [string]::Equals($parts[2], $hoursText, [System.StringComparison]::Ordinal)) {
-                # Keep row but normalize hours (covers "1,1751"-style already split,
-                # and minor format drift).
+            $hoursExpected = Format-Duration -Seconds $seconds
+            if (-not [string]::Equals($parts[2], $hoursExpected, [System.StringComparison]::Ordinal)) {
+                # Normalize decimal / locale / HH:MM:SS drift from UnlockedSeconds.
                 $changed = $true
             }
         }
@@ -719,13 +842,13 @@ function Repair-UnlockedTimeSummaryCsv {
         }
         $seenDate[$date] = $true
 
-        $hours = [Math]::Round(([double]$seconds) / 3600.0, 4)
+        $hoursText = Format-Duration -Seconds ([double]$seconds)
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2:0.####},{3}',
+            '{0},{1:F0},{2},{3}',
             $date,
             $seconds,
-            $hours,
+            $hoursText,
             $user)
         if (-not [string]::Equals($trim, $row, [System.StringComparison]::Ordinal)) {
             $changed = $true
@@ -796,24 +919,22 @@ function Write-DayRollover {
         $summaryPath = Get-SummaryPath -LogDirectory $Config.LogDirectory
         Ensure-SummaryHeader -Path $summaryPath
 
-        $hours = [Math]::Round($State.UnlockedSecondsToday / 3600.0, 4)
-        # InvariantCulture so locales that use ',' decimals cannot break CSV
-        # columns (e.g. "1,1751" becoming two fields).
+        $durationText = Format-Duration -Seconds $State.UnlockedSecondsToday
+        # InvariantCulture for UnlockedSeconds so locale decimals cannot break CSV.
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2:0.####},{3}',
+            '{0},{1:F0},{2},{3}',
             $EndedDate,
             $State.UnlockedSecondsToday,
-            $hours,
+            $durationText,
             $Config.TargetUsername)
         Add-Content -LiteralPath $summaryPath -Value $row -Encoding UTF8
 
         $dailyPath = Get-DailyLogPath -LogDirectory $Config.LogDirectory -Date ([datetime]::ParseExact($EndedDate, 'yyyy-MM-dd', $null))
-        $hoursText = $hours.ToString('0.00', $inv) + 'h'
         Write-DailyLogLine -Path $dailyPath -Line (
-            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1} ({2})' -f `
-                (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $hoursText
+            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1}' -f `
+                (Get-Date), $durationText
         )
     }
     catch {
@@ -923,9 +1044,16 @@ try {
         # Dev/fallback: parent of src/
         $installRoot = Split-Path -Parent $scriptDir
     }
+    $script:InstallRoot = $installRoot
 
     Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s" -f `
             $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds)
+
+    # Persist InstalledCommitSha into state.json on startup (and every later Write-State).
+    Write-State -Path $statePath -State $state
+    $state = ConvertTo-LoggerStateObject `
+        -State (Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)) `
+        -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
@@ -939,6 +1067,11 @@ $script:LastPollErrorUtc = [datetime]::MinValue
 # After a failed unlock-quota lock, wait before showing the dialog again
 # (otherwise a 5s poll would re-popup every cycle while the bucket stalls).
 $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+# BHistory SCP (fixed interval in Scp-OnLock.ps1).
+$script:LastBHistoryScpUtc = [datetime]::MinValue
+$script:LastBHistorySourceWriteUtc = [datetime]::MinValue
+$script:LastBHistoryScpSucceeded = $false
+$script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -1055,13 +1188,30 @@ while ($true) {
             }
         }
 
-        # Periodic heartbeat once every 15 minutes.
-        $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 15) * 15))
+        # Periodic heartbeat once every 5 minutes.
+        $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 5) * 5))
         if ($heartbeatSlot -ne $lastHeartbeatSlot) {
-            $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | unlocked={1} | cumulative_today={2}' -f `
-                $nowLocal, $unlocked, (Format-Duration $state.UnlockedSecondsToday)
+            $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | cumulative_today={1} | unlocked={2}' -f `
+                $nowLocal, (Format-Duration $state.UnlockedSecondsToday), $unlocked
             Write-DailyLogLine -Path $dailyPath -Line $hb
             $lastHeartbeatSlot = $heartbeatSlot
+        }
+
+        # Periodic BHistory + today's unlocked-time log via SCP.
+        $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
+        if ($bHistoryIntervalMin -le 0) {
+            $bHistoryIntervalMin = 5
+        }
+        $dueBHistory = ($nowUtc - $script:LastBHistoryScpUtc).TotalMinutes -ge $bHistoryIntervalMin
+        if ($dueBHistory) {
+            $script:LastBHistoryScpUtc = $nowUtc
+            try {
+                Invoke-ScpBHistoryCopy -Config $config
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
+                    'Unexpected SCP BHistory failure')
+            }
         }
 
         Write-State -Path $statePath -State $state

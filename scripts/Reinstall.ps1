@@ -187,19 +187,17 @@ try {
                 Write-Warning 'git.exe not found; skipping repo pull (will reinstall from current files).'
             }
             else {
-                Write-Host ("Updating git clone from origin/{0}..." -f $Branch) -ForegroundColor Cyan
+                Write-Host ("Updating git clone: fetch + reset --hard origin/{0}..." -f $Branch) -ForegroundColor Cyan
                 $fetch = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('fetch', 'origin', $Branch)
                 if ($fetch.ExitCode -ne 0) {
                     throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, $fetch.Output)
                 }
 
-                $pull = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('pull', '--ff-only', 'origin', $Branch)
-                if ($pull.ExitCode -ne 0) {
-                    Write-Warning ("git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f $Branch, $pull.Output)
-                    $reset = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('reset', '--hard', ("origin/{0}" -f $Branch))
-                    if ($reset.ExitCode -ne 0) {
-                        throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
-                    }
+                $reset = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @(
+                    'reset', '--hard', ("origin/{0}" -f $Branch)
+                )
+                if ($reset.ExitCode -ne 0) {
+                    throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
                 }
 
                 $headResult = Invoke-GitInRepo -GitExe $gitExe -RepoRoot $repoRoot -Arguments @('rev-parse', '--short', 'HEAD')
@@ -209,7 +207,7 @@ try {
         }
     }
     else {
-        Write-Host 'Skipping git pull (-SkipGitPull).' -ForegroundColor DarkGray
+        Write-Host 'Skipping git update (-SkipGitPull).' -ForegroundColor DarkGray
     }
 
     Write-Host ''

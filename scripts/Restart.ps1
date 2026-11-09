@@ -254,6 +254,14 @@ try {
         $adminUsername = Split-Path -Leaf $adminProfile
     }
 
+    $logDirectory = [string](Get-OptionalPropertyValue -InputObject $runtimeRaw -Name 'LogDirectory')
+    $clearedLogs = @(Reset-LoginTimeLoggerOperationalLogs `
+            -ErrorLogPath (Get-ErrorLogPath) `
+            -LogDirectory $logDirectory)
+    if ($clearedLogs.Count -gt 0) {
+        Write-Host ("Reset log file(s): {0}" -f ($clearedLogs -join '; ')) -ForegroundColor DarkGray
+    }
+
     $configForMerge = [pscustomobject]@{
         AdminUsername        = $adminUsername
         AdministratorProfile = $adminProfile
