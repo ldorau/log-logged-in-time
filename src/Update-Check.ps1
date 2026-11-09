@@ -1500,18 +1500,41 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
-        $gitLogText = '(git log -1 unavailable)'
+        $gitLogNewText = '(git log -1 unavailable)'
         try {
-            $gitLog = Invoke-GitCommand -GitExe $gitExe -RepoPath $Config.UpdateClonePath -Arguments @('log', '-1')
-            if ($gitLog.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($gitLog.Output)) {
-                $gitLogText = $gitLog.Output.TrimEnd()
+            $gitLogNew = Invoke-GitCommand -GitExe $gitExe -RepoPath $Config.UpdateClonePath `
+                -Arguments @('log', '-1')
+            if ($gitLogNew.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($gitLogNew.Output)) {
+                $gitLogNewText = $gitLogNew.Output.TrimEnd()
             }
-            elseif ($gitLog.ExitCode -ne 0) {
-                $gitLogText = ("git log -1 failed (exit {0}): {1}" -f $gitLog.ExitCode, $gitLog.Output)
+            elseif ($gitLogNew.ExitCode -ne 0) {
+                $gitLogNewText = ("git log -1 failed (exit {0}): {1}" -f `
+                        $gitLogNew.ExitCode, $gitLogNew.Output)
             }
         }
         catch {
-            $gitLogText = ("git log -1 failed: {0}" -f $_.Exception.Message)
+            $gitLogNewText = ("git log -1 failed: {0}" -f $_.Exception.Message)
+        }
+
+        $gitLogPrevText = '(no previous commit)'
+        if (-not [string]::IsNullOrWhiteSpace([string]$localSha)) {
+            $gitLogPrevText = '(git log -1 PreviousCommit unavailable)'
+            try {
+                $gitLogPrev = Invoke-GitCommand -GitExe $gitExe -RepoPath $Config.UpdateClonePath `
+                    -Arguments @('log', '-1', [string]$localSha)
+                if ($gitLogPrev.ExitCode -eq 0 -and
+                    -not [string]::IsNullOrWhiteSpace($gitLogPrev.Output)) {
+                    $gitLogPrevText = $gitLogPrev.Output.TrimEnd()
+                }
+                elseif ($gitLogPrev.ExitCode -ne 0) {
+                    $gitLogPrevText = ("git log -1 {0} failed (exit {1}): {2}" -f `
+                            $localSha, $gitLogPrev.ExitCode, $gitLogPrev.Output)
+                }
+            }
+            catch {
+                $gitLogPrevText = ("git log -1 {0} failed: {1}" -f `
+                        $localSha, $_.Exception.Message)
+            }
         }
 
         if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
@@ -1529,8 +1552,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 ('ClonePath: {0}' -f $Config.UpdateClonePath)
                 ('InstallRoot: {0}' -f $InstallRoot)
                 ''
-                '--- git log -1 ---'
-                $gitLogText
+                '--- git log -1 (new) ---'
+                $gitLogNewText
+                ''
+                ('--- git log -1 {0} (previous) ---' -f $(
+                        if ($localSha) { $localSha } else { '(none)' }))
+                $gitLogPrevText
             ) -join [Environment]::NewLine
             # Per-commit key so cooldown does not suppress distinct updates.
             $null = Send-LoginTimeSmtpAlert `
