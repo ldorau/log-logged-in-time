@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Blocking countdown on the interactive desktop, then LockWorkStation.
@@ -61,7 +61,10 @@ $restMessage.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $restMessage.Dock = [System.Windows.Forms.DockStyle]::Top
 $restMessage.Height = 56
 $restMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
-$restMessage.Text = 'Twoje OCZY muszą ODPOCZĄĆ !'
+# Build with [char] code points so Windows PowerShell 5.1 (-File, no BOM)
+# does not mis-decode UTF-8 Polish letters as the system ANSI code page.
+$restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
+        [char]0x0105, [char]0x0104, [char]0x0106)  # ą Ą Ć
 $restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
 $restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
 
