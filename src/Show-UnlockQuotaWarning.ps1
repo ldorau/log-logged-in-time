@@ -40,7 +40,7 @@ $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::FromArgb(32, 32, 36)
 $form.ForeColor = [System.Drawing.Color]::White
-$form.ClientSize = New-Object System.Drawing.Size(520, 220)
+$form.ClientSize = New-Object System.Drawing.Size(560, 280)
 $form.KeyPreview = $true
 # Swallow keys so the dialog stays modal/blocking for the countdown.
 $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
@@ -49,11 +49,21 @@ $title = New-Object System.Windows.Forms.Label
 $title.AutoSize = $false
 $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $title.Dock = [System.Windows.Forms.DockStyle]::Top
-$title.Height = 70
-$title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$title.Height = 48
+$title.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Regular)
 $title.Text = ("{0} minutes of unlocked time have passed." -f $Minutes)
-$title.ForeColor = [System.Drawing.Color]::White
-$title.Padding = New-Object System.Windows.Forms.Padding(12, 16, 12, 0)
+$title.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+$title.Padding = New-Object System.Windows.Forms.Padding(12, 12, 12, 0)
+
+$restMessage = New-Object System.Windows.Forms.Label
+$restMessage.AutoSize = $false
+$restMessage.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$restMessage.Dock = [System.Windows.Forms.DockStyle]::Top
+$restMessage.Height = 56
+$restMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
+$restMessage.Text = 'Twoje OCZY muszą ODPOCZĄĆ !'
+$restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
+$restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
 
 $countdown = New-Object System.Windows.Forms.Label
 $countdown.AutoSize = $false
@@ -72,8 +82,10 @@ $footer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $footer.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $footer.Text = 'Screen will lock when the timer reaches zero.'
 
+# Dock order: first added fills; later Top/Bottom dock around it.
 $form.Controls.Add($countdown)
 $form.Controls.Add($footer)
+$form.Controls.Add($restMessage)
 $form.Controls.Add($title)
 
 $script:remaining = [int]$CountdownSeconds
