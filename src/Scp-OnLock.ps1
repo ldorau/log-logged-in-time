@@ -332,6 +332,72 @@ function Get-ScpOnLockSourceFiles {
     return @($files)
 }
 
+function Get-ScpManualSourceFiles {
+    <#
+      Collects a fuller set for manual SCP: every unlocked-time-*.log under
+      LogDirectory, all error logs, unlocked-time-summary.csv, and state.json.
+      Does not include service.log.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$ErrorLogPath = ''
+    )
+
+    $files = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    $addFile = {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return
+        }
+        try {
+            $full = [System.IO.Path]::GetFullPath($Path)
+        }
+        catch {
+            $full = $Path
+        }
+        $key = $full.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            return
+        }
+        $seen[$key] = $true
+        $files.Add($full)
+    }
+
+    $logDir = ''
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        $logDir = [string]$Config.LogDirectory
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($logDir) -and (Test-Path -LiteralPath $logDir)) {
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter 'unlocked-time-*.log' -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            ForEach-Object { & $addFile $_.FullName }
+
+        & $addFile (Join-Path $logDir 'unlocked-time-summary.csv')
+        & $addFile (Join-Path $logDir 'state.json')
+
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter 'errors.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { & $addFile $_.FullName }
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter '*error*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { & $addFile $_.FullName }
+    }
+
+    & $addFile $ErrorLogPath
+    if (Get-Command Get-ErrorLogPath -ErrorAction SilentlyContinue) {
+        try { & $addFile (Get-ErrorLogPath) } catch { }
+    }
+
+    return @($files)
+}
+
 function Send-ScpOnLockFailureAlert {
     <#
       Emails an SCP-on-lock failure with local error/service logs attached (when SMTP enabled).

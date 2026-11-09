@@ -77,6 +77,12 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 
 When SCP-on-lock is enabled, Install and the daily self-update check also reconcile an outbound Windows Firewall **Allow** rule for `ScpHost:ScpPort` (`scripts/Allow-ScpOutboundFirewall.ps1`, prefix `SCP-Allow:`).
 
+To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `unlocked-time-summary.csv`, and `state.json`):
+
+```powershell
+.\scripts\Copy-LogsViaScp.ps1 -Force
+```
+
 ### Email alerts (SMTP)
 
 Optional. Install creates `<AdministratorProfile>\LoginTimeLogger\smtp.json` (admin + `SYSTEM` only; the measured user cannot read it). Template also lives at `config/smtp.json` in the repo (disabled, empty secrets).
@@ -124,6 +130,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Status.ps1
 .\scripts\Get-LockedTime.ps1          # estimate locked/away time from log transitions
 .\scripts\Get-LockedTime.ps1 -AllDays
+.\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + summary + state
 ```
 
 **Unlocked-time logs** (when the target user was logged in with the screen unlocked):

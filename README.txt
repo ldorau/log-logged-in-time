@@ -105,6 +105,7 @@ Project layout
   scripts\Install.ps1         - installs task; writes runtime config under Administrator
   scripts\Reinstall.ps1       - git pull (optional) + Install.ps1 -StartNow
   scripts\Test-ScpOnLock.ps1  - test remote log copy (SCP on lock) + debug
+  scripts\Copy-LogsViaScp.ps1 - manual SCP of all day logs + errors + summary + state
   scripts\Allow-ScpOutboundFirewall.ps1 - outbound Allow for ScpHost:ScpPort
   scripts\Uninstall.ps1       - remove scheduled task
   scripts\Status.ps1          - show task state and today's total

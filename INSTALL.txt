@@ -193,6 +193,9 @@ Test SCP-on-lock copy to the remote host (uses runtime config; prints debug on f
 Output goes to the screen and a log under LoginTimeLogger\scp-on-lock-test-*.log:
   .\scripts\Test-ScpOnLock.ps1
   .\scripts\Test-ScpOnLock.ps1 -Force -ProbeOnly
+  .\scripts\Copy-LogsViaScp.ps1 -Force
+    # manual SCP of every unlocked-time-*.log, error logs,
+    # unlocked-time-summary.csv, and state.json
 
 Test session / lock detection for the configured user:
   .\scripts\Test-Session.ps1
