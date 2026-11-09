@@ -634,6 +634,118 @@ function Write-State {
     }
 }
 
+function Repair-UnlockedTimeSummaryCsv {
+    <#
+      Rewrites locale-broken summary rows where UnlockedHours used ',' as the
+      decimal separator (e.g. "2026-11-02,4230,1,1751,piter" -> five fields).
+      Hours are recomputed from UnlockedSeconds with InvariantCulture.
+      Returns $true when the file was rewritten.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $rawLines = @(Get-Content -LiteralPath $Path -ErrorAction Stop)
+    }
+    catch {
+        return $false
+    }
+
+    $header = 'Date,UnlockedSeconds,UnlockedHours,TargetUsername'
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add($header)
+    $changed = $false
+    $seenDate = @{}
+
+    foreach ($line in $rawLines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $trim = $line.Trim()
+        if ($trim -match '^\s*Date\s*,') {
+            if (-not [string]::Equals($trim, $header, [System.StringComparison]::Ordinal)) {
+                $changed = $true
+            }
+            continue
+        }
+
+        $parts = @($trim.Split(','))
+        $date = ''
+        $seconds = $null
+        $user = ''
+
+        if ($parts.Count -eq 4 -and $parts[0] -match '^\d{4}-\d{2}-\d{2}$') {
+            $date = $parts[0]
+            $secParsed = 0.0
+            if (-not [double]::TryParse($parts[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$secParsed)) {
+                $out.Add($trim)
+                continue
+            }
+            $seconds = $secParsed
+            $user = $parts[3]
+            $hoursExpected = [Math]::Round($seconds / 3600.0, 4)
+            $hoursText = $hoursExpected.ToString('0.####', $inv)
+            if (-not [string]::Equals($parts[2], $hoursText, [System.StringComparison]::Ordinal)) {
+                # Keep row but normalize hours (covers "1,1751"-style already split,
+                # and minor format drift).
+                $changed = $true
+            }
+        }
+        elseif ($parts.Count -ge 5 -and $parts[0] -match '^\d{4}-\d{2}-\d{2}$') {
+            # Broken locale row: Date,Seconds,hoursLeft,hoursRight...,User
+            $date = $parts[0]
+            $secParsed = 0.0
+            if (-not [double]::TryParse($parts[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$secParsed)) {
+                $changed = $true
+                continue
+            }
+            $seconds = $secParsed
+            $user = $parts[$parts.Count - 1]
+            $changed = $true
+        }
+        else {
+            # Unknown shape: keep as-is so we do not discard data silently.
+            $out.Add($trim)
+            continue
+        }
+
+        if ($seenDate.ContainsKey($date)) {
+            $changed = $true
+            continue
+        }
+        $seenDate[$date] = $true
+
+        $hours = [Math]::Round(([double]$seconds) / 3600.0, 4)
+        $row = [string]::Format(
+            $inv,
+            '{0},{1:F0},{2:0.####},{3}',
+            $date,
+            $seconds,
+            $hours,
+            $user)
+        if (-not [string]::Equals($trim, $row, [System.StringComparison]::Ordinal)) {
+            $changed = $true
+        }
+        $out.Add($row)
+    }
+
+    if (-not $changed) {
+        return $false
+    }
+
+    try {
+        Set-Content -LiteralPath $Path -Value @($out) -Encoding UTF8
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 function Ensure-SummaryHeader {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -644,7 +756,10 @@ function Ensure-SummaryHeader {
             $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Ensure-SummaryHeader failed for '{0}'" -f $Path)
             throw (New-Object System.Exception($details, $_.Exception))
         }
+        return
     }
+
+    $null = Repair-UnlockedTimeSummaryCsv -Path $Path
 }
 
 function Format-Duration {
@@ -785,6 +900,16 @@ try {
         -AdminUsername $config.AdminUsername
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
+    $summaryPath = Get-SummaryPath -LogDirectory $config.LogDirectory
+    try {
+        if (Repair-UnlockedTimeSummaryCsv -Path $summaryPath) {
+            Write-LoggerEvent ("Repaired locale-broken rows in summary CSV: {0}" -f $summaryPath)
+        }
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "Summary CSV repair skipped: {0}" -f $_.Exception.Message)
+    }
     $statePath = Get-StatePath -LogDirectory $config.LogDirectory
     $state = ConvertTo-LoggerStateObject `
         -State (Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)) `
