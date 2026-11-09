@@ -20,6 +20,11 @@ if ($Minutes -lt 1) { $Minutes = 30 }
 if ($CountdownSeconds -lt 1) { $CountdownSeconds = 3 }
 if ($CountdownSeconds -gt 60) { $CountdownSeconds = 60 }
 
+# Elapsed unlocked time as H:MM (e.g. 30 -> 0:30, 90 -> 1:30).
+$elapsedHours = [int][Math]::Floor($Minutes / 60)
+$elapsedMins = [int]($Minutes % 60)
+$elapsedHm = '{0}:{1:D2}' -f $elapsedHours, $elapsedMins
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -Namespace User32 -Name Native -MemberDefinition @"
@@ -51,7 +56,7 @@ $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $title.Dock = [System.Windows.Forms.DockStyle]::Top
 $title.Height = 48
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Regular)
-$title.Text = ("{0} minutes of unlocked time have passed." -f $Minutes)
+$title.Text = 'Unlocked time so far'
 $title.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $title.Padding = New-Object System.Windows.Forms.Padding(12, 12, 12, 0)
 
@@ -68,13 +73,14 @@ $restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
 $restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
 $restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
 
-$countdown = New-Object System.Windows.Forms.Label
-$countdown.AutoSize = $false
-$countdown.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-$countdown.Dock = [System.Windows.Forms.DockStyle]::Fill
-$countdown.Font = New-Object System.Drawing.Font('Segoe UI', 36, [System.Drawing.FontStyle]::Bold)
-$countdown.ForeColor = [System.Drawing.Color]::FromArgb(255, 196, 0)
-$countdown.Text = "$CountdownSeconds"
+# Large display: elapsed unlocked time as hours:minutes.
+$elapsedLabel = New-Object System.Windows.Forms.Label
+$elapsedLabel.AutoSize = $false
+$elapsedLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$elapsedLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$elapsedLabel.Font = New-Object System.Drawing.Font('Segoe UI', 36, [System.Drawing.FontStyle]::Bold)
+$elapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 196, 0)
+$elapsedLabel.Text = $elapsedHm
 
 $footer = New-Object System.Windows.Forms.Label
 $footer.AutoSize = $false
@@ -83,10 +89,10 @@ $footer.Dock = [System.Windows.Forms.DockStyle]::Bottom
 $footer.Height = 40
 $footer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $footer.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
-$footer.Text = 'Screen will lock when the timer reaches zero.'
+$footer.Text = ('Screen will lock in {0} s...' -f $CountdownSeconds)
 
 # Dock order: first added fills; later Top/Bottom dock around it.
-$form.Controls.Add($countdown)
+$form.Controls.Add($elapsedLabel)
 $form.Controls.Add($footer)
 $form.Controls.Add($restMessage)
 $form.Controls.Add($title)
@@ -97,11 +103,11 @@ $timer.Interval = 1000
 $timer.Add_Tick({
         $script:remaining--
         if ($script:remaining -gt 0) {
-            $countdown.Text = "$script:remaining"
+            $footer.Text = ('Screen will lock in {0} s...' -f $script:remaining)
             return
         }
         $timer.Stop()
-        $countdown.Text = '0'
+        $footer.Text = 'Screen will lock now...'
         $form.Close()
     })
 

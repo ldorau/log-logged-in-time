@@ -1,5 +1,5 @@
 # SCP helper for LoginTimeLogger (dot-sourced by the monitor).
-# On screen lock, copies today's unlocked-time log and errors.log to a remote host.
+# On screen lock, copies the two newest unlocked-time-*.log files and error logs.
 
 function Find-ScpExecutable {
     $cmd = Get-Command scp.exe -ErrorAction SilentlyContinue
@@ -257,8 +257,9 @@ function Get-ScpOnLockMissingConfigFields {
 
 function Get-ScpOnLockSourceFiles {
     <#
-      Collects log files for SCP-on-lock: today's time log, errors.log, and every
-      *.log / *.csv / state.json under LogDirectory (deduped).
+      Collects log files for SCP-on-lock: the two newest unlocked-time-*.log
+      files under LogDirectory, plus all error logs (errors.log paths).
+      Does not copy service.log, summary CSV, state.json, or older time logs.
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -291,20 +292,40 @@ function Get-ScpOnLockSourceFiles {
         $files.Add($full)
     }
 
-    & $addFile $TimeLogPath
-    & $addFile $ErrorLogPath
-
     $logDir = ''
     if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
         $logDir = [string]$Config.LogDirectory
     }
+
+    # Two newest unlocked-time-*.log (by LastWriteTime, then name).
+    $timeLogs = @()
     if (-not [string]::IsNullOrWhiteSpace($logDir) -and (Test-Path -LiteralPath $logDir)) {
-        Get-ChildItem -LiteralPath $logDir -File -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -eq 'state.json' -or
-                $_.Extension -eq '.log' -or
-                $_.Extension -eq '.csv'
-            } |
+        $timeLogs = @(
+            Get-ChildItem -LiteralPath $logDir -File -Force `
+                -Filter 'unlocked-time-*.log' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime, Name -Descending |
+                Select-Object -First 2
+        )
+    }
+    foreach ($tl in $timeLogs) {
+        & $addFile $tl.FullName
+    }
+    # If LogDirectory had no matches yet but caller passed today's path, include it.
+    if ($timeLogs.Count -eq 0) {
+        & $addFile $TimeLogPath
+    }
+
+    # All error logs: explicit path, current Get-ErrorLogPath, and errors.log under LogDirectory.
+    & $addFile $ErrorLogPath
+    if (Get-Command Get-ErrorLogPath -ErrorAction SilentlyContinue) {
+        try { & $addFile (Get-ErrorLogPath) } catch { }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($logDir) -and (Test-Path -LiteralPath $logDir)) {
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter 'errors.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { & $addFile $_.FullName }
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter '*error*.log' -ErrorAction SilentlyContinue |
             ForEach-Object { & $addFile $_.FullName }
     }
 
