@@ -223,6 +223,152 @@ function Test-ScpAuthFailure {
         ($StdErr -match '(?i)No more authentication methods to try')
 }
 
+function Add-ScpCommonSshOptions {
+    <#
+      Appends shared OpenSSH client options for LoginTimeLogger scp calls.
+      ConnectTimeout covers the initial TCP connect only; ServerAlive* detects
+      a stalled session after connect so hung copies fail quickly.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$ArgumentList,
+        [Parameter(Mandatory)][string]$IdentityFile,
+        [Parameter(Mandatory)][int]$Port,
+        [string]$KnownHostsFile = '',
+        [switch]$VerboseSsh
+    )
+
+    $ArgumentList.Add('-i')
+    $ArgumentList.Add($IdentityFile.Trim())
+    $ArgumentList.Add('-P')
+    $ArgumentList.Add("$Port")
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('BatchMode=yes')
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('IdentitiesOnly=yes')
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('PreferredAuthentications=publickey')
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('StrictHostKeyChecking=accept-new')
+    if (-not [string]::IsNullOrWhiteSpace($KnownHostsFile)) {
+        $ArgumentList.Add('-o')
+        $ArgumentList.Add(('UserKnownHostsFile={0}' -f $KnownHostsFile.Trim()))
+    }
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('ConnectTimeout=20')
+    # Detect dead peers after connect (ConnectTimeout does not cover transfer stalls).
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('ServerAliveInterval=10')
+    $ArgumentList.Add('-o')
+    $ArgumentList.Add('ServerAliveCountMax=3')
+    if ($VerboseSsh) {
+        $ArgumentList.Add('-v')
+    }
+}
+
+function Stop-ScpProcessTree {
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) {
+        return
+    }
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+    }
+    catch {
+        return
+    }
+
+    $procId = 0
+    try { $procId = [int]$Process.Id } catch { return }
+    if ($procId -le 0) {
+        return
+    }
+
+    # Prefer killing the whole tree (scp may spawn ssh.exe).
+    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    if (Test-Path -LiteralPath $taskkill) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & $taskkill /PID $procId /T /F 2>&1
+        }
+        finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+    else {
+        try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch { }
+    }
+
+    try { $null = $Process.WaitForExit(5000) } catch { }
+}
+
+function Invoke-ScpProcessWithTimeout {
+    <#
+      Starts scp and waits up to TimeoutSeconds. On timeout, kills the process
+      tree and returns TimedOut=$true with ExitCode=-1.
+      ConnectTimeout alone is not enough: a stalled transfer can block for hours.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScpExe,
+        [Parameter(Mandatory)][string]$ArgumentList,
+        [Parameter(Mandatory)][string]$StdOutPath,
+        [Parameter(Mandatory)][string]$StdErrPath,
+        [ValidateRange(5, 3600)]
+        [int]$TimeoutSeconds = 90
+    )
+
+    $proc = Start-Process -FilePath $ScpExe -ArgumentList $ArgumentList `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
+
+    if ($null -eq $proc) {
+        return [pscustomobject]@{
+            ExitCode = -1
+            TimedOut = $false
+            Process  = $null
+        }
+    }
+
+    $timeoutMs = [Math]::Max(1000, $TimeoutSeconds * 1000)
+    $exited = $false
+    try {
+        $exited = $proc.WaitForExit($timeoutMs)
+    }
+    catch {
+        $exited = $false
+    }
+
+    if (-not $exited) {
+        Stop-ScpProcessTree -Process $proc
+        return [pscustomobject]@{
+            ExitCode = -1
+            TimedOut = $true
+            Process  = $proc
+        }
+    }
+
+    $code = -1
+    try {
+        if ($proc.HasExited) {
+            $code = [int]$proc.ExitCode
+        }
+    }
+    catch {
+        $code = -1
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $code
+        TimedOut = $false
+        Process  = $proc
+    }
+}
+
 function Test-ScpOnLockConfigured {
     param([Parameter(Mandatory)]$Config)
 
@@ -508,31 +654,21 @@ function Invoke-ScpLogCopyOnLock {
 
         # Do not name this $args (PowerShell automatic variable).
         $scpArgList = New-Object System.Collections.Generic.List[string]
-        $scpArgList.Add('-i')
-        $scpArgList.Add(([string]$Config.ScpIdentityFile).Trim())
-        $scpArgList.Add('-P')
-        $scpArgList.Add("$port")
-        $scpArgList.Add('-o')
-        $scpArgList.Add('BatchMode=yes')
-        $scpArgList.Add('-o')
-        $scpArgList.Add('IdentitiesOnly=yes')
-        $scpArgList.Add('-o')
-        $scpArgList.Add('PreferredAuthentications=publickey')
-        $scpArgList.Add('-o')
-        $scpArgList.Add('StrictHostKeyChecking=accept-new')
-        if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpKnownHostsFile)) {
-            $scpArgList.Add('-o')
-            $scpArgList.Add(('UserKnownHostsFile={0}' -f ([string]$Config.ScpKnownHostsFile).Trim()))
-        }
-        $scpArgList.Add('-o')
-        $scpArgList.Add('ConnectTimeout=20')
+        Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+            -IdentityFile ([string]$Config.ScpIdentityFile) `
+            -Port $port `
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
         foreach ($f in $files) {
             $scpArgList.Add($f)
         }
         $scpArgList.Add($remoteTarget)
 
-        Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1}: {2}" -f `
-                $files.Count, $remoteTarget, ($files -join '; '))
+        # Hard cap: ConnectTimeout only covers TCP connect. A stalled transfer
+        # previously blocked the monitor for hours (see Connection aborted after ~2.5h).
+        $scpTimeoutSeconds = 90
+
+        Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1} (timeout {2}s): {3}" -f `
+                $files.Count, $remoteTarget, $scpTimeoutSeconds, ($files -join '; '))
 
         $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.out' -f [guid]::NewGuid().ToString('N'))
         $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.err' -f [guid]::NewGuid().ToString('N'))
@@ -548,9 +684,8 @@ function Invoke-ScpLogCopyOnLock {
                     }) -join ' '
             }
 
-            $proc = Start-Process -FilePath $scpExe -ArgumentList $argLine `
-                -Wait -PassThru -WindowStyle Hidden `
-                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+            $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
             $stdout = ''
             $stderr = ''
             if (Test-Path -LiteralPath $outFile) {
@@ -559,9 +694,30 @@ function Invoke-ScpLogCopyOnLock {
             if (Test-Path -LiteralPath $errFile) {
                 $stderr = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
-            $exitCode = -1
-            if ($null -ne $proc) {
-                $exitCode = [int]$proc.ExitCode
+            $exitCode = [int]$run.ExitCode
+            if ($run.TimedOut) {
+                $msg = ("SCP on lock timed out after {0}s (killed). target={1}; files={2}; stderr={3}; stdout={4}" -f `
+                        $scpTimeoutSeconds, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
+                Write-LoggerEvent -Level WARN -Message $msg
+
+                $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    @(
+                        $msg
+                        ''
+                        '--- scp stderr ---'
+                        ("$stderr").Trim()
+                        ''
+                        '--- scp stdout ---'
+                        ("$stdout").Trim()
+                    ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                    $null = Send-ScpOnLockFailureAlert -Body $msg -Config $Config `
+                        -ErrorLogPath $ErrorLogPath -ExtraAttachment @($diagPath)
+                }
+                finally {
+                    Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                }
+                return
             }
             if ($exitCode -ne 0) {
                 $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `

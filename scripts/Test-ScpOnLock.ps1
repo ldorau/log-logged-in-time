@@ -295,40 +295,26 @@ function Invoke-ScpCopyForTest {
     $remoteTarget = '{0}@{1}:{2}' -f $Config.ScpUser, $Config.ScpHost, $remoteDir
 
     $argList = New-Object System.Collections.Generic.List[string]
-    $argList.Add('-i')
-    $argList.Add([string]$Config.ScpIdentityFile)
-    $argList.Add('-P')
-    $argList.Add("$([int]$Config.ScpPort)")
-    $argList.Add('-o')
-    $argList.Add('BatchMode=yes')
-    $argList.Add('-o')
-    $argList.Add('IdentitiesOnly=yes')
-    $argList.Add('-o')
-    $argList.Add('PreferredAuthentications=publickey')
-    $argList.Add('-o')
-    $argList.Add('StrictHostKeyChecking=accept-new')
-    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ScpKnownHostsFile)) {
-        $argList.Add('-o')
-        $argList.Add(('UserKnownHostsFile={0}' -f $Config.ScpKnownHostsFile))
-    }
-    $argList.Add('-o')
-    $argList.Add('ConnectTimeout=20')
-    $argList.Add('-v')
+    Add-ScpCommonSshOptions -ArgumentList $argList `
+        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -Port ([int]$Config.ScpPort) `
+        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+        -VerboseSsh
     foreach ($f in $Files) {
         $argList.Add($f)
     }
     $argList.Add($remoteTarget)
 
     $argLine = ConvertTo-StartProcessArgumentString -Argument $argList.ToArray()
+    $timeoutSeconds = 120
     # Safe command preview: show identity path, not key contents.
-    Write-ScpTestLine ("scp command: {0} {1}" -f $scpExe, $argLine) -ForegroundColor DarkGray
+    Write-ScpTestLine ("scp command (timeout {0}s): {1} {2}" -f $timeoutSeconds, $scpExe, $argLine) -ForegroundColor DarkGray
 
     $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-test-{0}.out' -f [guid]::NewGuid().ToString('N'))
     $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-test-{0}.err' -f [guid]::NewGuid().ToString('N'))
     try {
-        $proc = Start-Process -FilePath $scpExe -ArgumentList $argLine `
-            -Wait -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $timeoutSeconds
         $stdout = ''
         $stderr = ''
         if (Test-Path -LiteralPath $outFile) {
@@ -337,10 +323,14 @@ function Invoke-ScpCopyForTest {
         if (Test-Path -LiteralPath $errFile) {
             $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
         }
+        if ($run.TimedOut) {
+            $stderr = (("timed out after {0}s (process killed)`r`n{1}" -f $timeoutSeconds, $stderr)).Trim()
+        }
         return [pscustomobject]@{
             ScpExe       = $scpExe
             RemoteTarget = $remoteTarget
-            ExitCode     = [int]$proc.ExitCode
+            ExitCode     = [int]$run.ExitCode
+            TimedOut     = [bool]$run.TimedOut
             StdOut       = $stdout
             StdErr       = $stderr
             ArgPreview   = ("{0} {1}" -f $scpExe, $argLine)

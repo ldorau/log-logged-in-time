@@ -68,7 +68,7 @@ Existing installs that receive `UnlockQuota*` via **self-update** merge get `Unl
 - the **two newest** `unlocked-time-*.log` files under `LogDirectory`
 - all error logs (`errors.log` / `*error*.log`, including the configured error log path)
 
-to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`). Defaults for empty key paths:
+to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`), `ServerAliveInterval` keepalives, and a **90s hard process timeout** so a stalled transfer cannot block the monitor for hours. Defaults for empty key paths:
 
 - `ScpIdentityFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519`
 - `ScpKnownHostsFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\known_hosts`

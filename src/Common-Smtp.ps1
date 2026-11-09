@@ -201,11 +201,74 @@ function Set-SmtpAlertCooldownStamp {
     ($map | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $CooldownPath -Encoding UTF8
 }
 
+function New-SmtpAttachmentTailFile {
+    <#
+      Writes the last TailBytes of SourcePath to a TEMP file for emailing.
+      Returns the temp path, or '' on failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [ValidateRange(1024, 10485760)]
+        [int]$TailBytes = 262144
+    )
+
+    try {
+        $item = Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop
+        $srcLen = [int64]$item.Length
+        $take = [int64]$TailBytes
+        if ($take -gt $srcLen) {
+            $take = $srcLen
+        }
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($SourcePath)
+        $ext = [System.IO.Path]::GetExtension($SourcePath)
+        if ([string]::IsNullOrWhiteSpace($ext)) {
+            $ext = '.txt'
+        }
+        $dest = Join-Path $env:TEMP (
+            'LoginTimeLogger-smtp-tail-{0}-{1}{2}' -f `
+                $name, [guid]::NewGuid().ToString('N'), $ext)
+
+        $inStream = $null
+        $outStream = $null
+        try {
+            $inStream = [System.IO.File]::Open(
+                $SourcePath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite)
+            $null = $inStream.Seek($srcLen - $take, [System.IO.SeekOrigin]::Begin)
+            $outStream = [System.IO.File]::Create($dest)
+            $buffer = New-Object byte[] 8192
+            $remaining = $take
+            while ($remaining -gt 0) {
+                $want = [int]([Math]::Min([int64]$buffer.Length, $remaining))
+                $read = $inStream.Read($buffer, 0, $want)
+                if ($read -le 0) {
+                    break
+                }
+                $outStream.Write($buffer, 0, $read)
+                $remaining -= $read
+            }
+        }
+        finally {
+            if ($null -ne $outStream) { $outStream.Dispose() }
+            if ($null -ne $inStream) { $inStream.Dispose() }
+        }
+        return $dest
+    }
+    catch {
+        return ''
+    }
+}
+
 function Send-LoginTimeSmtpAlert {
     <#
       Sends an email when smtp.json is Enabled and complete.
       Optional -Attachment paths are included when the files exist (size-capped).
-      Failures are swallowed (logged to errors.log when possible) so alerts never stop the monitor.
+      Files larger than PreferredAttachmentBytes are attached as a trailing
+      slice (last PreferredAttachmentBytes) so alerts stay small (e.g. 1MB+
+      errors.log). Failures are swallowed (logged to errors.log when possible)
+      so alerts never stop the monitor.
     #>
     [CmdletBinding()]
     param(
@@ -214,9 +277,11 @@ function Send-LoginTimeSmtpAlert {
         [string]$AlertKey = '',
         [string]$SmtpConfigPath = '',
         [string[]]$Attachment = @(),
-        [int]$MaxAttachmentBytes = 5242880
+        [int]$MaxAttachmentBytes = 5242880,
+        [int]$PreferredAttachmentBytes = 262144
     )
 
+    $tempAttachments = New-Object System.Collections.Generic.List[string]
     try {
         if ([string]::IsNullOrWhiteSpace($script:LoginTimeSmtpConfigPath) -and [string]::IsNullOrWhiteSpace($SmtpConfigPath)) {
             $null = Initialize-SmtpAlerts
@@ -278,12 +343,35 @@ function Send-LoginTimeSmtpAlert {
                 $attachmentNotes.Add(("skipped (not a file): {0}" -f $full))
                 continue
             }
-            if ($MaxAttachmentBytes -gt 0 -and $item.Length -gt $MaxAttachmentBytes) {
+
+            $attachPath = $full
+            if ($PreferredAttachmentBytes -gt 0 -and $item.Length -gt $PreferredAttachmentBytes) {
+                # Large logs (e.g. 1MB+ errors.log): attach a trailing slice only.
+                $tailPath = New-SmtpAttachmentTailFile -SourcePath $full -TailBytes $PreferredAttachmentBytes
+                if (-not [string]::IsNullOrWhiteSpace($tailPath) -and (Test-Path -LiteralPath $tailPath)) {
+                    $tempAttachments.Add($tailPath)
+                    $attachPath = $tailPath
+                    $attachmentNotes.Add((
+                            "attached (last {0} bytes of {1}): {2}" -f `
+                                $PreferredAttachmentBytes, $item.Length, $full))
+                }
+                elseif ($MaxAttachmentBytes -gt 0 -and $item.Length -gt $MaxAttachmentBytes) {
+                    $attachmentNotes.Add(("skipped (too large {0} bytes; tail failed): {1}" -f $item.Length, $full))
+                    continue
+                }
+                else {
+                    $attachmentNotes.Add(("attached (full; tail failed): {0} ({1} bytes)" -f $full, $item.Length))
+                }
+            }
+            elseif ($MaxAttachmentBytes -gt 0 -and $item.Length -gt $MaxAttachmentBytes) {
                 $attachmentNotes.Add(("skipped (too large {0} bytes): {1}" -f $item.Length, $full))
                 continue
             }
-            $attachmentPaths.Add($full)
-            $attachmentNotes.Add(("attached: {0} ({1} bytes)" -f $full, $item.Length))
+            else {
+                $attachmentNotes.Add(("attached: {0} ({1} bytes)" -f $full, $item.Length))
+            }
+
+            $attachmentPaths.Add($attachPath)
         }
 
         $fullBody = @(
@@ -331,5 +419,10 @@ function Send-LoginTimeSmtpAlert {
         }
         catch { }
         return $false
+    }
+    finally {
+        foreach ($tmp in @($tempAttachments)) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
     }
 }
