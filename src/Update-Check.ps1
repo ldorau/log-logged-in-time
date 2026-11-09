@@ -1,6 +1,6 @@
 # Update helper for LoginTimeLogger (dot-sourced by the monitor).
 # Once per day: if online, compare local installed commit to GitHub tip;
-# if different, git pull (or clone), publish Program Files, merge new fields
+# if different, git fetch + reset --hard (or clone), publish Program Files, merge new fields
 # from config/config.json and config/smtp.json into the installed admin
 # configs (existing values unchanged), and restart via the scheduled task.
 # After a successful daily check (up-to-date or just updated), also run
@@ -439,21 +439,17 @@ function Sync-UpdateRepository {
         }
     }
     else {
-        $null = Write-LoggerEvent ("git fetch/pull in {0}" -f $ClonePath)
+        # Always fetch + hard reset (survives force-pushes; no merge/pull).
+        $null = Write-LoggerEvent ("git fetch + reset --hard origin/{0} in {1}" -f $Branch, $ClonePath)
         $fetch = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('fetch', 'origin', $Branch)
         if ($fetch.ExitCode -ne 0) {
             throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, $fetch.Output)
         }
-        # Unattended-safe equivalent of updating to newest tip after pull/fetch.
-        $pull = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('pull', '--ff-only', 'origin', $Branch)
-        if ($pull.ExitCode -ne 0) {
-            $null = Write-LoggerEvent -Level WARN -Message (
-                "git pull --ff-only failed; hard-resetting to origin/{0}. Detail: {1}" -f `
-                    $Branch, $pull.Output)
-            $reset = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @('reset', '--hard', ("origin/{0}" -f $Branch))
-            if ($reset.ExitCode -ne 0) {
-                throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
-            }
+        $reset = Invoke-GitCommand -GitExe $GitExe -RepoPath $ClonePath -Arguments @(
+            'reset', '--hard', ("origin/{0}" -f $Branch)
+        )
+        if ($reset.ExitCode -ne 0) {
+            throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, $reset.Output)
         }
     }
 

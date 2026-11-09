@@ -255,15 +255,17 @@ try {
         }
     }
     else {
-        Write-Host ("Repository already present at {0}; fetching latest {1}..." -f $ClonePath, $Branch)
+        Write-Host ("Repository already present at {0}; fetch + reset --hard origin/{1}..." -f $ClonePath, $Branch)
         $fetch = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'fetch', 'origin', $Branch)
         if ($fetch.ExitCode -ne 0) {
             throw ("git fetch failed (exit {0}): {1}" -f $fetch.ExitCode, ($fetch.Output | Out-String))
         }
         $null = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'checkout', $Branch)
-        $pull = Invoke-Git -GitExe $gitExe -Arguments @('-C', $ClonePath, 'pull', '--ff-only', 'origin', $Branch)
-        if ($pull.ExitCode -ne 0) {
-            Write-Host ("Warning: git pull --ff-only failed; continuing with local tree. Detail: {0}" -f ($pull.Output | Out-String)) -ForegroundColor Yellow
+        $reset = Invoke-Git -GitExe $gitExe -Arguments @(
+            '-C', $ClonePath, 'reset', '--hard', ("origin/{0}" -f $Branch)
+        )
+        if ($reset.ExitCode -ne 0) {
+            throw ("git reset --hard failed (exit {0}): {1}" -f $reset.ExitCode, ($reset.Output | Out-String))
         }
     }
 
