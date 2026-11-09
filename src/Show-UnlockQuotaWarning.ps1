@@ -5,6 +5,7 @@
 .DESCRIPTION
   Intended to run inside the target user's session (CreateProcessAsUser from SYSTEM).
   Shows a top-most modal for -CountdownSeconds, then locks the workstation.
+  Exits 0 only when LockWorkStation (or rundll32 fallback) reports success.
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +23,7 @@ if ($CountdownSeconds -gt 60) { $CountdownSeconds = 60 }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -Namespace User32 -Name Native -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("user32.dll")]
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
 public static extern bool LockWorkStation();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool SetForegroundWindow(System.IntPtr hWnd);
@@ -100,12 +101,44 @@ $form.Add_FormClosed({
 
 [void]$form.ShowDialog()
 
+# Brief pause so the dialog fully tears down before locking.
+Start-Sleep -Milliseconds 250
+
+$lockOk = $false
+$lockDetail = ''
 try {
-    [void][User32.Native]::LockWorkStation()
+    $lockOk = [User32.Native]::LockWorkStation()
+    if (-not $lockOk) {
+        $lockDetail = ('LockWorkStation returned false; Win32Error={0}' -f `
+                [System.Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
 }
 catch {
-    # Last resort if Add-Type failed earlier.
-    rundll32.exe user32.dll,LockWorkStation
+    $lockDetail = ('LockWorkStation threw: {0}' -f $_.Exception.Message)
+}
+
+if (-not $lockOk) {
+    try {
+        $rundll = Join-Path $env:SystemRoot 'System32\rundll32.exe'
+        $p = Start-Process -FilePath $rundll -ArgumentList @('user32.dll,LockWorkStation') `
+            -Wait -PassThru -WindowStyle Hidden
+        if ($null -ne $p -and [int]$p.ExitCode -eq 0) {
+            $lockOk = $true
+            $lockDetail = 'rundll32 user32.dll,LockWorkStation fallback used'
+        }
+        else {
+            $exit = if ($null -ne $p) { $p.ExitCode } else { '(null)' }
+            $lockDetail = ("{0}; rundll32 exit={1}" -f $lockDetail, $exit)
+        }
+    }
+    catch {
+        $lockDetail = ("{0}; rundll32 failed: {1}" -f $lockDetail, $_.Exception.Message)
+    }
+}
+
+if (-not $lockOk) {
+    [Console]::Error.WriteLine(("Unlock-quota lock failed: {0}" -f $lockDetail))
+    exit 1
 }
 
 exit 0

@@ -578,7 +578,31 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
-    Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; lock requested in target session." -f `
+    # Child exit 0 is not enough: older scripts always exited 0 even when
+    # LockWorkStation failed, which advanced the quota bucket while the
+    # desktop stayed unlocked. Confirm the session actually locked.
+    $stillUnlocked = $true
+    for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Milliseconds 500
+        try {
+            if (-not [SessionQuery]::IsUserUnlocked($Config.TargetUsername)) {
+                $stillUnlocked = $false
+                break
+            }
+        }
+        catch {
+            # Probe failed; keep trying briefly.
+        }
+    }
+    if ($stillUnlocked) {
+        Write-LoggerEvent -Level WARN -Message (
+            ("Unlock-quota: warning ran but session still unlocked for {0} " +
+                "(lock may have failed); will retry without advancing bucket.") -f `
+                $Config.TargetUsername)
+        return $false
+    }
+
+    Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; session locked." -f `
             $seconds, $ElapsedMinutes)
     return $true
 }
@@ -658,12 +682,23 @@ function Write-DayRollover {
         Ensure-SummaryHeader -Path $summaryPath
 
         $hours = [Math]::Round($State.UnlockedSecondsToday / 3600.0, 4)
-        $row = '{0},{1:F0},{2},{3}' -f $EndedDate, $State.UnlockedSecondsToday, $hours, $Config.TargetUsername
+        # InvariantCulture so locales that use ',' decimals cannot break CSV
+        # columns (e.g. "1,1751" becoming two fields).
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $row = [string]::Format(
+            $inv,
+            '{0},{1:F0},{2:0.####},{3}',
+            $EndedDate,
+            $State.UnlockedSecondsToday,
+            $hours,
+            $Config.TargetUsername)
         Add-Content -LiteralPath $summaryPath -Value $row -Encoding UTF8
 
         $dailyPath = Get-DailyLogPath -LogDirectory $Config.LogDirectory -Date ([datetime]::ParseExact($EndedDate, 'yyyy-MM-dd', $null))
+        $hoursText = $hours.ToString('0.00', $inv) + 'h'
         Write-DailyLogLine -Path $dailyPath -Line (
-            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1} ({2})' -f (Get-Date), (Format-Duration $State.UnlockedSecondsToday), ("{0:F2}h" -f $hours)
+            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1} ({2})' -f `
+                (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $hoursText
         )
     }
     catch {
@@ -776,6 +811,9 @@ $lastPollUtc = [datetime]::UtcNow
 $lastHeartbeatSlot = $null
 $script:LastPollErrorKey = $null
 $script:LastPollErrorUtc = [datetime]::MinValue
+# After a failed unlock-quota lock, wait before showing the dialog again
+# (otherwise a 5s poll would re-popup every cycle while the bucket stalls).
+$script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -834,9 +872,10 @@ while ($true) {
                 $quotaSeconds = [double]([int]$config.UnlockQuotaMinutes * 60)
                 $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
                 # At most one warning/lock per poll. Catch up the bucket only after a
-                # successful in-session launch (avoids parallel dialogs after sleep and
-                # retries when CreateProcessAsUser fails).
-                if ($newBucket -gt [int]$state.LastUnlockQuotaBucket) {
+                # successful in-session lock (avoids parallel dialogs after sleep and
+                # retries when CreateProcessAsUser / LockWorkStation fails).
+                if ($newBucket -gt [int]$state.LastUnlockQuotaBucket -and
+                    [datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
                     $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
                     $elapsedMinutes = [int]($newBucket * [int]$config.UnlockQuotaMinutes)
                     $launched = $false
@@ -853,7 +892,11 @@ while ($true) {
                     }
                     if ($launched) {
                         $state.LastUnlockQuotaBucket = $newBucket
+                        $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
                         Write-State -Path $statePath -State $state
+                    }
+                    else {
+                        $script:UnlockQuotaRetryAfterUtc = [datetime]::UtcNow.AddSeconds(60)
                     }
                 }
             }
