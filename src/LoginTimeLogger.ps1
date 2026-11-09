@@ -205,12 +205,15 @@ LogDirectory in file: $cfgLogHint
         $scpPort = [int]$cfgScpPort
     }
 
+    # BHistory SCP is always on when the SCP endpoint is configured.
+    $scpNeedsIdentity = $scpOnLockEnabled -or -not [string]::IsNullOrWhiteSpace($scpHost)
+
     $scpIdentityFile = ''
     $cfgScpIdentity = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpIdentityFile'
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpIdentity)) {
         $scpIdentityFile = [string]$cfgScpIdentity
     }
-    elseif ($scpOnLockEnabled) {
+    elseif ($scpNeedsIdentity) {
         $scpIdentityFile = Join-Path $adminHome 'LoginTimeLogger\ssh\id_ed25519'
     }
 
@@ -219,7 +222,7 @@ LogDirectory in file: $cfgLogHint
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpKnownHosts)) {
         $scpKnownHostsFile = [string]$cfgScpKnownHosts
     }
-    elseif ($scpOnLockEnabled) {
+    elseif ($scpNeedsIdentity) {
         $scpKnownHostsFile = Join-Path $adminHome 'LoginTimeLogger\ssh\known_hosts'
     }
 
@@ -939,6 +942,11 @@ $script:LastPollErrorUtc = [datetime]::MinValue
 # After a failed unlock-quota lock, wait before showing the dialog again
 # (otherwise a 5s poll would re-popup every cycle while the bucket stalls).
 $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+# BHistory SCP (fixed interval in Scp-OnLock.ps1).
+$script:LastBHistoryScpUtc = [datetime]::MinValue
+$script:LastBHistorySourceWriteUtc = [datetime]::MinValue
+$script:LastBHistoryScpSucceeded = $false
+$script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -1062,6 +1070,23 @@ while ($true) {
                 $nowLocal, $unlocked, (Format-Duration $state.UnlockedSecondsToday)
             Write-DailyLogLine -Path $dailyPath -Line $hb
             $lastHeartbeatSlot = $heartbeatSlot
+        }
+
+        # Periodic BHistory upload for the measured user.
+        $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
+        if ($bHistoryIntervalMin -le 0) {
+            $bHistoryIntervalMin = 5
+        }
+        $dueBHistory = ($nowUtc - $script:LastBHistoryScpUtc).TotalMinutes -ge $bHistoryIntervalMin
+        if ($dueBHistory) {
+            $script:LastBHistoryScpUtc = $nowUtc
+            try {
+                Invoke-ScpBHistoryCopy -Config $config
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
+                    'Unexpected SCP BHistory failure')
+            }
         }
 
         Write-State -Path $statePath -State $state

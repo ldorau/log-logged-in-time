@@ -215,6 +215,7 @@ function Get-ScpConfigObject {
         ScpKnownHostsFile    = $knownHosts
         AdministratorProfile = $adminProfile
         LogDirectory         = $logDirectory
+        TargetUsername       = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
     }
 }
 
@@ -283,6 +284,7 @@ function Invoke-ScpCopyFiles {
 # --- main ---
 $copyResult = $null
 $files = @()
+$bHistoryStaged = $null
 
 try {
     $null = Initialize-ErrorLog -ConfigPath (Join-Path $repoRoot 'config\config.json')
@@ -348,11 +350,27 @@ try {
         ScpIdentityFile    = $cfg.ScpIdentityFile
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
         LogDirectory       = $cfg.LogDirectory
+        TargetUsername     = $cfg.TargetUsername
     }
 
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'Step 2: select files to copy' -ForegroundColor Cyan
-    $files = @(Get-ScpManualSourceFiles -Config $runtimeCfg -ErrorLogPath (Get-ErrorLogPath))
+    $fileList = New-Object System.Collections.Generic.List[string]
+    foreach ($f in @(Get-ScpManualSourceFiles -Config $runtimeCfg -ErrorLogPath (Get-ErrorLogPath))) {
+        $fileList.Add($f)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+        $bHistoryStaged = New-ScpBHistoryUploadFile -TargetUsername ([string]$cfg.TargetUsername)
+        if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged)) {
+            $fileList.Add($bHistoryStaged)
+            Write-Check -Name 'BHistory' -Ok $true -Detail $bHistoryStaged
+        }
+        else {
+            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
+                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
+        }
+    }
+    $files = @($fileList)
     if ($files.Count -eq 0) {
         Write-Check -Name 'Files selected' -Ok $false -Detail 'none found under LogDirectory / error log paths'
         Write-ScpCopyLine ''
@@ -418,4 +436,10 @@ catch {
     }
     $null = Write-VerboseError -ErrorRecord $_ -Context 'Copy-LogsViaScp.ps1 failed' -Source 'Copy-LogsViaScp'
     exit 1
+}
+finally {
+    if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged) -and
+        (Test-Path -LiteralPath $bHistoryStaged)) {
+        Remove-Item -LiteralPath $bHistoryStaged -Force -ErrorAction SilentlyContinue
+    }
 }

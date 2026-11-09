@@ -998,7 +998,12 @@ function Invoke-DailyScpOutboundAllow {
     )
 
     $UpdateState = ConvertTo-UpdateStateObject -State $UpdateState
-    if (-not $Config.ScpOnLockEnabled) {
+    $scpFirewallNeeded = [bool]$Config.ScpOnLockEnabled
+    if (-not $scpFirewallNeeded -and
+        -not [string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) {
+        $scpFirewallNeeded = $true
+    }
+    if (-not $scpFirewallNeeded) {
         $UpdateState.LastScpAllowUtc = [datetime]::UtcNow.ToString('o')
         $UpdateState.LastScpAllowResult = 'skipped-scp-disabled'
         Write-UpdateState -Path $StatePath -State $UpdateState

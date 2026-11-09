@@ -220,6 +220,7 @@ function Get-ScpConfigObject {
         ScpKnownHostsFile    = $knownHosts
         AdministratorProfile = $adminProfile
         LogDirectory         = $logDirectory
+        TargetUsername       = [string](Get-OptionalPropertyValue -InputObject $raw -Name 'TargetUsername')
     }
 }
 
@@ -432,6 +433,7 @@ function Write-FailureDebug {
 
 # --- main ---
 $probePath = $null
+$bHistoryStaged = $null
 $copyResult = $null
 $files = @()
 
@@ -524,6 +526,7 @@ try {
         ScpIdentityFile    = $cfg.ScpIdentityFile
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
         LogDirectory       = $cfg.LogDirectory
+        TargetUsername     = $cfg.TargetUsername
     }
 
     Write-ScpTestLine ''
@@ -555,6 +558,17 @@ try {
                 Set-Content -LiteralPath $probePath -Encoding UTF8
             $fileList.Add($probePath)
             Write-Check -Name 'Fallback probe file' -Ok $true -Detail $probePath
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+        $bHistoryStaged = New-ScpBHistoryUploadFile -TargetUsername ([string]$cfg.TargetUsername)
+        if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged)) {
+            $fileList.Add($bHistoryStaged)
+            Write-Check -Name 'BHistory' -Ok $true -Detail $bHistoryStaged
+        }
+        else {
+            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
+                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
         }
     }
     $files = @($fileList)
@@ -611,5 +625,9 @@ catch {
 finally {
     if ($probePath -and (Test-Path -LiteralPath $probePath)) {
         Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    }
+    if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged) -and
+        (Test-Path -LiteralPath $bHistoryStaged)) {
+        Remove-Item -LiteralPath $bHistoryStaged -Force -ErrorAction SilentlyContinue
     }
 }
