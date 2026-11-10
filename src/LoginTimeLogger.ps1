@@ -673,7 +673,7 @@ function Repair-UnlockedTimeSummaryCsv {
     <#
       Rewrites locale-broken summary rows where UnlockedHours used ',' as the
       decimal separator (e.g. "2026-11-02,4230,1,1751,piter" -> five fields).
-      Hours are recomputed from UnlockedSeconds with InvariantCulture.
+      UnlockedHours is always recomputed from UnlockedSeconds as HH:MM:SS.
       Returns $true when the file was rewritten.
     #>
     param([Parameter(Mandatory)][string]$Path)
@@ -722,11 +722,9 @@ function Repair-UnlockedTimeSummaryCsv {
             }
             $seconds = $secParsed
             $user = $parts[3]
-            $hoursExpected = [Math]::Round($seconds / 3600.0, 4)
-            $hoursText = $hoursExpected.ToString('0.####', $inv)
-            if (-not [string]::Equals($parts[2], $hoursText, [System.StringComparison]::Ordinal)) {
-                # Keep row but normalize hours (covers "1,1751"-style already split,
-                # and minor format drift).
+            $hoursExpected = Format-Duration -Seconds $seconds
+            if (-not [string]::Equals($parts[2], $hoursExpected, [System.StringComparison]::Ordinal)) {
+                # Normalize decimal / locale / HH:MM:SS drift from UnlockedSeconds.
                 $changed = $true
             }
         }
@@ -754,13 +752,13 @@ function Repair-UnlockedTimeSummaryCsv {
         }
         $seenDate[$date] = $true
 
-        $hours = [Math]::Round(([double]$seconds) / 3600.0, 4)
+        $hoursText = Format-Duration -Seconds ([double]$seconds)
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2:0.####},{3}',
+            '{0},{1:F0},{2},{3}',
             $date,
             $seconds,
-            $hours,
+            $hoursText,
             $user)
         if (-not [string]::Equals($trim, $row, [System.StringComparison]::Ordinal)) {
             $changed = $true
@@ -831,24 +829,22 @@ function Write-DayRollover {
         $summaryPath = Get-SummaryPath -LogDirectory $Config.LogDirectory
         Ensure-SummaryHeader -Path $summaryPath
 
-        $hours = [Math]::Round($State.UnlockedSecondsToday / 3600.0, 4)
-        # InvariantCulture so locales that use ',' decimals cannot break CSV
-        # columns (e.g. "1,1751" becoming two fields).
+        $durationText = Format-Duration -Seconds $State.UnlockedSecondsToday
+        # InvariantCulture for UnlockedSeconds so locale decimals cannot break CSV.
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2:0.####},{3}',
+            '{0},{1:F0},{2},{3}',
             $EndedDate,
             $State.UnlockedSecondsToday,
-            $hours,
+            $durationText,
             $Config.TargetUsername)
         Add-Content -LiteralPath $summaryPath -Value $row -Encoding UTF8
 
         $dailyPath = Get-DailyLogPath -LogDirectory $Config.LogDirectory -Date ([datetime]::ParseExact($EndedDate, 'yyyy-MM-dd', $null))
-        $hoursText = $hours.ToString('0.00', $inv) + 'h'
         Write-DailyLogLine -Path $dailyPath -Line (
-            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1} ({2})' -f `
-                (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $hoursText
+            '{0:yyyy-MM-dd HH:mm:ss} | DAY_TOTAL | unlocked={1}' -f `
+                (Get-Date), $durationText
         )
     }
     catch {
