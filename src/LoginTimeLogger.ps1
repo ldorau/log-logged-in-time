@@ -1073,7 +1073,7 @@ while ($true) {
             $lastHeartbeatSlot = $heartbeatSlot
         }
 
-        # Periodic BHistory upload for the measured user.
+        # Periodic BHistory + today's unlocked-time log via SCP.
         $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
         if ($bHistoryIntervalMin -le 0) {
             $bHistoryIntervalMin = 5

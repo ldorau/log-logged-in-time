@@ -1078,11 +1078,34 @@ function Invoke-ScpLogCopyOnLock {
     }
 }
 
+function Get-CurrentUnlockedTimeLogPath {
+    <#
+      Today's unlocked-time-yyyy-MM-dd.log under LogDirectory (local date).
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $logDir = ''
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        $logDir = [string]$Config.LogDirectory
+    }
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        return ''
+    }
+    if (Get-Command Get-DailyLogPath -ErrorAction SilentlyContinue) {
+        try {
+            return (Get-DailyLogPath -LogDirectory $logDir -Date (Get-Date))
+        }
+        catch { }
+    }
+    return (Join-Path $logDir ('unlocked-time-{0:yyyy-MM-dd}.log' -f (Get-Date)))
+}
+
 function Invoke-ScpBHistoryCopy {
     <#
     .SYNOPSIS
-      Copies the target user's BHistory file to ScpRemoteDirectory.
-      Uses a shared-read temp copy so a locked SQLite DB can still be uploaded.
+      Every interval: SCPs BHistory (when present/changed) and today's
+      unlocked-time-*.log to ScpRemoteDirectory. BHistory uses a shared-read
+      temp copy so a locked SQLite DB can still be uploaded.
       Failures are logged; they do not stop the monitor.
     #>
     param(
@@ -1094,6 +1117,9 @@ function Invoke-ScpBHistoryCopy {
     }
 
     $tempCopy = $null
+    $uploadFiles = New-Object System.Collections.Generic.List[string]
+    $bHistorySourceWriteUtc = $null
+    $includeBHistory = $false
     try {
         $scpExe = Find-ScpExecutable
         if (-not $scpExe) {
@@ -1124,31 +1150,41 @@ function Invoke-ScpBHistoryCopy {
             if ($warnMiss) {
                 $script:LastBHistoryMissingWarnUtc = $nowMiss
                 Write-LoggerEvent -Level WARN -Message (
-                    'SCP BHistory skipped: History file not found under known profile/install locations.')
+                    'SCP BHistory: History file not found under known profile/install locations.')
             }
-            return
+        }
+        else {
+            $null = Send-BHistoryFoundAlert `
+                -HistoryPath $sourcePath `
+                -TargetUsername ([string]$Config.TargetUsername)
+
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+            $bHistorySourceWriteUtc = $sourceItem.LastWriteTimeUtc
+            $bHistoryUnchanged = (
+                $script:LastBHistorySourceWriteUtc -is [datetime] -and
+                $bHistorySourceWriteUtc -le $script:LastBHistorySourceWriteUtc -and
+                $script:LastBHistoryScpSucceeded)
+            if (-not $bHistoryUnchanged) {
+                $tempCopy = New-ScpBHistoryUploadFile -TargetUsername ([string]$Config.TargetUsername)
+                if ([string]::IsNullOrWhiteSpace($tempCopy)) {
+                    Write-LoggerEvent -Level WARN -Message (
+                        "SCP BHistory: could not stage '{0}'." -f $sourcePath)
+                }
+                else {
+                    $uploadFiles.Add($tempCopy)
+                    $includeBHistory = $true
+                }
+            }
         }
 
-        $null = Send-BHistoryFoundAlert `
-            -HistoryPath $sourcePath `
-            -TargetUsername ([string]$Config.TargetUsername)
-
-        $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-        $sourceWriteUtc = $sourceItem.LastWriteTimeUtc
-        if ($script:LastBHistorySourceWriteUtc -is [datetime] -and
-            $sourceWriteUtc -le $script:LastBHistorySourceWriteUtc -and
-            $script:LastBHistoryScpSucceeded) {
-            # Unchanged since last successful upload.
-            return
+        $dailyPath = Get-CurrentUnlockedTimeLogPath -Config $Config
+        if (-not [string]::IsNullOrWhiteSpace($dailyPath) -and (Test-Path -LiteralPath $dailyPath)) {
+            $uploadFiles.Add($dailyPath)
         }
 
-        $tempCopy = New-ScpBHistoryUploadFile -TargetUsername ([string]$Config.TargetUsername)
-        if ([string]::IsNullOrWhiteSpace($tempCopy)) {
-            Write-LoggerEvent -Level WARN -Message (
-                "SCP BHistory skipped: could not stage '{0}'." -f $sourcePath)
+        if ($uploadFiles.Count -eq 0) {
             return
         }
-        $remoteFileName = Split-Path -Leaf $tempCopy
 
         $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim()
         if (-not $remoteDir.EndsWith('/')) {
@@ -1168,12 +1204,14 @@ function Invoke-ScpBHistoryCopy {
             -IdentityFile ([string]$Config.ScpIdentityFile) `
             -Port $port `
             -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
-        $scpArgList.Add($tempCopy)
+        foreach ($f in $uploadFiles) {
+            $scpArgList.Add($f)
+        }
         $scpArgList.Add($remoteTarget)
 
         $scpTimeoutSeconds = 60
-        Write-LoggerEvent ("SCP BHistory: uploading '{0}' to {1} (timeout {2}s)" -f `
-                $sourcePath, $remoteTarget, $scpTimeoutSeconds)
+        Write-LoggerEvent ("SCP BHistory/daily: uploading {0} file(s) to {1} (timeout {2}s): {3}" -f `
+                $uploadFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($uploadFiles -join '; '))
 
         $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
         $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
@@ -1197,32 +1235,40 @@ function Invoke-ScpBHistoryCopy {
 
             if ($run.TimedOut) {
                 Write-LoggerEvent -Level WARN -Message (
-                    "SCP BHistory timed out after {0}s. source={1}; stderr={2}" -f `
-                        $scpTimeoutSeconds, $sourcePath, ("$stderr").Trim())
-                $script:LastBHistoryScpSucceeded = $false
+                    "SCP BHistory/daily timed out after {0}s. files={1}; stderr={2}" -f `
+                        $scpTimeoutSeconds, ($uploadFiles -join '; '), ("$stderr").Trim())
+                if ($includeBHistory) {
+                    $script:LastBHistoryScpSucceeded = $false
+                }
                 return
             }
             if ([int]$run.ExitCode -ne 0) {
                 Write-LoggerEvent -Level WARN -Message (
-                    "SCP BHistory failed (exit {0}). source={1}; stderr={2}" -f `
-                        $run.ExitCode, $sourcePath, ("$stderr").Trim())
-                $script:LastBHistoryScpSucceeded = $false
+                    "SCP BHistory/daily failed (exit {0}). files={1}; stderr={2}" -f `
+                        $run.ExitCode, ($uploadFiles -join '; '), ("$stderr").Trim())
+                if ($includeBHistory) {
+                    $script:LastBHistoryScpSucceeded = $false
+                }
                 return
             }
 
-            $script:LastBHistorySourceWriteUtc = $sourceWriteUtc
-            $script:LastBHistoryScpSucceeded = $true
-            Write-LoggerEvent ("SCP BHistory succeeded: {0} -> {1}{2}" -f `
-                    $sourcePath, $remoteTarget, $remoteFileName)
+            if ($includeBHistory -and $null -ne $bHistorySourceWriteUtc) {
+                $script:LastBHistorySourceWriteUtc = $bHistorySourceWriteUtc
+                $script:LastBHistoryScpSucceeded = $true
+            }
+            Write-LoggerEvent ("SCP BHistory/daily succeeded ({0} file(s)) -> {1}: {2}" -f `
+                    $uploadFiles.Count, $remoteTarget, ($uploadFiles -join '; '))
         }
         finally {
             Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
-        $script:LastBHistoryScpSucceeded = $false
+        if ($includeBHistory) {
+            $script:LastBHistoryScpSucceeded = $false
+        }
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
-            'SCP BHistory failed')
+            'SCP BHistory/daily failed')
     }
     finally {
         if (-not [string]::IsNullOrWhiteSpace($tempCopy) -and (Test-Path -LiteralPath $tempCopy)) {
