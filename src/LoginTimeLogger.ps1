@@ -1072,7 +1072,6 @@ $script:LastBHistoryScpUtc = [datetime]::MinValue
 $script:LastBHistorySourceWriteUtc = [datetime]::MinValue
 $script:LastBHistoryScpSucceeded = $false
 $script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
-$script:LastBHistoryNotifiedPath = ''
 
 while ($true) {
     try {
