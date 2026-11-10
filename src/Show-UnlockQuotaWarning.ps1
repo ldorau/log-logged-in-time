@@ -45,10 +45,16 @@ $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::FromArgb(32, 32, 36)
 $form.ForeColor = [System.Drawing.Color]::White
-$form.ClientSize = New-Object System.Drawing.Size(560, 280)
+$form.ClientSize = New-Object System.Drawing.Size(560, 300)
 $form.KeyPreview = $true
 # Swallow keys so the dialog stays modal/blocking for the countdown.
 $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
+
+# Layout (top -> bottom):
+#   1) "Unlocked time so far:"
+#   2) current unlocked time (H:MM)
+#   3) "Twoje OCZY muszą ODPOCZĄĆ !"
+#   4) countdown footer (same place as before)
 
 $title = New-Object System.Windows.Forms.Label
 $title.AutoSize = $false
@@ -56,22 +62,9 @@ $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $title.Dock = [System.Windows.Forms.DockStyle]::Top
 $title.Height = 48
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Regular)
-$title.Text = 'Unlocked time so far'
+$title.Text = 'Unlocked time so far:'
 $title.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $title.Padding = New-Object System.Windows.Forms.Padding(12, 12, 12, 0)
-
-$restMessage = New-Object System.Windows.Forms.Label
-$restMessage.AutoSize = $false
-$restMessage.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-$restMessage.Dock = [System.Windows.Forms.DockStyle]::Top
-$restMessage.Height = 56
-$restMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
-# Build with [char] code points so Windows PowerShell 5.1 (-File, no BOM)
-# does not mis-decode UTF-8 Polish letters as the system ANSI code page.
-$restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
-        [char]0x0105, [char]0x0104, [char]0x0106)  # ą Ą Ć
-$restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
-$restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
 
 # Large display: elapsed unlocked time as hours:minutes.
 $elapsedLabel = New-Object System.Windows.Forms.Label
@@ -82,6 +75,19 @@ $elapsedLabel.Font = New-Object System.Drawing.Font('Segoe UI', 36, [System.Draw
 $elapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 196, 0)
 $elapsedLabel.Text = $elapsedHm
 
+$restMessage = New-Object System.Windows.Forms.Label
+$restMessage.AutoSize = $false
+$restMessage.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$restMessage.Dock = [System.Windows.Forms.DockStyle]::Bottom
+$restMessage.Height = 56
+$restMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
+# Build with [char] code points so Windows PowerShell 5.1 (-File, no BOM)
+# does not mis-decode UTF-8 Polish letters as the system ANSI code page.
+$restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
+        [char]0x0105, [char]0x0104, [char]0x0106)  # ą Ą Ć
+$restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
+$restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
+
 $footer = New-Object System.Windows.Forms.Label
 $footer.AutoSize = $false
 $footer.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
@@ -91,7 +97,8 @@ $footer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $footer.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $footer.Text = ('Screen will lock in {0} s...' -f $CountdownSeconds)
 
-# Dock order: first added fills; later Top/Bottom dock around it.
+# Dock order: Fill first; first Bottom = outermost edge (countdown);
+# second Bottom stacks above it (Polish); Top last.
 $form.Controls.Add($elapsedLabel)
 $form.Controls.Add($footer)
 $form.Controls.Add($restMessage)

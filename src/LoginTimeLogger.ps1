@@ -17,6 +17,7 @@ $ErrorActionPreference = 'Stop'
 # Initialize before any Write-LoggerEvent call (StrictMode forbids reading unset script vars).
 $script:ServiceLogPath = $null
 $script:InstanceMutex = $null
+$script:InstallRoot = $null
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -436,7 +437,8 @@ function New-LoggerStateObject {
         [double]$UnlockedSecondsToday = 0,
         [bool]$LastUnlocked = $false,
         [AllowNull()]$LastTransitionUtc = $null,
-        [int]$LastUnlockQuotaBucket = 0
+        [int]$LastUnlockQuotaBucket = 0,
+        [string]$InstalledCommitSha = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
@@ -449,6 +451,7 @@ function New-LoggerStateObject {
         LastUnlocked          = [bool]$LastUnlocked
         LastTransitionUtc     = $(if ($LastTransitionUtc) { [string]$LastTransitionUtc } else { $null })
         LastUnlockQuotaBucket = [int]$LastUnlockQuotaBucket
+        InstalledCommitSha    = [string]$InstalledCommitSha
     }
 }
 
@@ -505,12 +508,15 @@ function ConvertTo-LoggerStateObject {
         $bucket = [int][Math]::Floor($seconds / $quotaSeconds)
     }
 
+    $commitSha = [string](Get-OptionalPropertyValue -InputObject $State -Name 'InstalledCommitSha')
+
     return (New-LoggerStateObject `
             -Date $date `
             -UnlockedSecondsToday $seconds `
             -LastUnlocked $lastUnlocked `
             -LastTransitionUtc $lastTransition `
-            -LastUnlockQuotaBucket $bucket)
+            -LastUnlockQuotaBucket $bucket `
+            -InstalledCommitSha $commitSha)
 }
 
 function Read-State {
@@ -610,6 +616,28 @@ function Invoke-UnlockQuotaWarningAndLock {
     return $true
 }
 
+function Get-CurrentInstalledCommitSha {
+    <#
+      SHA from Program Files\LoginTimeLogger\installed-commit.txt when available.
+    #>
+    if ([string]::IsNullOrWhiteSpace([string]$script:InstallRoot)) {
+        return ''
+    }
+    if (-not (Get-Command Get-InstalledCommit -ErrorAction SilentlyContinue)) {
+        return ''
+    }
+    try {
+        $sha = Get-InstalledCommit -InstallRoot ([string]$script:InstallRoot)
+        if ([string]::IsNullOrWhiteSpace([string]$sha)) {
+            return ''
+        }
+        return ([string]$sha).Trim().ToLowerInvariant()
+    }
+    catch {
+        return ''
+    }
+}
+
 function Write-State {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -617,6 +645,10 @@ function Write-State {
     )
     try {
         $normalized = ConvertTo-LoggerStateObject -State $State
+        $commitSha = Get-CurrentInstalledCommitSha
+        if (-not [string]::IsNullOrWhiteSpace($commitSha)) {
+            $normalized.InstalledCommitSha = $commitSha
+        }
         $tempPath = "$Path.tmp"
         ($normalized | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tempPath -Encoding UTF8
         # Replace in place. If destination is a zeroed/locked leftover, remove
@@ -926,9 +958,16 @@ try {
         # Dev/fallback: parent of src/
         $installRoot = Split-Path -Parent $scriptDir
     }
+    $script:InstallRoot = $installRoot
 
     Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s" -f `
             $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds)
+
+    # Persist InstalledCommitSha into state.json on startup (and every later Write-State).
+    Write-State -Path $statePath -State $state
+    $state = ConvertTo-LoggerStateObject `
+        -State (Read-State -Path $statePath -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)) `
+        -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
 }
 catch {
     $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
