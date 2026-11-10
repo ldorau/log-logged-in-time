@@ -1192,8 +1192,8 @@ while ($true) {
         # Periodic heartbeat once every 5 minutes.
         $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 5) * 5))
         if ($heartbeatSlot -ne $lastHeartbeatSlot) {
-            $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | unlocked={1} | cumulative_today={2}' -f `
-                $nowLocal, $unlocked, (Format-Duration $state.UnlockedSecondsToday)
+            $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | cumulative_today={1} | unlocked={2}' -f `
+                $nowLocal, (Format-Duration $state.UnlockedSecondsToday), $unlocked
             Write-DailyLogLine -Path $dailyPath -Line $hb
             $lastHeartbeatSlot = $heartbeatSlot
         }
