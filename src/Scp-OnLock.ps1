@@ -3,6 +3,11 @@
 
 # BHistory periodic SCP (not configurable).
 $script:ScpBHistoryIntervalMinutes = 5
+# StrictMode-safe defaults (Test-ScpOnLock / Copy-LogsViaScp dot-source this file).
+$script:LastBHistoryNotifiedPath = $null
+$script:LastBHistoryMissingWarnUtc = $null
+$script:LastBHistorySourceWriteUtc = $null
+$script:LastBHistoryScpSucceeded = $false
 
 function ConvertFrom-ScpB64Path {
     param([Parameter(Mandatory)][string]$Base64)
