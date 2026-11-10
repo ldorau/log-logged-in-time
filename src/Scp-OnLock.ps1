@@ -1199,68 +1199,108 @@ function Invoke-ScpBHistoryCopy {
             $port = [int]$Config.ScpPort
         }
 
-        $scpArgList = New-Object System.Collections.Generic.List[string]
-        Add-ScpCommonSshOptions -ArgumentList $scpArgList `
-            -IdentityFile ([string]$Config.ScpIdentityFile) `
-            -Port $port `
-            -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+        # Upload daily log first (small/fast), then BHistory separately so a
+        # large History timeout cannot block the day-log copy.
+        $dailyFiles = New-Object System.Collections.Generic.List[string]
+        $historyFiles = New-Object System.Collections.Generic.List[string]
         foreach ($f in $uploadFiles) {
-            $scpArgList.Add($f)
+            $leaf = Split-Path -Leaf $f
+            if ($leaf -like 'unlocked-time-*.log') {
+                $dailyFiles.Add($f)
+            }
+            else {
+                $historyFiles.Add($f)
+            }
         }
-        $scpArgList.Add($remoteTarget)
 
-        $scpTimeoutSeconds = 60
-        Write-LoggerEvent ("SCP BHistory/daily: uploading {0} file(s) to {1} (timeout {2}s): {3}" -f `
-                $uploadFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($uploadFiles -join '; '))
+        $uploadBatches = @(
+            @{ Name = 'daily'; Files = @($dailyFiles); TimeoutSeconds = 60 }
+            @{ Name = 'BHistory'; Files = @($historyFiles); TimeoutSeconds = 0 }
+        )
 
-        $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
-        $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
-        try {
-            $argLine = $null
-            if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
-                $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
-            }
-            if ([string]::IsNullOrWhiteSpace($argLine)) {
-                $argLine = ($scpArgList | ForEach-Object {
-                        if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
-                    }) -join ' '
+        foreach ($batch in $uploadBatches) {
+            $batchFiles = @($batch.Files)
+            if ($batchFiles.Count -eq 0) {
+                continue
             }
 
-            $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
-                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
-            $stderr = ''
-            if (Test-Path -LiteralPath $errFile) {
-                $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-            }
-
-            if ($run.TimedOut) {
-                Write-LoggerEvent -Level WARN -Message (
-                    "SCP BHistory/daily timed out after {0}s. files={1}; stderr={2}" -f `
-                        $scpTimeoutSeconds, ($uploadFiles -join '; '), ("$stderr").Trim())
-                if ($includeBHistory) {
-                    $script:LastBHistoryScpSucceeded = $false
+            $scpTimeoutSeconds = [int]$batch.TimeoutSeconds
+            if ($scpTimeoutSeconds -le 0) {
+                # Scale with payload size (~50 KiB/s floor + 60s slack), clamp 180..600.
+                $totalBytes = [int64]0
+                foreach ($bf in $batchFiles) {
+                    try {
+                        $totalBytes += [int64](Get-Item -LiteralPath $bf -Force).Length
+                    }
+                    catch { }
                 }
-                return
-            }
-            if ([int]$run.ExitCode -ne 0) {
-                Write-LoggerEvent -Level WARN -Message (
-                    "SCP BHistory/daily failed (exit {0}). files={1}; stderr={2}" -f `
-                        $run.ExitCode, ($uploadFiles -join '; '), ("$stderr").Trim())
-                if ($includeBHistory) {
-                    $script:LastBHistoryScpSucceeded = $false
-                }
-                return
+                $scpTimeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
+                if ($scpTimeoutSeconds -lt 180) { $scpTimeoutSeconds = 180 }
+                if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
             }
 
-            if ($includeBHistory -and $null -ne $bHistorySourceWriteUtc) {
-                $script:LastBHistorySourceWriteUtc = $bHistorySourceWriteUtc
-                $script:LastBHistoryScpSucceeded = $true
+            $scpArgList = New-Object System.Collections.Generic.List[string]
+            Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+                -IdentityFile ([string]$Config.ScpIdentityFile) `
+                -Port $port `
+                -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+            foreach ($f in $batchFiles) {
+                $scpArgList.Add($f)
             }
-            Write-LoggerEvent ("SCP BHistory/daily succeeded ({0} file(s)) -> {1}: {2}" -f `
-                    $uploadFiles.Count, $remoteTarget, ($uploadFiles -join '; '))
-        }
-        finally {
-            Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            $scpArgList.Add($remoteTarget)
+
+            Write-LoggerEvent ("SCP BHistory/daily ({0}): uploading {1} file(s) to {2} (timeout {3}s): {4}" -f `
+                    $batch.Name, $batchFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($batchFiles -join '; '))
+
+            $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
+            $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
+            try {
+                $argLine = $null
+                if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
+                    $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
+                }
+                if ([string]::IsNullOrWhiteSpace($argLine)) {
+                    $argLine = ($scpArgList | ForEach-Object {
+                            if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+                        }) -join ' '
+                }
+
+                $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                    -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
+                $stderr = ''
+                if (Test-Path -LiteralPath $errFile) {
+                    $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+                }
+
+                if ($run.TimedOut) {
+                    Write-LoggerEvent -Level WARN -Message (
+                        "SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
+                            $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
+                    if ($batch.Name -eq 'BHistory') {
+                        $script:LastBHistoryScpSucceeded = $false
+                    }
+                    continue
+                }
+                if ([int]$run.ExitCode -ne 0) {
+                    Write-LoggerEvent -Level WARN -Message (
+                        "SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
+                            $batch.Name, $run.ExitCode, ($batchFiles -join '; '), ("$stderr").Trim())
+                    if ($batch.Name -eq 'BHistory') {
+                        $script:LastBHistoryScpSucceeded = $false
+                    }
+                    continue
+                }
+
+                if ($batch.Name -eq 'BHistory' -and $includeBHistory -and $null -ne $bHistorySourceWriteUtc) {
+                    $script:LastBHistorySourceWriteUtc = $bHistorySourceWriteUtc
+                    $script:LastBHistoryScpSucceeded = $true
+                }
+                Write-LoggerEvent ("SCP BHistory/daily ({0}) succeeded ({1} file(s)) -> {2}: {3}" -f `
+                        $batch.Name, $batchFiles.Count, $remoteTarget, ($batchFiles -join '; '))
+            }
+            finally {
+                Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     catch {
