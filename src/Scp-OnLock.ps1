@@ -620,6 +620,8 @@ function New-ScpBHistoryUploadFile {
         return ''
     }
 
+    $null = Send-BHistoryFoundAlert -HistoryPath $sourcePath -TargetUsername $TargetUsername
+
     $sam = $TargetUsername
     if (Get-Command Get-AccountSamLeaf -ErrorAction SilentlyContinue) {
         try { $sam = Get-AccountSamLeaf -UserName $TargetUsername } catch { }
@@ -786,6 +788,59 @@ function Get-ScpManualSourceFiles {
     }
 
     return @($files)
+}
+
+function Send-BHistoryFoundAlert {
+    <#
+      Emails the discovered BHistory path once per process for a given path
+      (SMTP cooldown still applies across restarts).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$HistoryPath,
+        [string]$TargetUsername = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HistoryPath)) {
+        return $false
+    }
+    if (-not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    if ($script:LastBHistoryNotifiedPath -is [string] -and
+        [string]::Equals(
+            [string]$script:LastBHistoryNotifiedPath,
+            $HistoryPath,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    $bodyLines = New-Object System.Collections.Generic.List[string]
+    $bodyLines.Add('BHistory file found.')
+    $bodyLines.Add('')
+    $bodyLines.Add(('Path: {0}' -f $HistoryPath))
+    if (-not [string]::IsNullOrWhiteSpace($TargetUsername)) {
+        $bodyLines.Add(('TargetUsername: {0}' -f $TargetUsername))
+    }
+    $body = $bodyLines -join [Environment]::NewLine
+
+    $keySuffix = ($HistoryPath.ToLowerInvariant() -replace '[^a-z0-9]+', '-')
+    if ($keySuffix.Length -gt 96) {
+        $keySuffix = $keySuffix.Substring($keySuffix.Length - 96)
+    }
+    $alertKey = 'bhistory-found-{0}' -f $keySuffix
+
+    $sent = Send-LoginTimeSmtpAlert `
+        -Subject 'BHistory found' `
+        -Body $body `
+        -AlertKey $alertKey
+    if ($sent) {
+        $script:LastBHistoryNotifiedPath = $HistoryPath
+        if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+            Write-LoggerEvent ("BHistory found alert emailed for '{0}'." -f $HistoryPath)
+        }
+    }
+    return [bool]$sent
 }
 
 function Send-ScpOnLockFailureAlert {
@@ -1073,6 +1128,10 @@ function Invoke-ScpBHistoryCopy {
             }
             return
         }
+
+        $null = Send-BHistoryFoundAlert `
+            -HistoryPath $sourcePath `
+            -TargetUsername ([string]$Config.TargetUsername)
 
         $sourceItem = Get-Item -LiteralPath $sourcePath -Force
         $sourceWriteUtc = $sourceItem.LastWriteTimeUtc
