@@ -54,7 +54,7 @@ $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
 #   1) "Unlocked time so far:"
 #   2) current unlocked time (H:MM)
 #   3) "Twoje OCZY muszą ODPOCZĄĆ !"
-#   4) countdown footer (same place as before)
+#   4) countdown footer ("Screen will lock in N s...")
 
 $title = New-Object System.Windows.Forms.Label
 $title.AutoSize = $false
@@ -97,11 +97,12 @@ $footer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $footer.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $footer.Text = ('Screen will lock in {0} s...' -f $CountdownSeconds)
 
-# Dock order: Fill first; first Bottom = outermost edge (countdown);
-# second Bottom stacks above it (Polish); Top last.
+# WinForms docks in reverse z-order (last added = outermost edge).
+# Add Polish Bottom first, then countdown Bottom last so the timer sits
+# below "Twoje OCZY..."; Top last so title claims the top edge.
 $form.Controls.Add($elapsedLabel)
-$form.Controls.Add($footer)
 $form.Controls.Add($restMessage)
+$form.Controls.Add($footer)
 $form.Controls.Add($title)
 
 $script:remaining = [int]$CountdownSeconds
