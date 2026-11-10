@@ -237,6 +237,23 @@ Files:
   state.json                    - current-day running total
   service.log                   - diagnostics
 
+Daily log fields (unlocked-time-YYYY-MM-DD.log):
+  cumulative_today=
+    Total unlocked time so far today (current calendar day), as HH:MM:SS.
+    On UNLOCKED_ACTIVE / LOCKED_OR_AWAY / HEARTBEAT; grows while unlocked.
+
+  unlocked=
+    HEARTBEAT: boolean — is the user unlocked right now? (True/False)
+    DAY_TOTAL: duration — final unlocked total for the day that just ended
+               (HH:MM:SS), plus hours in (1.50h)
+
+  Difference:
+    cumulative_today=   = running counter for today
+    DAY_TOTAL unlocked= = closed total for a past day (written at rollover;
+                          timestamp is when rollover ran; line goes in that
+                          ended day's log file)
+    On HEARTBEAT, unlocked= is status only; duration is cumulative_today=
+
 
 Change the monitored user later
 -------------------------------

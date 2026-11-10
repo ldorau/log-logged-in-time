@@ -146,6 +146,25 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 | `state.json` | Running total for the current day |
 | `service.log` | Monitor diagnostics |
 
+### Daily log field meanings (`unlocked-time-YYYY-MM-DD.log`)
+
+**`cumulative_today=`**  
+Total unlocked time **so far today** (current calendar day), as `HH:MM:SS`.  
+It appears on `UNLOCKED_ACTIVE`, `LOCKED_OR_AWAY`, and `HEARTBEAT` lines and grows while the session is unlocked.
+
+**`unlocked=`** — two different meanings by line type:
+
+| Line | Meaning |
+|------|--------|
+| `HEARTBEAT` | **Boolean:** is the user unlocked right now? (`True` / `False`) |
+| `DAY_TOTAL` | **Duration:** final unlocked total for the **day that just ended** (`HH:MM:SS`), plus hours in `(1.50h)` |
+
+**Difference**
+
+- `cumulative_today=` = running counter for **today**
+- `DAY_TOTAL`’s `unlocked=` = same kind of counter, but the **closed total for a past day** (written at day rollover; the line timestamp is when rollover ran, and the line is appended to that ended day’s log file)
+- On `HEARTBEAT`, `unlocked=` is **not** a duration — only locked/unlocked status; the duration is still `cumulative_today=`
+
 **Error log** (install, monitor, and helper failures — separate from the daily time logs):
 
 `<AdministratorProfile>\LoginTimeLogger\errors.log` (example: `C:\Users\AdminName\LoginTimeLogger\errors.log`)
