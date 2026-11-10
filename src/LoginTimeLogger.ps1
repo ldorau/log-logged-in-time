@@ -1103,8 +1103,8 @@ while ($true) {
             }
         }
 
-        # Periodic heartbeat once every 15 minutes.
-        $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 15) * 15))
+        # Periodic heartbeat once every 5 minutes.
+        $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 5) * 5))
         if ($heartbeatSlot -ne $lastHeartbeatSlot) {
             $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | unlocked={1} | cumulative_today={2}' -f `
                 $nowLocal, $unlocked, (Format-Duration $state.UnlockedSecondsToday)
