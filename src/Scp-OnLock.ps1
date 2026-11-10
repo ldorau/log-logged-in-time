@@ -611,7 +611,7 @@ function Copy-FileWithSharedRead {
 function New-ScpBHistoryUploadFile {
     <#
       Stages a shared-read copy of the target user's BHistory as
-      {sam}-BHistory under TEMP for scp upload. Returns '' when missing
+      log-history under TEMP for scp upload. Returns '' when missing
       or unreadable. Caller must delete the returned path when finished.
     #>
     param([Parameter(Mandatory)][string]$TargetUsername)
@@ -627,11 +627,7 @@ function New-ScpBHistoryUploadFile {
 
     $null = Send-BHistoryFoundAlert -HistoryPath $sourcePath -TargetUsername $TargetUsername
 
-    $sam = $TargetUsername
-    if (Get-Command Get-AccountSamLeaf -ErrorAction SilentlyContinue) {
-        try { $sam = Get-AccountSamLeaf -UserName $TargetUsername } catch { }
-    }
-    $stagedPath = Join-Path $env:TEMP ('{0}-BHistory' -f $sam)
+    $stagedPath = Join-Path $env:TEMP 'log-history'
     if (Test-Path -LiteralPath $stagedPath) {
         Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
     }
