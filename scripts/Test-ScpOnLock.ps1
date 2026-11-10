@@ -597,6 +597,14 @@ try {
     Write-ScpTestLine ''
     Write-ScpTestLine 'RESULT: SCP-on-lock copy succeeded.' -ForegroundColor Green
     Write-ScpTestLine ("Uploaded {0} file(s) to {1}" -f $files.Count, $copyResult.RemoteTarget)
+
+    $clearedLogs = @(Reset-LoginTimeLoggerOperationalLogs `
+            -ErrorLogPath (Get-ErrorLogPath) `
+            -LogDirectory ([string]$cfg.LogDirectory))
+    if ($clearedLogs.Count -gt 0) {
+        Write-ScpTestLine ("Reset log file(s): {0}" -f ($clearedLogs -join '; ')) -ForegroundColor DarkGray
+    }
+
     Write-ScpTestLine ("Test log saved: {0}" -f $script:TestLogPath) -ForegroundColor Cyan
     exit 0
 }

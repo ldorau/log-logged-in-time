@@ -419,6 +419,14 @@ try {
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'RESULT: SCP copy succeeded.' -ForegroundColor Green
     Write-ScpCopyLine ("Uploaded {0} file(s) to {1}" -f $files.Count, $copyResult.RemoteTarget)
+
+    $clearedLogs = @(Reset-LoginTimeLoggerOperationalLogs `
+            -ErrorLogPath (Get-ErrorLogPath) `
+            -LogDirectory ([string]$cfg.LogDirectory))
+    if ($clearedLogs.Count -gt 0) {
+        Write-ScpCopyLine ("Reset log file(s): {0}" -f ($clearedLogs -join '; ')) -ForegroundColor DarkGray
+    }
+
     Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Cyan
     exit 0
 }

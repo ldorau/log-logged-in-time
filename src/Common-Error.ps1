@@ -343,6 +343,74 @@ function Get-ErrorLogPath {
     return $script:LoginTimeErrorLogPath
 }
 
+function Clear-LoginTimeLoggerLogFile {
+    <#
+      Truncates a text log in place (FileShare.ReadWrite so a running monitor
+      can keep the handle) or creates an empty file. Returns $true on success.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    try {
+        $dir = Split-Path -Parent $Path
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+
+        if (Test-Path -LiteralPath $Path) {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite)
+            try {
+                $stream.SetLength(0)
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }
+        else {
+            [System.IO.File]::WriteAllText($Path, [string]::Empty)
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Reset-LoginTimeLoggerOperationalLogs {
+    <#
+      Clears errors.log and LogDirectory\service.log when paths are known.
+      Returns the list of paths successfully cleared.
+    #>
+    param(
+        [string]$ErrorLogPath = '',
+        [string]$LogDirectory = ''
+    )
+
+    $cleared = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($ErrorLogPath)) {
+        if (Clear-LoginTimeLoggerLogFile -Path $ErrorLogPath) {
+            $cleared.Add($ErrorLogPath)
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($LogDirectory)) {
+        $serviceLog = Join-Path $LogDirectory 'service.log'
+        if (Clear-LoginTimeLoggerLogFile -Path $serviceLog) {
+            $cleared.Add($serviceLog)
+        }
+    }
+
+    return ,$cleared.ToArray()
+}
+
 function Write-ErrorLogFile {
     param(
         [Parameter(Mandatory)][string]$Text
