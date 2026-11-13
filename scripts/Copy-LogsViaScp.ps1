@@ -360,10 +360,12 @@ try {
         $fileList.Add($f)
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
-        $bHistoryStaged = New-ScpBHistoryUploadFile -TargetUsername ([string]$cfg.TargetUsername)
-        if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged)) {
-            $fileList.Add($bHistoryStaged)
-            Write-Check -Name 'BHistory' -Ok $true -Detail $bHistoryStaged
+        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername))
+        if ($bHistoryStaged.Count -gt 0) {
+            foreach ($staged in $bHistoryStaged) {
+                $fileList.Add($staged)
+            }
+            Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
         }
         else {
             Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (

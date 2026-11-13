@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export log-history (Chromium-style History SQLite) to semicolon CSV."""
+"""Export log-history (browser History SQLite) to semicolon CSV."""
 from __future__ import print_function
 
 import argparse
@@ -76,7 +76,7 @@ def quote_none(value):
 
 
 def format_duration_hhmmss(duration_us):
-    """Chromium visit_duration is microseconds; emit HH:MM:SS (hours may exceed 24)."""
+    """History visit_duration is microseconds; emit HH:MM:SS (hours may exceed 24)."""
     try:
         micros = int(duration_us or 0)
     except (TypeError, ValueError):
@@ -100,10 +100,10 @@ def parse_start_date(text):
         )
 
 
-def local_day_start_chrome_micros(day):
+def local_day_start_history_micros(day):
     """
-    Chromium visit_time: microseconds since 1601-01-01 UTC.
-    Convert local midnight of day -> chrome micros via local timestamp().
+    History visit_time: microseconds since 1601-01-01 UTC.
+    Convert local midnight of day -> History micros via local timestamp().
     """
     local_midnight = datetime(day.year, day.month, day.day, 0, 0, 0)
     unix_seconds = local_midnight.timestamp()
@@ -124,7 +124,7 @@ def resolve_start_bound(start_date, previous_days):
     else:
         start = start_date
         label = 'start_date={0} local'.format(start.isoformat())
-    return local_day_start_chrome_micros(start), label
+    return local_day_start_history_micros(start), label
 
 
 def main(argv):

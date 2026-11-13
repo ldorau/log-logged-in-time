@@ -3,8 +3,8 @@
 .SYNOPSIS
   Convert a log-history SQLite database to a semicolon-separated CSV.
 .DESCRIPTION
-  Reads a Chromium-style History SQLite file (local name: log-history) and
-  writes one CSV row per visit joined with its URL record.
+  Reads a browser History SQLite file (e.g. log-history-op / log-history-ch)
+  and writes one CSV row per visit joined with its URL record.
 
   Output columns (separator ';'):
     visit_time_local;url;title;visit_duration;transition;from_visit;
