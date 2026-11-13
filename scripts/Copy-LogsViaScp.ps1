@@ -357,13 +357,16 @@ try {
     Write-ScpCopyLine 'Step 2: select files to copy' -ForegroundColor Cyan
     $fileList = New-Object System.Collections.Generic.List[string]
     foreach ($f in @(Get-ScpManualSourceFiles -Config $runtimeCfg -ErrorLogPath (Get-ErrorLogPath))) {
-        $fileList.Add($f)
+        if (-not [string]::IsNullOrWhiteSpace([string]$f)) {
+            $fileList.Add([string]$f)
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
-        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername))
+        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
         if ($bHistoryStaged.Count -gt 0) {
             foreach ($staged in $bHistoryStaged) {
-                $fileList.Add($staged)
+                $fileList.Add([string]$staged)
             }
             Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
         }
@@ -372,7 +375,7 @@ try {
                 "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
         }
     }
-    $files = @($fileList)
+    $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($files.Count -eq 0) {
         Write-Check -Name 'Files selected' -Ok $false -Detail 'none found under LogDirectory / error log paths'
         Write-ScpCopyLine ''
@@ -448,8 +451,10 @@ catch {
     exit 1
 }
 finally {
-    if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged) -and
-        (Test-Path -LiteralPath $bHistoryStaged)) {
-        Remove-Item -LiteralPath $bHistoryStaged -Force -ErrorAction SilentlyContinue
+    foreach ($staged in @($bHistoryStaged)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$staged) -and
+            (Test-Path -LiteralPath ([string]$staged))) {
+            Remove-Item -LiteralPath ([string]$staged) -Force -ErrorAction SilentlyContinue
+        }
     }
 }

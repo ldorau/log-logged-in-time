@@ -553,7 +553,9 @@ function Get-BHistoryInstallRootPaths {
         }
     }
 
-    return ,$roots.ToArray()
+    # Do not wrap with unary comma: callers use @() and a wrapped array
+    # becomes one nested element (breaks multi-hit and empty results).
+    return $roots.ToArray()
 }
 
 function Resolve-BHistoryPathForFamily {
@@ -646,7 +648,9 @@ function Get-BHistorySources {
             })
     }
 
-    return ,$sources.ToArray()
+    # Do not wrap with unary comma: callers use @() and a wrapped array
+    # becomes one nested element (Path member enumeration joins with spaces).
+    return $sources.ToArray()
 }
 
 function Get-BHistoryPath {
@@ -710,7 +714,7 @@ function New-ScpBHistoryUploadFiles {
 
     $staged = New-Object System.Collections.Generic.List[string]
     if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
-        return ,$staged.ToArray()
+        return [string[]]@()
     }
 
     foreach ($src in @(Get-BHistorySources -TargetUsername $TargetUsername)) {
@@ -730,7 +734,9 @@ function New-ScpBHistoryUploadFiles {
             $staged.Add($stagedPath)
         }
     }
-    return ,$staged.ToArray()
+    # Do not wrap with unary comma: callers use @(); a wrapped empty array
+    # becomes one empty-string element and breaks -Files binding.
+    return [string[]]$staged.ToArray()
 }
 
 function New-ScpBHistoryUploadFile {

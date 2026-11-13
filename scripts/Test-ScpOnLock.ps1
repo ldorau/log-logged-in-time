@@ -561,10 +561,11 @@ try {
         }
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
-        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername))
+        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
         if ($bHistoryStaged.Count -gt 0) {
             foreach ($staged in $bHistoryStaged) {
-                $fileList.Add($staged)
+                $fileList.Add([string]$staged)
             }
             Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
         }
@@ -573,7 +574,7 @@ try {
                 "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
         }
     }
-    $files = @($fileList)
+    $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 
     Write-ScpTestLine ''
     Write-ScpTestLine 'Step 3: TCP reachability' -ForegroundColor Cyan
@@ -636,8 +637,10 @@ finally {
     if ($probePath -and (Test-Path -LiteralPath $probePath)) {
         Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
     }
-    if (-not [string]::IsNullOrWhiteSpace($bHistoryStaged) -and
-        (Test-Path -LiteralPath $bHistoryStaged)) {
-        Remove-Item -LiteralPath $bHistoryStaged -Force -ErrorAction SilentlyContinue
+    foreach ($staged in @($bHistoryStaged)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$staged) -and
+            (Test-Path -LiteralPath ([string]$staged))) {
+            Remove-Item -LiteralPath ([string]$staged) -Force -ErrorAction SilentlyContinue
+        }
     }
 }
