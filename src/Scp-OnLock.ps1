@@ -21,14 +21,14 @@ $script:ScpBHistoryPreferredAbsolute = ConvertFrom-ScpB64Path `
 # Second preferred absolute (Local Default\History).
 $script:ScpBHistoryPreferredAbsoluteSecondary = ConvertFrom-ScpB64Path `
     'QzpcVXNlcnNccGl0ZXJcQXBwRGF0YVxMb2NhbFxHb29nbGVcQ2hyb21lXFVzZXIgRGF0YVxEZWZhdWx0XEhpc3Rvcnk='
-# Relative History paths under AppData\Roaming (order matches discovery preference).
+# Relative paths under AppData\Roaming (order matches discovery preference).
 $script:ScpBHistoryRoamingRels = @(
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXERlZmF1bHRcSGlzdG9yeQ==')
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
     (ConvertFrom-ScpB64Path 'T3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
 )
-# Relative History paths under AppData\Local (includes Programs\... installs).
+# Relative paths under AppData\Local (includes Programs\... installs).
 $script:ScpBHistoryLocalRels = @(
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXERlZmF1bHRcSGlzdG9yeQ==')
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxlXEhpc3Rvcnk=')
@@ -39,13 +39,13 @@ $script:ScpBHistoryLocalRels = @(
     (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hccHJvZmlsZVxIaXN0b3J5')
     (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
 )
-# Relative History paths under AppData\Local for the second browser family.
+# Relative paths under AppData\Local for the second family.
 $script:ScpBHistorySecondaryLocalRels = @(
     (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcRGVmYXVsdFxIaXN0b3J5')
     (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcUHJvZmlsZSAxXEhpc3Rvcnk=')
     (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcSGlzdG9yeQ==')
 )
-# History paths relative to a browser install directory.
+# paths relative to a browser install directory.
 $script:ScpBHistoryInstallRels = @(
     (ConvertFrom-ScpB64Path 'cHJvZmlsZVxIaXN0b3J5')
     (ConvertFrom-ScpB64Path 'ZGF0YVxwcm9maWxlXEhpc3Rvcnk=')

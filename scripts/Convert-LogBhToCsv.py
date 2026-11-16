@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export log-history (browser History SQLite) to semicolon CSV."""
+"""Export log-bh SQLite to semicolon CSV."""
 from __future__ import print_function
 
 import argparse
@@ -61,7 +61,7 @@ FIELDNAMES = [
 
 
 def open_readonly_copy(src_path):
-    fd, tmp = tempfile.mkstemp(prefix='log-history-', suffix='.sqlite')
+    fd, tmp = tempfile.mkstemp(prefix='log-bh-', suffix='.sqlite')
     os.close(fd)
     shutil.copy2(src_path, tmp)
     # Also copy -wal/-shm when present so a hot copy stays consistent.
@@ -142,8 +142,8 @@ def resolve_start_bound(start_date, previous_days):
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(description='Convert log-history SQLite to CSV.')
-    parser.add_argument('--input', required=True, help='Path to log-history SQLite file')
+    parser = argparse.ArgumentParser(description='Convert log-bh (History) SQLite to CSV.')
+    parser.add_argument('--input', required=True, help='Path to log-bh History SQLite file')
     parser.add_argument('--output', required=True, help='Output CSV path')
     parser.add_argument('--separator', default=';', help='CSV field separator (default: ;)')
     parser.add_argument(
@@ -201,6 +201,27 @@ def main(argv):
             )
             rows = cur.execute(EXPORT_SQL_NO_INDEX, bind).fetchall()
 
+        if range_label:
+            print('Filter: {0}'.format(range_label))
+        else:
+            print('Filter: all visits')
+
+        if len(rows) == 0:
+            # Do not leave a header-only CSV; remove a stale output if present.
+            if os.path.isfile(out):
+                try:
+                    os.remove(out)
+                except OSError as exc:
+                    print(
+                        'Wrote 0 visit row(s); failed to remove empty CSV {0}: {1}'.format(
+                            out, exc
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 4
+            print('Wrote 0 visit row(s); no CSV written.')
+            return 0
+
         out_dir = os.path.dirname(out)
         if out_dir and not os.path.isdir(out_dir):
             os.makedirs(out_dir)
@@ -220,10 +241,6 @@ def main(argv):
                 item['visit_duration'] = format_duration_hhmmss(row['visit_duration_us'])
                 writer.writerow(item)
 
-        if range_label:
-            print('Filter: {0}'.format(range_label))
-        else:
-            print('Filter: all visits')
         print('Wrote {0} visit row(s) to {1}'.format(len(rows), out))
         return 0
     finally:

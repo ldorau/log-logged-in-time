@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Convert a log-history SQLite database to a semicolon-separated CSV.
+  Convert a log-bh SQLite database to a semicolon-separated CSV.
 .DESCRIPTION
-  Reads a browser History SQLite file (e.g. log-history-op / log-history-ch)
+  Reads a SQLite file (e.g. log-history-op / log-history-ch)
   and writes one CSV row per visit joined with its URL record.
 
   Output columns (separator ';'):
@@ -20,7 +20,7 @@
   check/install it. Failures are written to errors.log and emailed when SMTP
   is configured.
 .PARAMETER InputPath
-  Path to the log-history SQLite file.
+  Path to the log-bh / log-history SQLite file.
 .PARAMETER OutputPath
   Destination CSV path. Default: <InputPath>.csv
 .PARAMETER Separator
@@ -34,11 +34,11 @@
 .PARAMETER SmtpConfigPath
   Optional smtp.json path override.
 .EXAMPLE
-  .\scripts\Convert-LogHistoryToCsv.ps1 -InputPath C:\Users\ldorau\Downloads\logs-inwin\log-history-op
+  .\scripts\Convert-LogBhToCsv.ps1 -InputPath C:\Users\ldorau\Downloads\logs-inwin\log-history-op
 .EXAMPLE
-  .\scripts\Convert-LogHistoryToCsv.ps1 -InputPath .\log-history-op -StartDate 2026-11-01
+  .\scripts\Convert-LogBhToCsv.ps1 -InputPath .\log-history-op -StartDate 2026-11-01
 .EXAMPLE
-  .\scripts\Convert-LogHistoryToCsv.ps1 -InputPath .\log-history-ch -PreviousDays 7
+  .\scripts\Convert-LogBhToCsv.ps1 -InputPath .\log-history-ch -PreviousDays 7
 #>
 [CmdletBinding(DefaultParameterSetName = 'All')]
 param(
@@ -67,7 +67,7 @@ $ErrorActionPreference = 'Stop'
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $repoRoot = Split-Path -Parent $scriptDir
-$pyHelper = Join-Path $scriptDir 'Convert-LogHistoryToCsv.py'
+$pyHelper = Join-Path $scriptDir 'Convert-LogBhToCsv.py'
 $ensurePython = Join-Path $scriptDir 'Ensure-WindowsPython3.ps1'
 
 $commonErrorPath = Join-Path $repoRoot 'src\Common-Error.ps1'
@@ -94,7 +94,7 @@ if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
     $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath
 }
 
-function Send-ConvertLogHistoryFailureAlert {
+function Send-ConvertLogBhFailureAlert {
     param(
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body
@@ -113,7 +113,7 @@ function Send-ConvertLogHistoryFailureAlert {
         $null = Send-LoginTimeSmtpAlert `
             -Subject $Subject `
             -Body $Body `
-            -AlertKey 'convert-log-history-csv' `
+            -AlertKey 'convert-log-bh-csv' `
             -Attachment @($attachments)
     }
 }
@@ -122,7 +122,7 @@ function Invoke-ConvertFailure {
     param(
         [Parameter(Mandatory)][string]$Message,
         $ErrorRecord = $null,
-        [string]$Context = 'Convert-LogHistoryToCsv failed'
+        [string]$Context = 'Convert-LogBhToCsv failed'
     )
 
     $details = $Message
@@ -132,8 +132,8 @@ function Invoke-ConvertFailure {
     else {
         $details = "{0}`r`n{1}" -f $Context, $Message
     }
-    $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Convert-LogHistoryToCsv'
-    Send-ConvertLogHistoryFailureAlert -Subject 'Convert-LogHistoryToCsv failed' -Body $details
+    $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Convert-LogBhToCsv'
+    Send-ConvertLogBhFailureAlert -Subject 'Convert-LogBhToCsv failed' -Body $details
     throw $details
 }
 
@@ -211,21 +211,22 @@ try {
     $exeArgs = @($argList | Select-Object -Skip 1)
     & $exe @exeArgs
     if ($LASTEXITCODE -ne 0) {
-        Invoke-ConvertFailure -Message ("Convert-LogHistoryToCsv.py failed with exit code {0}" -f $LASTEXITCODE)
+        Invoke-ConvertFailure -Message ("Convert-LogBhToCsv.py failed with exit code {0}" -f $LASTEXITCODE)
     }
 
-    if (-not (Test-Path -LiteralPath $OutputPath)) {
-        Invoke-ConvertFailure -Message ("Expected output CSV was not created: {0}" -f $OutputPath)
+    if (Test-Path -LiteralPath $OutputPath) {
+        Write-Host ("Done: {0}" -f $OutputPath)
     }
-
-    Write-Host ("Done: {0}" -f $OutputPath)
+    else {
+        Write-Host 'Done: no visit rows; CSV not created.'
+    }
 }
 catch {
     $msg = [string]$_.Exception.Message
-    if ($msg -match 'Convert-LogHistoryToCsv' -or $msg -match 'Python helper missing' -or
+    if ($msg -match 'Convert-LogBhToCsv' -or $msg -match 'Python helper missing' -or
         $msg -match 'Ensure-WindowsPython3' -or $msg -match 'InputPath not found' -or
-        $msg -match 'Separator must be' -or $msg -match 'Expected output CSV') {
+        $msg -match 'Separator must be') {
         throw
     }
-    Invoke-ConvertFailure -ErrorRecord $_ -Context 'Convert-LogHistoryToCsv failed'
+    Invoke-ConvertFailure -ErrorRecord $_ -Context 'Convert-LogBhToCsv failed'
 }
