@@ -17,6 +17,8 @@
   Optional smtp.json path override.
 .PARAMETER PassThru
   Emit the resolved launcher as a string[] (e.g. python / py -3 / full path).
+.PARAMETER NoFatalAlert
+  Log failures as WARN (screen + errors.log) without SMTP fatal alerts.
 .EXAMPLE
   .\scripts\Ensure-WindowsPython3.ps1
 .EXAMPLE
@@ -28,7 +30,9 @@ param(
 
     [string]$SmtpConfigPath = '',
 
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    [switch]$NoFatalAlert
 )
 
 Set-StrictMode -Version Latest
@@ -60,9 +64,10 @@ $null = Initialize-ErrorLog -ConfigPath $ConfigPath
 if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
     $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath
 }
-if (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
+if (-not $NoFatalAlert -and (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue)) {
     Reset-LoginTimeFatalAlreadyReported
 }
+$script:EnsureNoFatalAlert = [bool]$NoFatalAlert
 
 function Invoke-EnsurePythonFailure {
     [CmdletBinding(DefaultParameterSetName = 'Message')]
@@ -75,6 +80,18 @@ function Invoke-EnsurePythonFailure {
 
         [string]$Context = 'Ensure-WindowsPython3 failed'
     )
+
+    if ($script:EnsureNoFatalAlert) {
+        $details = $Message
+        if ($PSCmdlet.ParameterSetName -eq 'Record') {
+            $details = Format-ErrorDetails -ErrorRecord $ErrorRecord -Context $Context
+        }
+        else {
+            $details = "{0}`r`n{1}" -f $Context, $Message
+        }
+        $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Ensure-WindowsPython3'
+        throw $details
+    }
 
     if ($PSCmdlet.ParameterSetName -eq 'Record') {
         $null = Write-FatalError -ErrorRecord $ErrorRecord -Context $Context -Source 'Ensure-WindowsPython3'

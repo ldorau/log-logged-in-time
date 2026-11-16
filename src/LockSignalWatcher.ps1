@@ -294,6 +294,7 @@ Write-WatcherLog ("LockSignalWatcher process start; pid={0}; target={1}; signal=
 
 # Restart the STA message loop if Task Scheduler / host tears it down without a hard kill.
 $restartDelaySeconds = 5
+$script:LockSignalFatalAlertSent = $false
 while ($true) {
     try {
         Write-WatcherLog 'Entering LoginTimeLockSignalWatch.Run (Application.Run message pump).'
@@ -304,20 +305,23 @@ while ($true) {
         $msg = 'Run ERROR: ' + $_.Exception.ToString()
         Write-WatcherLog $msg
         try { Add-Content -LiteralPath $watcherErrPath -Value ('{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $msg) -Encoding UTF8 } catch { }
-        try {
-            $useCommonError = Join-Path $PSScriptRoot 'Use-CommonError.ps1'
-            if (-not (Test-Path -LiteralPath $useCommonError)) {
-                $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+        if (-not $script:LockSignalFatalAlertSent) {
+            try {
+                $useCommonError = Join-Path $PSScriptRoot 'Use-CommonError.ps1'
+                if (-not (Test-Path -LiteralPath $useCommonError)) {
+                    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+                }
+                if ((Test-Path -LiteralPath $useCommonError) -and -not (Get-Command Write-FatalError -ErrorAction SilentlyContinue)) {
+                    . $useCommonError
+                }
+                if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+                    $null = Write-FatalError -ErrorRecord $_ -Context 'LockSignalWatcher.ps1 Run failed' `
+                        -Source 'LockSignalWatcher' -NoThrow
+                    $script:LockSignalFatalAlertSent = $true
+                }
             }
-            if ((Test-Path -LiteralPath $useCommonError) -and -not (Get-Command Write-FatalError -ErrorAction SilentlyContinue)) {
-                . $useCommonError
-            }
-            if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
-                $null = Write-FatalError -ErrorRecord $_ -Context 'LockSignalWatcher.ps1 Run failed' `
-                    -Source 'LockSignalWatcher' -NoThrow
-            }
+            catch { }
         }
-        catch { }
     }
 
     Start-Sleep -Seconds $restartDelaySeconds

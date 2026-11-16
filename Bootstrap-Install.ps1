@@ -309,6 +309,12 @@ catch {
         try {
             . $c
             if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+                # Install.ps1 (or another child) may already have reported fatally.
+                if ((Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -and
+                    (Test-LoginTimeFatalAlreadyReported)) {
+                    $loadedFatal = $true
+                    break
+                }
                 $null = Write-FatalError -ErrorRecord $fatalRecord -Context 'Bootstrap-Install.ps1 failed' `
                     -Source 'Bootstrap-Install' -NoThrow
                 $loadedFatal = $true

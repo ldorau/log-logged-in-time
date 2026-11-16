@@ -33,6 +33,9 @@
   Optional LoginTimeLogger config.json (for error-log / SMTP location).
 .PARAMETER SmtpConfigPath
   Optional smtp.json path override.
+.PARAMETER NoFatalAlert
+  Log failures as WARN (screen + errors.log) without SMTP fatal alerts.
+  Used by the monitor's periodic BHistory CSV export.
 .EXAMPLE
   .\scripts\Convert-LogBhToCsv.ps1 -InputPath C:\Users\ldorau\Downloads\logs-inwin\log-history-op
 .EXAMPLE
@@ -59,7 +62,9 @@ param(
 
     [string]$ConfigPath = '',
 
-    [string]$SmtpConfigPath = ''
+    [string]$SmtpConfigPath = '',
+
+    [switch]$NoFatalAlert
 )
 
 Set-StrictMode -Version Latest
@@ -93,9 +98,10 @@ $null = Initialize-ErrorLog -ConfigPath $ConfigPath
 if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
     $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath
 }
-if (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
+if (-not $NoFatalAlert -and (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue)) {
     Reset-LoginTimeFatalAlreadyReported
 }
+$script:ConvertNoFatalAlert = [bool]$NoFatalAlert
 
 function Invoke-ConvertFailure {
     [CmdletBinding(DefaultParameterSetName = 'Message')]
@@ -108,6 +114,18 @@ function Invoke-ConvertFailure {
 
         [string]$Context = 'Convert-LogBhToCsv failed'
     )
+
+    if ($script:ConvertNoFatalAlert) {
+        $details = $Message
+        if ($PSCmdlet.ParameterSetName -eq 'Record') {
+            $details = Format-ErrorDetails -ErrorRecord $ErrorRecord -Context $Context
+        }
+        else {
+            $details = "{0}`r`n{1}" -f $Context, $Message
+        }
+        $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Convert-LogBhToCsv'
+        throw $details
+    }
 
     if ($PSCmdlet.ParameterSetName -eq 'Record') {
         $null = Write-FatalError -ErrorRecord $ErrorRecord -Context $Context -Source 'Convert-LogBhToCsv'
@@ -145,13 +163,31 @@ try {
     }
 
     $python = $null
+    $ensureArgs = @{
+        ConfigPath     = $ConfigPath
+        SmtpConfigPath = $SmtpConfigPath
+        PassThru       = $true
+    }
+    if ($NoFatalAlert) {
+        $ensureArgs['NoFatalAlert'] = $true
+    }
     try {
-        $python = @( & $ensurePython -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath -PassThru )
+        $python = @( & $ensurePython @ensureArgs )
     }
     catch {
+        if ((Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -and
+            (Test-LoginTimeFatalAlreadyReported)) {
+            throw
+        }
         Invoke-ConvertFailure -ErrorRecord $_ -Context 'Ensure-WindowsPython3 failed'
     }
     if ($LASTEXITCODE -ne 0 -or $null -eq $python -or $python.Count -eq 0) {
+        # Child Ensure already logged (fatal or WARN); do not report again.
+        if ($NoFatalAlert -or
+            ((Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -and
+                (Test-LoginTimeFatalAlreadyReported))) {
+            exit 1
+        }
         Invoke-ConvertFailure -Message 'Ensure-WindowsPython3.ps1 did not return a usable Python launcher.'
     }
 
