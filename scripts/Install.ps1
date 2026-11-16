@@ -1403,6 +1403,9 @@ SystemDrive: $env:SystemDrive
     $vpnProvidersSrc = Join-Path $repoRoot 'scripts\Block-Vpn-Providers.json'
     $dnsForceSrc = Join-Path $repoRoot 'scripts\Force-DnsToLocalResolver.ps1'
     $scpAllowFwSrc = Join-Path $repoRoot 'scripts\Allow-ScpOutboundFirewall.ps1'
+    $convertBhPs1Src = Join-Path $repoRoot 'scripts\Convert-LogBhToCsv.ps1'
+    $convertBhPySrc = Join-Path $repoRoot 'scripts\Convert-LogBhToCsv.py'
+    $ensurePythonSrc = Join-Path $repoRoot 'scripts\Ensure-WindowsPython3.ps1'
 
     try {
         New-Item -ItemType Directory -Path $installSrc -Force | Out-Null
@@ -1439,6 +1442,15 @@ SystemDrive: $env:SystemDrive
         }
         if (Test-Path -LiteralPath $scpAllowFwSrc) {
             Copy-Item -LiteralPath $scpAllowFwSrc -Destination (Join-Path $installScripts 'Allow-ScpOutboundFirewall.ps1') -Force
+        }
+        if (Test-Path -LiteralPath $convertBhPs1Src) {
+            Copy-Item -LiteralPath $convertBhPs1Src -Destination (Join-Path $installScripts 'Convert-LogBhToCsv.ps1') -Force
+        }
+        if (Test-Path -LiteralPath $convertBhPySrc) {
+            Copy-Item -LiteralPath $convertBhPySrc -Destination (Join-Path $installScripts 'Convert-LogBhToCsv.py') -Force
+        }
+        if (Test-Path -LiteralPath $ensurePythonSrc) {
+            Copy-Item -LiteralPath $ensurePythonSrc -Destination (Join-Path $installScripts 'Ensure-WindowsPython3.ps1') -Force
         }
     }
     catch {

@@ -516,6 +516,9 @@ function Publish-InstalledFilesFromRepo {
         'Block-Vpn-Providers.json'
         'Force-DnsToLocalResolver.ps1'
         'Allow-ScpOutboundFirewall.ps1'
+        'Convert-LogBhToCsv.ps1'
+        'Convert-LogBhToCsv.py'
+        'Ensure-WindowsPython3.ps1'
     )
     foreach ($name in $helperFiles) {
         $from = Join-Path $scriptsSrc $name

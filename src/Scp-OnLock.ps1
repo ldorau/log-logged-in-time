@@ -9,6 +9,12 @@ $script:LastBHistorySourceWriteUtc = $null
 $script:LastBHistoryScpSucceeded = $false
 # Per staged leaf (log-history-op / log-history-ch): WriteUtc + Succeeded.
 $script:LastBHistoryStateByLeaf = @{}
+# Directory of this helper while it is being dot-sourced (src/ under install or repo).
+$script:ScpOnLockScriptDir = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
+    -not [string]::IsNullOrWhiteSpace([string]$MyInvocation.MyCommand.Path)) {
+    $script:ScpOnLockScriptDir = Split-Path -Parent ([string]$MyInvocation.MyCommand.Path)
+}
 
 function ConvertFrom-ScpB64Path {
     param([Parameter(Mandatory)][string]$Base64)
@@ -753,6 +759,144 @@ function New-ScpBHistoryUploadFile {
     return ''
 }
 
+function Write-BHistoryCsvEvent {
+    param(
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO',
+        [Parameter(Mandatory)][string]$Message
+    )
+    if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+        Write-LoggerEvent -Level $Level -Message $Message
+        return
+    }
+    Write-Host ("[BHistory CSV][{0}] {1}" -f $Level, $Message)
+}
+
+function Resolve-ConvertLogBhToCsvScript {
+    <#
+      Locate Convert-LogBhToCsv.ps1 under install/repo scripts/.
+    #>
+    $roots = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:ScpOnLockScriptDir)) {
+        $roots.Add((Split-Path -Parent ([string]$script:ScpOnLockScriptDir)))
+    }
+    $pf = Join-Path $env:ProgramFiles 'LoginTimeLogger'
+    if (-not [string]::IsNullOrWhiteSpace($pf)) {
+        $roots.Add($pf)
+    }
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $candidate = Join-Path $root 'scripts\Convert-LogBhToCsv.ps1'
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Get-BHistoryCsvDirectory {
+    <#
+      LogDirectory\bhist for dated History CSV exports.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $logDir = [string]$Config.LogDirectory
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        throw 'LogDirectory missing; cannot create bhist CSV directory.'
+    }
+    $dir = Join-Path $logDir 'bhist'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return $dir
+}
+
+function New-BHistoryCsvExports {
+    <#
+      Stage History DBs, run Convert-LogBhToCsv.ps1 -PreviousDays 1 for each,
+      and write LogDirectory\bhist\log-history-{op|ch}-YYYY-MM-DD.csv.
+      Returns paths of CSVs that exist after conversion (0-row exports omit files).
+      Temp staged SQLite copies are deleted before return.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $csvPaths = New-Object System.Collections.Generic.List[string]
+    $convertScript = Resolve-ConvertLogBhToCsvScript
+    if ([string]::IsNullOrWhiteSpace($convertScript)) {
+        Write-BHistoryCsvEvent -Level WARN -Message (
+            'BHistory CSV: Convert-LogBhToCsv.ps1 not found under install/repo scripts.')
+        return [string[]]@()
+    }
+
+    $bhistDir = Get-BHistoryCsvDirectory -Config $Config
+    $day = Get-Date -Format 'yyyy-MM-dd'
+    $staged = @()
+    try {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config.TargetUsername)) {
+            $staged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$Config.TargetUsername))
+        }
+        if ($staged.Count -eq 0) {
+            Write-BHistoryCsvEvent -Level WARN -Message (
+                'BHistory CSV: no History DB could be staged for conversion.')
+        }
+
+        foreach ($dbPath in $staged) {
+            if ([string]::IsNullOrWhiteSpace([string]$dbPath)) { continue }
+            $leaf = Split-Path -Leaf ([string]$dbPath)
+            if ($leaf -notmatch '^log-history-(op|ch)$') {
+                continue
+            }
+            $outPath = Join-Path $bhistDir ('{0}-{1}.csv' -f $leaf, $day)
+            try {
+                Write-BHistoryCsvEvent -Message (
+                    "BHistory CSV: converting {0} -> {1} (-PreviousDays 1)" -f $leaf, $outPath)
+                # Capture success-stream noise from Convert/Python so it does not
+                # pollute this function's return value.
+                $convertOut = @(& $convertScript -InputPath ([string]$dbPath) `
+                        -OutputPath $outPath -PreviousDays 1 2>&1)
+                $convertExit = [int]$LASTEXITCODE
+                foreach ($line in $convertOut) {
+                    $text = [string]$line
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        Write-BHistoryCsvEvent -Message $text
+                    }
+                }
+                if ($convertExit -ne 0) {
+                    Write-BHistoryCsvEvent -Level WARN -Message (
+                        'BHistory CSV convert failed for {0} (exit {1}).' -f $leaf, $convertExit)
+                }
+            }
+            catch {
+                Write-BHistoryCsvEvent -Level WARN -Message (
+                    'BHistory CSV convert error for {0}: {1}' -f $leaf, $_.Exception.Message)
+            }
+            if (Test-Path -LiteralPath $outPath) {
+                $csvPaths.Add((Get-Item -LiteralPath $outPath -Force).FullName)
+            }
+        }
+
+        # If conversion produced nothing this pass, still upload today's existing CSVs.
+        if ($csvPaths.Count -eq 0) {
+            foreach ($base in @('log-history-op', 'log-history-ch')) {
+                $existing = Join-Path $bhistDir ('{0}-{1}.csv' -f $base, $day)
+                if (Test-Path -LiteralPath $existing) {
+                    $csvPaths.Add($existing)
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($tempCopy in @($staged)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$tempCopy) -and
+                (Test-Path -LiteralPath ([string]$tempCopy))) {
+                Remove-Item -LiteralPath ([string]$tempCopy) -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    return [string[]]$csvPaths.ToArray()
+}
+
 function Get-ScpOnLockMissingConfigFields {
     param([Parameter(Mandatory)]$Config)
 
@@ -1167,10 +1311,10 @@ function Get-CurrentUnlockedTimeLogPath {
 function Invoke-ScpBHistoryCopy {
     <#
     .SYNOPSIS
-      Every interval: SCPs BHistory (when present/changed) and today's
-      unlocked-time-*.log to ScpRemoteDirectory. BHistory uses a shared-read
-      temp copy so a locked SQLite DB can still be uploaded.
-      Failures are logged; they do not stop the monitor.
+      Every interval: converts History DBs to dated CSVs under LogDirectory\bhist
+      (Convert-LogBhToCsv.ps1 -PreviousDays 1), SCPs those CSVs when present, and
+      uploads today's unlocked-time-*.log. Failures are logged; they do not stop
+      the monitor.
     #>
     param(
         [Parameter(Mandatory)]$Config
@@ -1180,9 +1324,7 @@ function Invoke-ScpBHistoryCopy {
         return
     }
 
-    $tempCopies = New-Object System.Collections.Generic.List[string]
     $uploadFiles = New-Object System.Collections.Generic.List[string]
-    $stagedSourceByLeaf = @{}
     $includeBHistory = $false
     try {
         $scpExe = Find-ScpExecutable
@@ -1221,42 +1363,13 @@ function Invoke-ScpBHistoryCopy {
                     'SCP BHistory: History file not found under known profile/install locations.')
             }
         }
-        else {
-            $needStage = $false
-            foreach ($src in $sources) {
-                $leaf = [string]$src.StageLeaf
-                $sourcePath = [string]$src.Path
-                $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-                $writeUtc = $sourceItem.LastWriteTimeUtc
-                $stagedSourceByLeaf[$leaf] = [pscustomobject]@{
-                    Path     = $sourcePath
-                    WriteUtc = $writeUtc
-                }
-                $prev = $null
-                if ($script:LastBHistoryStateByLeaf.ContainsKey($leaf)) {
-                    $prev = $script:LastBHistoryStateByLeaf[$leaf]
-                }
-                $unchanged = (
-                    $null -ne $prev -and
-                    $prev.WriteUtc -is [datetime] -and
-                    $writeUtc -le $prev.WriteUtc -and
-                    [bool]$prev.Succeeded)
-                if (-not $unchanged) {
-                    $needStage = $true
-                }
-            }
-            if ($needStage) {
-                $staged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$Config.TargetUsername))
-                if ($staged.Count -eq 0) {
-                    Write-LoggerEvent -Level WARN -Message 'SCP BHistory: could not stage any History file.'
-                }
-                else {
-                    foreach ($s in $staged) {
-                        $tempCopies.Add($s)
-                        $uploadFiles.Add($s)
-                    }
-                    $includeBHistory = $true
-                }
+
+        # Always convert (today's visits grow); upload CSVs only when they exist.
+        $csvFiles = @(New-BHistoryCsvExports -Config $Config)
+        foreach ($csv in $csvFiles) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$csv) -and (Test-Path -LiteralPath ([string]$csv))) {
+                $uploadFiles.Add([string]$csv)
+                $includeBHistory = $true
             }
         }
 
@@ -1282,8 +1395,7 @@ function Invoke-ScpBHistoryCopy {
             $port = [int]$Config.ScpPort
         }
 
-        # Upload daily log first (small/fast), then BHistory separately so a
-        # large History timeout cannot block the day-log copy.
+        # Upload daily log first (small/fast), then BHistory CSVs separately.
         $dailyFiles = New-Object System.Collections.Generic.List[string]
         $historyFiles = New-Object System.Collections.Generic.List[string]
         foreach ($f in $uploadFiles) {
@@ -1309,7 +1421,7 @@ function Invoke-ScpBHistoryCopy {
 
             $scpTimeoutSeconds = [int]$batch.TimeoutSeconds
             if ($scpTimeoutSeconds -le 0) {
-                # Scale with payload size (~50 KiB/s floor + 60s slack), clamp 180..600.
+                # Scale with payload size (~50 KiB/s floor + 60s slack), clamp 120..600.
                 $totalBytes = [int64]0
                 foreach ($bf in $batchFiles) {
                     try {
@@ -1318,7 +1430,7 @@ function Invoke-ScpBHistoryCopy {
                     catch { }
                 }
                 $scpTimeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
-                if ($scpTimeoutSeconds -lt 180) { $scpTimeoutSeconds = 180 }
+                if ($scpTimeoutSeconds -lt 120) { $scpTimeoutSeconds = 120 }
                 if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
             }
 
@@ -1390,18 +1502,15 @@ function Invoke-ScpBHistoryCopy {
 
                 if ($batch.Name -eq 'BHistory' -and $includeBHistory) {
                     $script:LastBHistoryScpSucceeded = $true
+                    $nowUtc = [datetime]::UtcNow
                     foreach ($bf in $batchFiles) {
                         $leaf = Split-Path -Leaf $bf
-                        $writeUtc = $null
-                        if ($stagedSourceByLeaf.ContainsKey($leaf)) {
-                            $writeUtc = $stagedSourceByLeaf[$leaf].WriteUtc
-                        }
                         $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                            WriteUtc  = $writeUtc
+                            WriteUtc  = $nowUtc
                             Succeeded = $true
                         }
-                        if ($leaf -eq 'log-history-op' -and $writeUtc -is [datetime]) {
-                            $script:LastBHistorySourceWriteUtc = $writeUtc
+                        if ($leaf -like 'log-history-op-*.csv') {
+                            $script:LastBHistorySourceWriteUtc = $nowUtc
                         }
                     }
                 }
@@ -1419,12 +1528,5 @@ function Invoke-ScpBHistoryCopy {
         }
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
             'SCP BHistory/daily failed')
-    }
-    finally {
-        foreach ($tempCopy in @($tempCopies)) {
-            if (-not [string]::IsNullOrWhiteSpace($tempCopy) -and (Test-Path -LiteralPath $tempCopy)) {
-                Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
-            }
-        }
     }
 }
