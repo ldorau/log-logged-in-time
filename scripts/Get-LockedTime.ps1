@@ -307,6 +307,6 @@ try {
     }
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Get-LockedTime.ps1 failed' -Source 'Get-LockedTime'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Get-LockedTime.ps1 failed' -Source 'Get-LockedTime' -NoThrow
     throw
 }

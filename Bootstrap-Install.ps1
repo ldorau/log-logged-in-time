@@ -295,12 +295,55 @@ try {
     Write-Host ("Repo clone: {0}" -f $ClonePath)
 }
 catch {
-    Write-Host ''
-    Write-Host '---------- BOOTSTRAP ERROR ----------' -ForegroundColor Red
-    Write-Host $_.Exception.ToString() -ForegroundColor Red
-    if ($_.ScriptStackTrace) {
-        Write-Host $_.ScriptStackTrace -ForegroundColor Red
+    $fatalRecord = $_
+    $commonCandidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($ClonePath)) {
+        $commonCandidates.Add((Join-Path $ClonePath 'src\Common-Error.ps1'))
+        $commonCandidates.Add((Join-Path $ClonePath 'src\Use-CommonError.ps1'))
     }
-    Write-Host '-------------------------------------' -ForegroundColor Red
+    $commonCandidates.Add((Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'))
+    $commonCandidates.Add((Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Common-Error.ps1'))
+    $loadedFatal = $false
+    foreach ($c in $commonCandidates) {
+        if ([string]::IsNullOrWhiteSpace($c) -or -not (Test-Path -LiteralPath $c)) { continue }
+        try {
+            . $c
+            if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+                $null = Write-FatalError -ErrorRecord $fatalRecord -Context 'Bootstrap-Install.ps1 failed' `
+                    -Source 'Bootstrap-Install' -NoThrow
+                $loadedFatal = $true
+                break
+            }
+        }
+        catch {
+            # try next candidate
+        }
+    }
+    if (-not $loadedFatal) {
+        Write-Host ''
+        Write-Host '---------- BOOTSTRAP ERROR ----------' -ForegroundColor Red
+        Write-Host $fatalRecord.Exception.ToString() -ForegroundColor Red
+        if ($fatalRecord.ScriptStackTrace) {
+            Write-Host $fatalRecord.ScriptStackTrace -ForegroundColor Red
+        }
+        Write-Host '-------------------------------------' -ForegroundColor Red
+        try {
+            $fallbackDir = Join-Path $env:USERPROFILE 'LoginTimeLogger'
+            if (-not (Test-Path -LiteralPath $fallbackDir)) {
+                New-Item -ItemType Directory -Path $fallbackDir -Force | Out-Null
+            }
+            $fallbackLog = Join-Path $fallbackDir 'errors.log'
+            $text = @(
+                '---------- ERROR DETAILS ----------'
+                ('{0:yyyy-MM-dd HH:mm:ss} [ERROR] [Bootstrap-Install]' -f (Get-Date))
+                'Bootstrap-Install.ps1 failed (Common-Error not available yet)'
+                $fatalRecord.Exception.ToString()
+                '-----------------------------------'
+            ) -join [Environment]::NewLine
+            Add-Content -LiteralPath $fallbackLog -Value $text -Encoding UTF8
+            Write-Host ("Error also logged to: {0}" -f $fallbackLog) -ForegroundColor DarkYellow
+        }
+        catch { }
+    }
     exit 1
 }

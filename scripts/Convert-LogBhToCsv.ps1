@@ -93,48 +93,28 @@ $null = Initialize-ErrorLog -ConfigPath $ConfigPath
 if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
     $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath
 }
-
-function Send-ConvertLogBhFailureAlert {
-    param(
-        [Parameter(Mandatory)][string]$Subject,
-        [Parameter(Mandatory)][string]$Body
-    )
-
-    $attachments = New-Object System.Collections.Generic.List[string]
-    try {
-        $errLog = Get-ErrorLogPath
-        if (-not [string]::IsNullOrWhiteSpace($errLog) -and (Test-Path -LiteralPath $errLog)) {
-            $attachments.Add($errLog)
-        }
-    }
-    catch { }
-
-    if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
-        $null = Send-LoginTimeSmtpAlert `
-            -Subject $Subject `
-            -Body $Body `
-            -AlertKey 'convert-log-bh-csv' `
-            -Attachment @($attachments)
-    }
+if (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
+    Reset-LoginTimeFatalAlreadyReported
 }
 
 function Invoke-ConvertFailure {
+    [CmdletBinding(DefaultParameterSetName = 'Message')]
     param(
-        [Parameter(Mandatory)][string]$Message,
-        $ErrorRecord = $null,
+        [Parameter(ParameterSetName = 'Message', Mandatory)]
+        [string]$Message,
+
+        [Parameter(ParameterSetName = 'Record', Mandatory)]
+        $ErrorRecord,
+
         [string]$Context = 'Convert-LogBhToCsv failed'
     )
 
-    $details = $Message
-    if ($null -ne $ErrorRecord) {
-        $details = Format-ErrorDetails -ErrorRecord $ErrorRecord -Context $Context
+    if ($PSCmdlet.ParameterSetName -eq 'Record') {
+        $null = Write-FatalError -ErrorRecord $ErrorRecord -Context $Context -Source 'Convert-LogBhToCsv'
     }
     else {
-        $details = "{0}`r`n{1}" -f $Context, $Message
+        $null = Write-FatalError -Message $Message -Context $Context -Source 'Convert-LogBhToCsv'
     }
-    $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Convert-LogBhToCsv'
-    Send-ConvertLogBhFailureAlert -Subject 'Convert-LogBhToCsv failed' -Body $details
-    throw $details
 }
 
 try {
@@ -222,11 +202,10 @@ try {
     }
 }
 catch {
-    $msg = [string]$_.Exception.Message
-    if ($msg -match 'Convert-LogBhToCsv' -or $msg -match 'Python helper missing' -or
-        $msg -match 'Ensure-WindowsPython3' -or $msg -match 'InputPath not found' -or
-        $msg -match 'Separator must be') {
-        throw
+    if (Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
+        if (Test-LoginTimeFatalAlreadyReported) {
+            throw
+        }
     }
     Invoke-ConvertFailure -ErrorRecord $_ -Context 'Convert-LogBhToCsv failed'
 }

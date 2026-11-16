@@ -5,10 +5,22 @@
 # under the Administrator profile:
 #   <AdministratorProfile>\LoginTimeLogger\errors.log
 #
-# ERROR-level messages also attempt an SMTP alert when smtp.json is enabled
-# (see Common-Smtp.ps1 beside this file).
+# FATAL errors must use Write-FatalError (or Write-ErrorMessage -Level ERROR /
+# Write-VerboseError without -Level Warning). That path always:
+#   1) prints to the screen
+#   2) appends to errors.log
+#   3) sends an SMTP alert when smtp.json is enabled (see Common-Smtp.ps1)
+#
+# WARN-level messages are screen+log only (no auto-email) unless the caller
+# sends a custom Send-LoginTimeSmtpAlert (e.g. with attachments).
 
 $script:LoginTimeErrorLogPath = $null
+# Set by Write-FatalError so outer catch blocks (including parent scripts that
+# invoked a child with &) can avoid double-reporting. Global so nested
+# & script.ps1 scopes share the flag.
+if (-not (Get-Variable -Name LoginTimeFatalAlreadyReported -Scope Global -ErrorAction SilentlyContinue)) {
+    $global:LoginTimeFatalAlreadyReported = $false
+}
 
 # Optional SMTP helper (same folder). Missing file is fine for older installs.
 $script:LoginTimeSmtpHelperPath = Join-Path $PSScriptRoot 'Common-Smtp.ps1'
@@ -613,6 +625,68 @@ function Write-VerboseError {
     $logLevel = if ($Level -eq 'Warning') { 'WARN' } else { 'ERROR' }
     $null = Write-ErrorMessage -Message $details -Level $logLevel -Source $Source
     return $details
+}
+
+function Write-FatalError {
+    <#
+    .SYNOPSIS
+      Fatal error path: screen + errors.log + SMTP (when configured).
+    .DESCRIPTION
+      Prefer this for terminating failures. Uses ERROR-level Write-ErrorMessage
+      so all three channels fire. Default rethrows; pass -NoThrow when the
+      caller will exit instead. Sets $global:LoginTimeFatalAlreadyReported so
+      outer catch blocks (and parent scripts) can skip a second report.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Record')]
+    param(
+        [Parameter(ParameterSetName = 'Record', Mandatory)]
+        $ErrorRecord,
+
+        [Parameter(ParameterSetName = 'Message', Mandatory)]
+        [string]$Message,
+
+        [string]$Context = 'Fatal error',
+
+        [string]$Source = '',
+
+        [switch]$NoThrow
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:LoginTimeErrorLogPath)) {
+        $null = Initialize-ErrorLog
+    }
+    if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
+        try { $null = Initialize-SmtpAlerts } catch { }
+    }
+
+    $details = $null
+    if ($PSCmdlet.ParameterSetName -eq 'Message') {
+        $body = if ([string]::IsNullOrWhiteSpace($Context) -or $Context -eq 'Fatal error') {
+            $Message
+        }
+        else {
+            "{0}`r`n{1}" -f $Context, $Message
+        }
+        $details = Write-ErrorMessage -Message $body -Level ERROR -Source $Source
+    }
+    else {
+        $details = Write-VerboseError -ErrorRecord $ErrorRecord -Context $Context -Source $Source -Level Error
+    }
+
+    $global:LoginTimeFatalAlreadyReported = $true
+
+    if (-not $NoThrow) {
+        throw $details
+    }
+    return $details
+}
+
+function Test-LoginTimeFatalAlreadyReported {
+    return [bool]$global:LoginTimeFatalAlreadyReported
+}
+
+function Reset-LoginTimeFatalAlreadyReported {
+    $global:LoginTimeFatalAlreadyReported = $false
 }
 
 function New-VerboseException {

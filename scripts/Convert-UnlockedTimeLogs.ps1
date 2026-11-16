@@ -32,6 +32,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$useCommonError = Join-Path (Split-Path -Parent $scriptDir) 'src\Use-CommonError.ps1'
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+}
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    throw "Use-CommonError.ps1 missing (expected under repo src/ or Program Files)."
+}
+. $useCommonError
+
 function Format-UnlockedDuration {
     param([Parameter(Mandatory)][double]$Seconds)
     $ts = [TimeSpan]::FromSeconds([Math]::Max(0, [Math]::Floor($Seconds)))
@@ -157,64 +167,71 @@ function Write-Utf8NoBomFile {
     [System.IO.File]::WriteAllText($LiteralPath, $Text, $utf8)
 }
 
-if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
-    throw ("Path not found: {0}" -f $Path)
-}
-
-$item = Get-Item -LiteralPath $Path -Force
-$files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-if ($item.PSIsContainer) {
-    Get-ChildItem -LiteralPath $item.FullName -File -Force |
-        Where-Object { $_.Name -like 'unlocked-time*' -and ($_.Extension -in @('.log', '.csv')) } |
-        Sort-Object Name |
-        ForEach-Object { $files.Add($_) }
-}
-else {
-    if ($item.Name -notlike 'unlocked-time*') {
-        throw ("File name must match unlocked-time*: {0}" -f $item.FullName)
-    }
-    $files.Add($item)
-}
-
-if ($files.Count -eq 0) {
-    Write-Host ("No unlocked-time* .log/.csv files under '{0}'." -f $item.FullName)
-    exit 0
-}
-
-$converted = 0
-$skipped = 0
-foreach ($f in $files) {
-    $rawBytes = [System.IO.File]::ReadAllBytes($f.FullName)
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    $text = $utf8.GetString($rawBytes)
-    if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
-        $text = $utf8.GetString($rawBytes, 3, $rawBytes.Length - 3)
+try {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        throw ("Path not found: {0}" -f $Path)
     }
 
-    if ($f.Extension -eq '.csv' -or $f.Name -like '*summary*') {
-        $result = Convert-UnlockedTimeSummaryText -Text $text
-        $kind = 'summary'
+    $item = Get-Item -LiteralPath $Path -Force
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    if ($item.PSIsContainer) {
+        Get-ChildItem -LiteralPath $item.FullName -File -Force |
+            Where-Object { $_.Name -like 'unlocked-time*' -and ($_.Extension -in @('.log', '.csv')) } |
+            Sort-Object Name |
+            ForEach-Object { $files.Add($_) }
     }
     else {
-        $result = Convert-UnlockedTimeDayLogText -Text $text
-        $kind = 'day-log'
+        if ($item.Name -notlike 'unlocked-time*') {
+            throw ("File name must match unlocked-time*: {0}" -f $item.FullName)
+        }
+        $files.Add($item)
     }
 
-    if (-not $result.Changed) {
-        Write-Host ("[skip] {0} ({1}, already current)" -f $f.Name, $kind)
-        $skipped++
-        continue
+    if ($files.Count -eq 0) {
+        Write-Host ("No unlocked-time* .log/.csv files under '{0}'." -f $item.FullName)
+        exit 0
     }
 
-    if ($PSCmdlet.ShouldProcess($f.FullName, "Convert $kind to current unlocked-time format")) {
-        Write-Utf8NoBomFile -LiteralPath $f.FullName -Text ([string]$result.Text)
-        Write-Host ("[ok]   {0} ({1})" -f $f.Name, $kind)
-        $converted++
+    $converted = 0
+    $skipped = 0
+    foreach ($f in $files) {
+        $rawBytes = [System.IO.File]::ReadAllBytes($f.FullName)
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $text = $utf8.GetString($rawBytes)
+        if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+            $text = $utf8.GetString($rawBytes, 3, $rawBytes.Length - 3)
+        }
+
+        if ($f.Extension -eq '.csv' -or $f.Name -like '*summary*') {
+            $result = Convert-UnlockedTimeSummaryText -Text $text
+            $kind = 'summary'
+        }
+        else {
+            $result = Convert-UnlockedTimeDayLogText -Text $text
+            $kind = 'day-log'
+        }
+
+        if (-not $result.Changed) {
+            Write-Host ("[skip] {0} ({1}, already current)" -f $f.Name, $kind)
+            $skipped++
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($f.FullName, "Convert $kind to current unlocked-time format")) {
+            Write-Utf8NoBomFile -LiteralPath $f.FullName -Text ([string]$result.Text)
+            Write-Host ("[ok]   {0} ({1})" -f $f.Name, $kind)
+            $converted++
+        }
+        else {
+            Write-Host ("[whatif] {0} ({1})" -f $f.Name, $kind)
+            $converted++
+        }
     }
-    else {
-        Write-Host ("[whatif] {0} ({1})" -f $f.Name, $kind)
-        $converted++
-    }
+
+    Write-Host ("Done. converted={0}; skipped={1}; total={2}" -f $converted, $skipped, $files.Count)
 }
-
-Write-Host ("Done. converted={0}; skipped={1}; total={2}" -f $converted, $skipped, $files.Count)
+catch {
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Convert-UnlockedTimeLogs.ps1 failed' `
+        -Source 'Convert-UnlockedTimeLogs' -NoThrow
+    exit 1
+}

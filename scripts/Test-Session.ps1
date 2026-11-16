@@ -126,6 +126,6 @@ Set the Windows logon name in TargetUsername, then retry.
     }
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Test-Session.ps1 failed' -Source 'Test-Session'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Test-Session.ps1 failed' -Source 'Test-Session' -NoThrow
     throw
 }

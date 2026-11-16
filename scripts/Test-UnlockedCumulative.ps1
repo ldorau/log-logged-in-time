@@ -643,6 +643,6 @@ try {
     exit $code
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Test-UnlockedCumulative.ps1 failed' -Source 'Test-UnlockedCumulative'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Test-UnlockedCumulative.ps1 failed' -Source 'Test-UnlockedCumulative' -NoThrow
     throw
 }

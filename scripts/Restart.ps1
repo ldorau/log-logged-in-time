@@ -419,6 +419,5 @@ Install first: .\scripts\Install.ps1 -AdminUsername <admin> -TargetUsername <use
     exit 0
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Restart.ps1 failed' -Source 'Restart'
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Restart.ps1 failed' -Source 'Restart'
 }

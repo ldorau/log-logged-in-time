@@ -447,7 +447,7 @@ catch {
     if (-not [string]::IsNullOrWhiteSpace($script:CopyLogPath)) {
         Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
     }
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Copy-LogsViaScp.ps1 failed' -Source 'Copy-LogsViaScp'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Copy-LogsViaScp.ps1 failed' -Source 'Copy-LogsViaScp' -NoThrow
     exit 1
 }
 finally {

@@ -10,6 +10,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$useCommonError = Join-Path (Split-Path -Parent $scriptDir) 'src\Use-CommonError.ps1'
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+}
+if (Test-Path -LiteralPath $useCommonError) {
+    . $useCommonError
+}
+
 $dir = Split-Path -Parent $EventFile
 if (-not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -62,6 +71,11 @@ try {
 catch {
     $msg = '{0:yyyy-MM-dd HH:mm:ss} [WATCHER] ERROR {1}{2}' -f (Get-Date), $_.Exception.ToString(), [Environment]::NewLine
     try { Add-Content -LiteralPath $EventFile -Value $msg -Encoding UTF8 } catch { }
-    [Console]::Error.WriteLine($_.Exception.ToString())
+    if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+        $null = Write-FatalError -ErrorRecord $_ -Context 'LockCycleWatcher.ps1 failed' -Source 'LockCycleWatcher' -NoThrow
+    }
+    else {
+        [Console]::Error.WriteLine($_.Exception.ToString())
+    }
     exit 1
 }

@@ -236,6 +236,5 @@ try {
     Write-Host 'Reinstall finished.' -ForegroundColor Green
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Reinstall.ps1 failed' -Source 'Reinstall'
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Reinstall.ps1 failed' -Source 'Reinstall'
 }

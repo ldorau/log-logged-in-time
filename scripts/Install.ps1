@@ -1423,6 +1423,10 @@ SystemDrive: $env:SystemDrive
         if (Test-Path -LiteralPath $unlockQuotaWarnSrc) {
             Copy-Item -LiteralPath $unlockQuotaWarnSrc -Destination (Join-Path $installSrc 'Show-UnlockQuotaWarning.ps1') -Force
         }
+        $useCommonErrorSrc = Join-Path $repoRoot 'src\Use-CommonError.ps1'
+        if (Test-Path -LiteralPath $useCommonErrorSrc) {
+            Copy-Item -LiteralPath $useCommonErrorSrc -Destination (Join-Path $installSrc 'Use-CommonError.ps1') -Force
+        }
 
         New-Item -ItemType Directory -Path $installScripts -Force | Out-Null
         if (Test-Path -LiteralPath $dohFirewallSrc) {
@@ -1627,6 +1631,5 @@ SystemDrive: $env:SystemDrive
     }
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Install.ps1 failed' -Source 'Install'
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Install.ps1 failed' -Source 'Install'
 }

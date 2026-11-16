@@ -977,8 +977,8 @@ try {
     }
 }
 catch {
-    Write-Host ("ERROR: could not acquire instance mutex: {0}" -f $_.Exception.Message)
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'LoginTimeLogger could not acquire instance mutex' `
+        -Source 'LoginTimeLogger'
 }
 
 # --- main ---
@@ -1056,8 +1056,7 @@ try {
         -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'LoginTimeLogger startup failed' -Source 'LoginTimeLogger'
 }
 
 $lastPollUtc = [datetime]::UtcNow

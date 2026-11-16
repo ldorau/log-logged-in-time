@@ -172,6 +172,5 @@ try {
     }
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Uninstall.ps1 failed' -Source 'Uninstall'
-    throw
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Uninstall.ps1 failed' -Source 'Uninstall'
 }

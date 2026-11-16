@@ -56,6 +56,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$useCommonError = Join-Path (Split-Path -Parent $scriptDir) 'src\Use-CommonError.ps1'
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+}
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    throw "Use-CommonError.ps1 missing (expected under repo src/ or Program Files)."
+}
+. $useCommonError
 $repoRoot = Split-Path -Parent $scriptDir
 $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
 $probeScript = Join-Path $scriptDir 'WtsLockProbe.ps1'
@@ -540,13 +548,9 @@ try {
     catch { }
 }
 catch {
-    Write-Host '---------- ERROR ----------' -ForegroundColor Red
-    Write-Host $_.Exception.ToString() -ForegroundColor Red
-    if ($_.ScriptStackTrace) {
-        Write-Host $_.ScriptStackTrace -ForegroundColor Red
-    }
-    Write-Host '---------------------------' -ForegroundColor Red
     try { Write-Journal -Message ("ERROR: {0}" -f $_.Exception.Message) } catch { }
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Invoke-UnlockedTimeInvestigation.ps1 failed' `
+        -Source 'Invoke-UnlockedTimeInvestigation' -NoThrow
     exit 1
 }
 finally {

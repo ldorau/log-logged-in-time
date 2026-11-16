@@ -630,7 +630,7 @@ catch {
     if (-not [string]::IsNullOrWhiteSpace($script:TestLogPath)) {
         Write-ScpTestLine ("Test log saved: {0}" -f $script:TestLogPath) -ForegroundColor Yellow
     }
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Test-ScpOnLock.ps1 failed' -Source 'Test-ScpOnLock'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Test-ScpOnLock.ps1 failed' -Source 'Test-ScpOnLock' -NoThrow
     exit 1
 }
 finally {

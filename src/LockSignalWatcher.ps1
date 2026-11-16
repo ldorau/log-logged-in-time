@@ -304,6 +304,20 @@ while ($true) {
         $msg = 'Run ERROR: ' + $_.Exception.ToString()
         Write-WatcherLog $msg
         try { Add-Content -LiteralPath $watcherErrPath -Value ('{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $msg) -Encoding UTF8 } catch { }
+        try {
+            $useCommonError = Join-Path $PSScriptRoot 'Use-CommonError.ps1'
+            if (-not (Test-Path -LiteralPath $useCommonError)) {
+                $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+            }
+            if ((Test-Path -LiteralPath $useCommonError) -and -not (Get-Command Write-FatalError -ErrorAction SilentlyContinue)) {
+                . $useCommonError
+            }
+            if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+                $null = Write-FatalError -ErrorRecord $_ -Context 'LockSignalWatcher.ps1 Run failed' `
+                    -Source 'LockSignalWatcher' -NoThrow
+            }
+        }
+        catch { }
     }
 
     Start-Sleep -Seconds $restartDelaySeconds

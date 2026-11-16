@@ -19,6 +19,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$useCommonError = Join-Path (Split-Path -Parent $scriptDir) 'src\Use-CommonError.ps1'
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+}
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    throw "Use-CommonError.ps1 missing (expected under repo src/ or Program Files)."
+}
+. $useCommonError
+
 if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
     throw 'TargetUsername is empty. Pass -TargetUsername or run while logged on interactively.'
 }
@@ -30,7 +40,6 @@ if ([string]::IsNullOrWhiteSpace($userFolder)) {
     $userFolder = 'current'
 }
 
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $repoRoot = Split-Path -Parent $scriptDir
 $csPath = Join-Path $repoRoot 'src\SessionQuery.cs'
 $watcherScript = Join-Path $scriptDir 'LockCycleWatcher.ps1'
@@ -229,12 +238,7 @@ Events file: $eventFile
     exit 0
 }
 catch {
-    Write-Host '---------- ERROR ----------' -ForegroundColor Red
-    Write-Host $_.Exception.ToString() -ForegroundColor Red
-    if ($_.ScriptStackTrace) {
-        Write-Host $_.ScriptStackTrace -ForegroundColor Red
-    }
-    Write-Host '---------------------------' -ForegroundColor Red
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Test-LockCycle.ps1 failed' -Source 'Test-LockCycle' -NoThrow
     exit 1
 }
 finally {

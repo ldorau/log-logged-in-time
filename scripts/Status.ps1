@@ -447,6 +447,6 @@ try {
     # Status; use those scripts manually when needed.
 }
 catch {
-    $null = Write-VerboseError -ErrorRecord $_ -Context 'Status.ps1 failed' -Source 'Status'
+    $null = Write-FatalError -ErrorRecord $_ -Context 'Status.ps1 failed' -Source 'Status' -NoThrow
     throw
 }

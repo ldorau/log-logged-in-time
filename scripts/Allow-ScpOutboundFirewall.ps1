@@ -43,8 +43,28 @@ param(
 $ErrorActionPreference = 'Stop'
 $RulePrefix = 'SCP-Allow:'
 
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$useCommonError = Join-Path (Split-Path -Parent $scriptDir) 'src\Use-CommonError.ps1'
+if (-not (Test-Path -LiteralPath $useCommonError)) {
+    $useCommonError = Join-Path $env:ProgramFiles 'LoginTimeLogger\src\Use-CommonError.ps1'
+}
+if (Test-Path -LiteralPath $useCommonError) {
+    . $useCommonError
+}
+trap {
+    if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+        $null = Write-FatalError -ErrorRecord $_ -Context 'Allow-ScpOutboundFirewall.ps1 failed' `
+            -Source 'Allow-ScpOutboundFirewall' -NoThrow
+    }
+    else {
+        Write-Host $_.Exception.ToString() -ForegroundColor Red
+    }
+    exit 1
+}
+
 if ($Remove -and $Verify) {
-    throw 'Specify only one of -Remove or -Verify (not both).'
+    Write-Host 'Specify only one of -Remove or -Verify (not both).' -ForegroundColor Red
+    exit 1
 }
 
 function Write-ScpAllowHost {
@@ -98,12 +118,13 @@ $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
 $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $Verify -and -not $isAdmin) {
-    Write-Error 'This script must be run from an elevated (Administrator) PowerShell prompt (except -Verify).'
+    Write-Host 'This script must be run from an elevated (Administrator) PowerShell prompt (except -Verify).' -ForegroundColor Red
     exit 1
 }
 
 if (-not (Get-Module -ListAvailable -Name NetSecurity)) {
-    throw 'NetSecurity module is required (Get/New/Remove-NetFirewallRule).'
+    Write-Host 'NetSecurity module is required (Get/New/Remove-NetFirewallRule).' -ForegroundColor Red
+    exit 1
 }
 Import-Module NetSecurity -ErrorAction Stop
 

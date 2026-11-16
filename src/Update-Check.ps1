@@ -495,7 +495,7 @@ function Publish-InstalledFilesFromRepo {
     # Optional for older/stale update clones (keep existing Program Files copy).
     # Show-UnlockQuotaWarning must not hard-fail Restart when UpdateClonePath
     # lags the worktree; LoginTimeLogger already no-ops if the script is absent.
-    foreach ($optionalName in @('Common-Smtp.ps1', 'Show-UnlockQuotaWarning.ps1')) {
+    foreach ($optionalName in @('Common-Smtp.ps1', 'Show-UnlockQuotaWarning.ps1', 'Use-CommonError.ps1')) {
         $from = Join-Path $srcDir $optionalName
         if (Test-Path -LiteralPath $from) {
             Copy-Item -LiteralPath $from -Destination (Join-Path $destDir $optionalName) -Force

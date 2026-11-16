@@ -60,49 +60,28 @@ $null = Initialize-ErrorLog -ConfigPath $ConfigPath
 if (Get-Command Initialize-SmtpAlerts -ErrorAction SilentlyContinue) {
     $null = Initialize-SmtpAlerts -ConfigPath $ConfigPath -SmtpConfigPath $SmtpConfigPath
 }
-
-function Send-EnsurePythonFailureAlert {
-    param(
-        [Parameter(Mandatory)][string]$Subject,
-        [Parameter(Mandatory)][string]$Body
-    )
-
-    $attachments = New-Object System.Collections.Generic.List[string]
-    try {
-        $errLog = Get-ErrorLogPath
-        if (-not [string]::IsNullOrWhiteSpace($errLog) -and (Test-Path -LiteralPath $errLog)) {
-            $attachments.Add($errLog)
-        }
-    }
-    catch { }
-
-    if (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue) {
-        $null = Send-LoginTimeSmtpAlert `
-            -Subject $Subject `
-            -Body $Body `
-            -AlertKey 'ensure-windows-python3' `
-            -Attachment @($attachments)
-    }
+if (Get-Command Reset-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
+    Reset-LoginTimeFatalAlreadyReported
 }
 
 function Invoke-EnsurePythonFailure {
+    [CmdletBinding(DefaultParameterSetName = 'Message')]
     param(
-        [Parameter(Mandatory)][string]$Message,
-        $ErrorRecord = $null,
+        [Parameter(ParameterSetName = 'Message', Mandatory)]
+        [string]$Message,
+
+        [Parameter(ParameterSetName = 'Record', Mandatory)]
+        $ErrorRecord,
+
         [string]$Context = 'Ensure-WindowsPython3 failed'
     )
 
-    $details = $Message
-    if ($null -ne $ErrorRecord) {
-        $details = Format-ErrorDetails -ErrorRecord $ErrorRecord -Context $Context
+    if ($PSCmdlet.ParameterSetName -eq 'Record') {
+        $null = Write-FatalError -ErrorRecord $ErrorRecord -Context $Context -Source 'Ensure-WindowsPython3'
     }
     else {
-        $details = "{0}`r`n{1}" -f $Context, $Message
+        $null = Write-FatalError -Message $Message -Context $Context -Source 'Ensure-WindowsPython3'
     }
-    # WARN so Common-Error does not auto-email without attachments.
-    $null = Write-ErrorMessage -Message $details -Level WARN -Source 'Ensure-WindowsPython3'
-    Send-EnsurePythonFailureAlert -Subject 'Ensure-WindowsPython3 failed' -Body $details
-    throw $details
 }
 
 function Test-WindowsPythonCommand {
@@ -271,7 +250,6 @@ function Install-WindowsPython3 {
 
     $logLines.Add('Python still not resolvable after install attempts.')
     Write-Host ($logLines -join [Environment]::NewLine) -ForegroundColor Yellow
-    $null = Write-ErrorMessage -Message ($logLines -join [Environment]::NewLine) -Level WARN -Source 'Ensure-WindowsPython3'
     return $false
 }
 
@@ -308,16 +286,12 @@ try {
     exit 0
 }
 catch {
-    $msg = [string]$_.Exception.Message
-    if ($msg -match 'Ensure-WindowsPython3' -or $msg -match 'Windows Python 3') {
-        Write-Host $msg -ForegroundColor Red
-        exit 1
-    }
-    try {
-        Invoke-EnsurePythonFailure -ErrorRecord $_ -Context 'Ensure-WindowsPython3 failed'
-    }
-    catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
+    if (-not (Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -or
+        -not (Test-LoginTimeFatalAlreadyReported)) {
+        try {
+            Invoke-EnsurePythonFailure -ErrorRecord $_ -Context 'Ensure-WindowsPython3 failed'
+        }
+        catch { }
     }
     exit 1
 }
