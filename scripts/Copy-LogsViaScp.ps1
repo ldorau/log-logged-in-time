@@ -8,9 +8,10 @@
     - all error logs (errors.log / *error*.log, plus Get-ErrorLogPath)
     - unlocked-time-summary.csv
     - state.json
-    - raw browser History DBs as log-history-* (staged shared-read copies
-      of Opera/Chrome History; also any non-.csv log-history-* already under
-      LogDirectory)
+    - raw browser History DBs: log-history-op-<profile> and
+      log-history-ch-<profile> for every discovered browser profile
+      (Default, Profile-1, …); also any non-.csv log-history-* already under
+      LogDirectory
 
   Uses the same OpenSSH scp options as Scp-OnLock.ps1 (key auth, BatchMode).
   Does not require a screen lock; use -Force when ScpOnLockEnabled is false.
@@ -364,14 +365,39 @@ try {
             $fileList.Add([string]$f)
         }
     }
-    # Always stage raw History DBs (log-history-op / log-history-ch, …).
+    # Always stage raw History DBs (every log-history-op-* + log-history-ch-*).
     $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    $bHistoryOpStaged = @($bHistoryStaged | Where-Object {
+            $leaf = Split-Path -Leaf ([string]$_)
+            ($leaf -eq 'log-history-op') -or ($leaf -like 'log-history-op-*')
+        })
+    $bHistoryChStaged = @($bHistoryStaged | Where-Object {
+            (Split-Path -Leaf ([string]$_)) -like 'log-history-ch-*'
+        })
     if ($bHistoryStaged.Count -gt 0) {
         foreach ($staged in $bHistoryStaged) {
             $fileList.Add([string]$staged)
         }
         Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Detail ($bHistoryStaged -join '; ')
+        Write-Check -Name 'BHistory op (log-history-op-*)' -Ok ($bHistoryOpStaged.Count -gt 0) -Detail $(
+            if ($bHistoryOpStaged.Count -gt 0) {
+                ("{0} file(s): {1}" -f $bHistoryOpStaged.Count, (
+                    ($bHistoryOpStaged | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
+            }
+            else {
+                'none staged (no op profile History found)'
+            }
+        )
+        Write-Check -Name 'BHistory ch (log-history-ch-*)' -Ok ($bHistoryChStaged.Count -gt 0) -Detail $(
+            if ($bHistoryChStaged.Count -gt 0) {
+                ("{0} file(s): {1}" -f $bHistoryChStaged.Count, (
+                    ($bHistoryChStaged | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
+            }
+            else {
+                'none staged (no ch profile History found)'
+            }
+        )
     }
     else {
         $bhDetail = if ([string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
@@ -381,6 +407,8 @@ try {
             "not found or unreadable for '{0}'" -f $cfg.TargetUsername
         }
         Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Status WARN -Detail $bhDetail
+        Write-Check -Name 'BHistory op (log-history-op-*)' -Ok $true -Status WARN -Detail 'none staged'
+        Write-Check -Name 'BHistory ch (log-history-ch-*)' -Ok $true -Status WARN -Detail 'none staged'
     }
     $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($files.Count -eq 0) {

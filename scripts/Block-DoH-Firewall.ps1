@@ -80,7 +80,7 @@
       there is no reliable application-level signal to test against. -Verify
       only reports the UDP rules' configuration state, not live reachability.
     - Companion controls (firewall alone is not enough for "no DoH anywhere"):
-        * Disable browser Secure DNS / DoH (Chrome/Edge/Firefox settings or
+        * Disable browser Secure DNS / DoH (browser settings or
           enterprise policy).
         * Windows: Settings > Network > DNS > disable "DNS over HTTPS", or
           set DoH via policy (e.g. Administrative Templates / MDM).

