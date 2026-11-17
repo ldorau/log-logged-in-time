@@ -13,7 +13,8 @@
       (Default, Profile-1, …); also any non-.csv log-history-* already under
       LogDirectory
 
-  Uses the same OpenSSH scp options as Scp-OnLock.ps1 (key auth, BatchMode).
+  Uses the same OpenSSH scp options as Scp-OnLock.ps1 (key auth, BatchMode),
+  plus -v so the transfer lists each file on screen and in the copy log.
   Does not require a screen lock; use -Force when ScpOnLockEnabled is false.
 
   All screen output is also appended to a log file (see -LogPath).
@@ -244,7 +245,8 @@ function Invoke-ScpCopyFiles {
     Add-ScpCommonSshOptions -ArgumentList $argList `
         -IdentityFile ([string]$Config.ScpIdentityFile) `
         -Port ([int]$Config.ScpPort) `
-        -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+        -VerboseSsh
     foreach ($f in $Files) {
         $argList.Add($f)
     }
@@ -429,22 +431,24 @@ try {
     }
 
     Write-ScpCopyLine ''
-    Write-ScpCopyLine 'Step 3: scp copy' -ForegroundColor Cyan
+    Write-ScpCopyLine 'Step 3: scp copy (-v)' -ForegroundColor Cyan
     $copyResult = Invoke-ScpCopyFiles -Config $runtimeCfg -Files $files
     $ok = ($copyResult.ExitCode -eq 0)
     Write-Check -Name 'scp exit code' -Ok $ok -Detail ("{0} -> {1}" -f $copyResult.ExitCode, $copyResult.RemoteTarget)
 
+    # scp -v writes progress/file names to stderr; always show it.
+    if (-not [string]::IsNullOrWhiteSpace($copyResult.StdErr)) {
+        Write-ScpCopyLine '--- scp stderr (-v) ---' -ForegroundColor DarkGray
+        Write-ScpCopyLine $copyResult.StdErr.TrimEnd() -ForegroundColor DarkGray
+    }
+    if (-not [string]::IsNullOrWhiteSpace($copyResult.StdOut)) {
+        Write-ScpCopyLine '--- scp stdout ---' -ForegroundColor DarkGray
+        Write-ScpCopyLine $copyResult.StdOut.TrimEnd() -ForegroundColor DarkGray
+    }
+
     if (-not $ok) {
         Write-ScpCopyLine ''
         Write-ScpCopyLine 'RESULT: SCP copy failed.' -ForegroundColor Red
-        if (-not [string]::IsNullOrWhiteSpace($copyResult.StdErr)) {
-            Write-ScpCopyLine '--- scp stderr ---' -ForegroundColor Yellow
-            Write-ScpCopyLine $copyResult.StdErr.TrimEnd()
-        }
-        if (-not [string]::IsNullOrWhiteSpace($copyResult.StdOut)) {
-            Write-ScpCopyLine '--- scp stdout ---' -ForegroundColor Yellow
-            Write-ScpCopyLine $copyResult.StdOut.TrimEnd()
-        }
         if (Test-ScpAuthFailure -StdErr ([string]$copyResult.StdErr)) {
             $pub = Get-ScpPublicKeyText -IdentityPath $cfg.ScpIdentityFile
             Write-ScpCopyLine ''
