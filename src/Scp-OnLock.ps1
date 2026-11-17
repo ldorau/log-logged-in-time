@@ -715,15 +715,32 @@ function New-ScpBHistoryUploadFiles {
       Stages shared-read copies of each discovered History DB under TEMP
       (log-history-op, log-history-ch, ...). Returns staged full paths.
       Caller must delete returned paths when finished.
+      When TargetUsername is empty, still stages preferred absolute History
+      paths (profile-relative discovery is skipped).
     #>
-    param([Parameter(Mandatory)][string]$TargetUsername)
+    param([string]$TargetUsername = '')
 
     $staged = New-Object System.Collections.Generic.List[string]
-    if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
-        return [string[]]@()
+    $sources = New-Object System.Collections.Generic.List[object]
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetUsername)) {
+        foreach ($src in @(Get-BHistorySources -TargetUsername $TargetUsername)) {
+            $sources.Add($src)
+        }
+    }
+    else {
+        # Preferred absolute paths only (no profile-relative lookup).
+        foreach ($pair in @(
+                @{ Abs = [string]$script:ScpBHistoryPreferredAbsolute; Leaf = 'log-history-op' }
+                @{ Abs = [string]$script:ScpBHistoryPreferredAbsoluteSecondary; Leaf = 'log-history-ch' }
+            )) {
+            if (-not [string]::IsNullOrWhiteSpace($pair.Abs) -and (Test-Path -LiteralPath $pair.Abs)) {
+                $sources.Add([pscustomobject]@{ Path = $pair.Abs; StageLeaf = $pair.Leaf })
+            }
+        }
     }
 
-    foreach ($src in @(Get-BHistorySources -TargetUsername $TargetUsername)) {
+    foreach ($src in @($sources)) {
         $sourcePath = [string]$src.Path
         $leaf = [string]$src.StageLeaf
         if ([string]::IsNullOrWhiteSpace($sourcePath) -or [string]::IsNullOrWhiteSpace($leaf)) {
@@ -998,8 +1015,10 @@ function Get-ScpOnLockSourceFiles {
 function Get-ScpManualSourceFiles {
     <#
       Collects a fuller set for manual SCP: every unlocked-time-*.log under
-      LogDirectory, all error logs, unlocked-time-summary.csv, and state.json.
-      Does not include service.log.
+      LogDirectory, all error logs, unlocked-time-summary.csv, state.json,
+      and any raw History DB copies already under LogDirectory (log-history-*
+      without a .csv extension). Does not include service.log or stage live
+      browser History (callers use New-ScpBHistoryUploadFiles for that).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -1050,6 +1069,13 @@ function Get-ScpManualSourceFiles {
             ForEach-Object { & $addFile $_.FullName }
         Get-ChildItem -LiteralPath $logDir -File -Force `
             -Filter '*error*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { & $addFile $_.FullName }
+
+        # Raw History DB snapshots (log-history-op / log-history-ch / …), not CSVs.
+        Get-ChildItem -LiteralPath $logDir -File -Force `
+            -Filter 'log-history-*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -ne '.csv' } |
+            Sort-Object Name |
             ForEach-Object { & $addFile $_.FullName }
     }
 

