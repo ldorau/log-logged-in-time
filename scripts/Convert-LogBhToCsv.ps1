@@ -151,7 +151,10 @@ try {
         PassThru       = $true
     }
     try {
-        $python = @( & $ensurePython @ensureArgs )
+        # Clear leftover native exit codes; $null -ne 0 is True in PowerShell and
+        # would falsely treat a successful Ensure as failure.
+        $global:LASTEXITCODE = 0
+        $pythonRaw = @( & $ensurePython @ensureArgs )
     }
     catch {
         if ((Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -and
@@ -160,7 +163,27 @@ try {
         }
         Invoke-ConvertFailure -ErrorRecord $_ -Context 'Ensure-WindowsPython3 failed'
     }
-    if ($LASTEXITCODE -ne 0 -or $null -eq $python -or $python.Count -eq 0) {
+    # Flatten nested arrays / skip host noise so we get 'python' or 'py','-3'.
+    $python = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($pythonRaw)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($item) -and $item -ne 'System.Object[]') {
+                $python.Add($item)
+            }
+            continue
+        }
+        foreach ($sub in @($item)) {
+            $s = [string]$sub
+            if (-not [string]::IsNullOrWhiteSpace($s) -and $s -ne 'System.Object[]') {
+                $python.Add($s)
+            }
+        }
+    }
+    $python = @($python)
+    # Prefer PassThru output over leftover $LASTEXITCODE from Ensure internals
+    # (native probes can leave non-zero codes even when Python was found).
+    if ($null -eq $python -or $python.Count -eq 0) {
         # Child Ensure already logged (fatal); do not report again.
         if ((Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) -and
             (Test-LoginTimeFatalAlreadyReported)) {
@@ -203,8 +226,10 @@ try {
 
     $exe = $argList[0]
     $exeArgs = @($argList | Select-Object -Skip 1)
+    $global:LASTEXITCODE = 0
     & $exe @exeArgs
-    if ($LASTEXITCODE -ne 0) {
+    # $null -ne 0 is True in PowerShell; only fail on a defined non-zero code.
+    if ($null -ne $LASTEXITCODE -and [int]$LASTEXITCODE -ne 0) {
         Invoke-ConvertFailure -Message ("Convert-LogBhToCsv.py failed with exit code {0}" -f $LASTEXITCODE)
     }
 
@@ -214,12 +239,14 @@ try {
     else {
         Write-Host 'Done: no visit rows; CSV not created.'
     }
+    exit 0
 }
 catch {
     if (Get-Command Test-LoginTimeFatalAlreadyReported -ErrorAction SilentlyContinue) {
         if (Test-LoginTimeFatalAlreadyReported) {
-            throw
+            exit 1
         }
     }
     Invoke-ConvertFailure -ErrorRecord $_ -Context 'Convert-LogBhToCsv failed'
+    exit 1
 }

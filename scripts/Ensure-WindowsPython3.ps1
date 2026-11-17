@@ -114,7 +114,15 @@ function Test-WindowsPythonCommand {
             $prefix = @($Command[1..($Command.Length - 1)])
         }
         $out = & $exe @prefix -c "import sqlite3; print('ok')" 2>$null
-        return ($LASTEXITCODE -eq 0 -and ("$out").Trim() -eq 'ok')
+        if (("$out").Trim() -ne 'ok') {
+            return $false
+        }
+        # Some hosts leave $LASTEXITCODE $null after a successful native call;
+        # $null -eq 0 is False and would falsely reject a working Python.
+        if ($null -eq $LASTEXITCODE) {
+            return $true
+        }
+        return ([int]$LASTEXITCODE -eq 0)
     }
     catch {
         return $false
@@ -298,7 +306,12 @@ try {
 
     Write-Host ("OK: Windows Python 3 available ({0})" -f ($python -join ' '))
     if ($PassThru) {
-        ,$python
+        # Emit a flat string[] (e.g. 'python' or 'py','-3'). A unary-comma
+        # wrap becomes System.Object[] after @( & ... ) and breaks Convert.
+        foreach ($part in @($python)) {
+            [string]$part
+        }
+        return
     }
     exit 0
 }
@@ -309,6 +322,9 @@ catch {
             Invoke-EnsurePythonFailure -ErrorRecord $_ -Context 'Ensure-WindowsPython3 failed'
         }
         catch { }
+    }
+    if ($PassThru) {
+        throw
     }
     exit 1
 }

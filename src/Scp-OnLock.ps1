@@ -370,10 +370,29 @@ function Test-ScpAuthFailure {
         ($StdErr -match '(?i)UNPROTECTED PRIVATE KEY')
 }
 
+function Get-ScpVerboseExitStatus {
+    <#
+      Parse "debug1: Exit status N" from scp -v stderr (authoritative when
+      Start-Process ExitCode is missing/wrong on Windows).
+    #>
+    param([string]$StdErr = '')
+
+    if ([string]::IsNullOrWhiteSpace($StdErr)) {
+        return $null
+    }
+    if ($StdErr -match '(?im)debug1:\s*Exit status\s+(\d+)') {
+        return [int]$Matches[1]
+    }
+    if ($StdErr -match '(?im)(?:^|\n)Exit status\s+(\d+)') {
+        return [int]$Matches[1]
+    }
+    return $null
+}
+
 function Test-ScpCopyFailed {
     <#
-      True when scp exit code is non-zero/unknown, or stderr shows auth/key failure
-      even if ExitCode was mis-read as 0 (Windows Start-Process quirk).
+      True when scp failed. Prefers verbose "Exit status N" from stderr when
+      Start-Process ExitCode is -1/null (common on Windows with redirects).
     #>
     param(
         [AllowNull()]$ExitCode,
@@ -382,14 +401,20 @@ function Test-ScpCopyFailed {
     )
 
     if ($TimedOut) { return $true }
+    if (Test-ScpAuthFailure -StdErr $StdErr) { return $true }
+
+    $verboseExit = Get-ScpVerboseExitStatus -StdErr $StdErr
+    if ($null -ne $verboseExit) {
+        return ($verboseExit -ne 0)
+    }
+
     if ($null -eq $ExitCode) { return $true }
     try {
-        if ([int]$ExitCode -ne 0) { return $true }
+        return ([int]$ExitCode -ne 0)
     }
     catch {
         return $true
     }
-    return (Test-ScpAuthFailure -StdErr $StdErr)
 }
 
 function Add-ScpCommonSshOptions {
@@ -1252,9 +1277,17 @@ function New-BHistoryCsvExports {
                         $leaf, $outPath)
                 # Capture success-stream noise from Convert/Python so it does not
                 # pollute this function's return value.
+                # Avoid stale LASTEXITCODE from prior native commands in this runspace
+                # ([int]$null is 0, but a leftover 1 falsely marks Convert as failed).
+                $global:LASTEXITCODE = 0
                 $convertOut = @(& $convertScript -InputPath ([string]$dbPath) `
                         -OutputPath $outPath -PreviousDays 1 2>&1)
-                $convertExit = [int]$LASTEXITCODE
+                if ($null -eq $LASTEXITCODE) {
+                    $convertExit = 0
+                }
+                else {
+                    $convertExit = [int]$LASTEXITCODE
+                }
                 foreach ($line in $convertOut) {
                     $text = [string]$line
                     if (-not [string]::IsNullOrWhiteSpace($text)) {
@@ -1659,7 +1692,13 @@ function Invoke-ScpLogCopyOnLock {
                 }
                 return
             }
-            if ($exitCode -ne 0) {
+            # Prefer scp -v "Exit status N" when Start-Process ExitCode is -1/wrong.
+            $scpFailed = Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false
+            $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+            if ($null -ne $verboseExit) {
+                $exitCode = $verboseExit
+            }
+            if ($scpFailed) {
                 $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `
                         $exitCode, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
                 $badKeyAcl = '(?i)UNPROTECTED PRIVATE KEY|bad permissions|' +
@@ -1918,10 +1957,13 @@ function Invoke-ScpBHistoryCopy {
                     }
                     continue
                 }
-                if ([int]$run.ExitCode -ne 0) {
+                if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+                    $reportedExit = $run.ExitCode
+                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
                     Write-LoggerEvent -Level WARN -Message (
                         "SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
-                            $batch.Name, $run.ExitCode, ($batchFiles -join '; '), ("$stderr").Trim())
+                            $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
                     if ($batch.Name -eq 'BHistory') {
                         $script:LastBHistoryScpSucceeded = $false
                         foreach ($bf in $batchFiles) {
