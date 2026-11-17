@@ -540,8 +540,13 @@ function Get-BHistoryInstallRootPaths {
     )
     foreach ($glob in $uninstallGlobs) {
         Get-ItemProperty -Path $glob -ErrorAction SilentlyContinue | ForEach-Object {
-            $display = [string]$_.DisplayName
-            $install = [string]$_.InstallLocation
+            # StrictMode: many Uninstall keys omit DisplayName / InstallLocation.
+            $display = ''
+            $install = ''
+            $dnProp = $_.PSObject.Properties['DisplayName']
+            $ilProp = $_.PSObject.Properties['InstallLocation']
+            if ($null -ne $dnProp) { $display = [string]$dnProp.Value }
+            if ($null -ne $ilProp) { $install = [string]$ilProp.Value }
             if ([string]::IsNullOrWhiteSpace($display) -or [string]::IsNullOrWhiteSpace($install)) {
                 return
             }
