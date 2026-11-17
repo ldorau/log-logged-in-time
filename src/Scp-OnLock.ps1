@@ -696,6 +696,48 @@ function Add-BHistoryProductRootFromPreferredHistory {
     Add-BHistoryRootPath -Accumulator $Accumulator -Path (Split-Path -Parent $profileDir)
 }
 
+function Add-BHistoryProfileSource {
+    <#
+      Append one History DB to $Sources when the file exists (dedupe path/leaf).
+    #>
+    param(
+        # AllowEmptyCollection: a new List[object] is empty on first add.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Sources,
+
+        [Parameter(Mandatory)]$SeenHist,
+        [Parameter(Mandatory)]$UsedLeaves,
+        [Parameter(Mandatory)][string]$StagePrefix,
+        [string]$HistPath,
+        [Parameter(Mandatory)][string]$ProfileName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HistPath)) { return }
+    if (-not (Test-Path -LiteralPath $HistPath -PathType Leaf)) { return }
+    try {
+        $full = [System.IO.Path]::GetFullPath($HistPath)
+    }
+    catch {
+        $full = $HistPath
+    }
+    if (-not $SeenHist.Add($full)) { return }
+
+    $safe = Get-BHistoryStageLeafSafeName -Name $ProfileName
+    $leaf = '{0}-{1}' -f $StagePrefix, $safe
+    if (-not $UsedLeaves.Add($leaf)) {
+        $n = 2
+        while (-not $UsedLeaves.Add(('{0}-{1}' -f $leaf, $n))) {
+            $n++
+        }
+        $leaf = '{0}-{1}' -f $leaf, $n
+    }
+    $Sources.Add([pscustomobject]@{
+            Path      = $full
+            StageLeaf = $leaf
+        })
+}
+
 function Get-ProfileHistorySourcesFromRoots {
     <#
       Scan product/User Data roots for profile History DBs.
@@ -715,45 +757,24 @@ function Get-ProfileHistorySourcesFromRoots {
     $usedLeaves = New-Object 'System.Collections.Generic.HashSet[string]' `
         ([StringComparer]::OrdinalIgnoreCase)
 
-    $addHist = {
-        param([string]$HistPath, [string]$ProfileName)
-        if ([string]::IsNullOrWhiteSpace($HistPath)) { return }
-        if (-not (Test-Path -LiteralPath $HistPath -PathType Leaf)) { return }
-        try {
-            $full = [System.IO.Path]::GetFullPath($HistPath)
-        }
-        catch {
-            $full = $HistPath
-        }
-        if (-not $seenHist.Add($full)) { return }
-
-        $safe = Get-BHistoryStageLeafSafeName -Name $ProfileName
-        $leaf = '{0}-{1}' -f $StagePrefix, $safe
-        if (-not $usedLeaves.Add($leaf)) {
-            $n = 2
-            while (-not $usedLeaves.Add(('{0}-{1}' -f $leaf, $n))) {
-                $n++
-            }
-            $leaf = '{0}-{1}' -f $leaf, $n
-        }
-        $sources.Add([pscustomobject]@{
-                Path      = $full
-                StageLeaf = $leaf
-            })
-    }
-
     foreach ($root in @($Roots)) {
         if ([string]::IsNullOrWhiteSpace([string]$root)) { continue }
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
 
         if ($IncludeRootHistory) {
-            & $addHist (Join-Path $root 'History') 'Default'
+            Add-BHistoryProfileSource -Sources $sources -SeenHist $seenHist `
+                -UsedLeaves $usedLeaves -StagePrefix $StagePrefix `
+                -HistPath (Join-Path $root 'History') -ProfileName 'Default'
         }
 
-        Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                & $addHist (Join-Path $_.FullName 'History') ([string]$_.Name)
-            }
+        $profileDirs = @(Get-ChildItem -LiteralPath $root -Directory -Force `
+                -ErrorAction SilentlyContinue)
+        foreach ($dir in $profileDirs) {
+            Add-BHistoryProfileSource -Sources $sources -SeenHist $seenHist `
+                -UsedLeaves $usedLeaves -StagePrefix $StagePrefix `
+                -HistPath (Join-Path $dir.FullName 'History') `
+                -ProfileName ([string]$dir.Name)
+        }
     }
 
     return $sources.ToArray()
@@ -959,6 +980,13 @@ function New-ScpBHistoryUploadFiles {
 
     # Do not wrap List[object] with @(): PowerShell throws "Argument types do
     # not match" when the list holds PSCustomObject rows (breaks all staging).
+    $stageDir = Join-Path $env:TEMP ('LoginTimeLogger-bhist-' + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    }
+    catch {
+        $stageDir = $env:TEMP
+    }
     foreach ($src in $sources) {
         $sourcePath = [string]$src.Path
         $leaf = [string]$src.StageLeaf
@@ -968,16 +996,20 @@ function New-ScpBHistoryUploadFiles {
         if (-not (Test-Path -LiteralPath $sourcePath)) {
             continue
         }
-        $stagedPath = Join-Path $env:TEMP $leaf
+        $stagedPath = Join-Path $stageDir $leaf
         if (Test-Path -LiteralPath $stagedPath) {
             Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
         }
         if (Copy-FileWithSharedRead -SourcePath $sourcePath -DestinationPath $stagedPath) {
             $staged.Add($stagedPath)
         }
+        else {
+            Write-BHistoryCsvEvent -Level WARN -Message (
+                'BHistory stage failed (shared-read copy): {0} -> {1}' -f $sourcePath, $stagedPath)
+        }
     }
-    # Do not wrap with unary comma: callers use @(); a wrapped empty array
-    # becomes one empty-string element and breaks -Files binding.
+    # Callers must wrap with @() WITHOUT piping first (a single string return is
+    # character-enumerated by Where-Object/ForEach-Object in Windows PowerShell).
     return [string[]]$staged.ToArray()
 }
 

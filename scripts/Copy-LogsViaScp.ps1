@@ -366,8 +366,12 @@ try {
         }
     }
     # Always stage raw History DBs (every log-history-op-* + log-history-ch-*).
-    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    # Important: wrap with @() first; do NOT pipe the bare return into
+    # Where-Object (a single path string is enumerated as characters in WinPS).
+    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername))
+    $bHistoryStaged = @($bHistoryStaged | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_))
+        })
     $bHistoryOpStaged = @($bHistoryStaged | Where-Object {
             $leaf = Split-Path -Leaf ([string]$_)
             ($leaf -eq 'log-history-op') -or ($leaf -like 'log-history-op-*')

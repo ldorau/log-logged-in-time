@@ -560,8 +560,12 @@ try {
             Write-Check -Name 'Fallback probe file' -Ok $true -Detail $probePath
         }
     }
-    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    # Wrap with @() first; do not pipe the bare return into Where-Object (WinPS
+    # character-enumerates a single path string).
+    $bHistoryStaged = @(New-ScpBHistoryUploadFiles -TargetUsername ([string]$cfg.TargetUsername))
+    $bHistoryStaged = @($bHistoryStaged | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_))
+        })
     if ($bHistoryStaged.Count -gt 0) {
         foreach ($staged in $bHistoryStaged) {
             $fileList.Add([string]$staged)
