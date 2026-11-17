@@ -847,15 +847,14 @@ function New-BHistoryCsvExports {
                 continue
             }
             $outPath = Join-Path $bhistDir ('{0}-{1}.csv' -f $leaf, $day)
+            $convertExit = -1
             try {
                 Write-BHistoryCsvEvent -Message (
                     "BHistory CSV: converting {0} -> {1} (-PreviousDays 1)" -f $leaf, $outPath)
                 # Capture success-stream noise from Convert/Python so it does not
                 # pollute this function's return value.
-                # -NoFatalAlert: monitor interval must not SMTP-spam on every
-                # failed convert (missing Python, empty DB, etc.).
                 $convertOut = @(& $convertScript -InputPath ([string]$dbPath) `
-                        -OutputPath $outPath -PreviousDays 1 -NoFatalAlert 2>&1)
+                        -OutputPath $outPath -PreviousDays 1 2>&1)
                 $convertExit = [int]$LASTEXITCODE
                 foreach ($line in $convertOut) {
                     $text = [string]$line
@@ -874,6 +873,15 @@ function New-BHistoryCsvExports {
             }
             if (Test-Path -LiteralPath $outPath) {
                 $csvPaths.Add((Get-Item -LiteralPath $outPath -Force).FullName)
+            }
+            elseif ($convertExit -ne 0) {
+                Write-BHistoryCsvEvent -Level WARN -Message (
+                    'BHistory CSV: no output file after failed convert: {0}' -f $outPath)
+            }
+            else {
+                # 0 visit rows for -PreviousDays 1: Convert exits 0 and omits the CSV by design.
+                Write-BHistoryCsvEvent -Message (
+                    'BHistory CSV: no rows for -PreviousDays 1 (CSV not written): {0}' -f $outPath)
             }
         }
 
