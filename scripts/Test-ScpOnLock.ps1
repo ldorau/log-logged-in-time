@@ -295,9 +295,23 @@ function Invoke-ScpCopyForTest {
     }
     $remoteTarget = '{0}@{1}:{2}' -f $Config.ScpUser, $Config.ScpHost, $remoteDir
 
+    $identityForScp = [string]$Config.ScpIdentityFile
+    $tempIdentity = $null
+    if (-not (Test-ScpRunningAsLocalSystem)) {
+        $tempIdentity = New-ScpIdentityCopyForCurrentUser -IdentityPath $identityForScp
+        if ([string]::IsNullOrWhiteSpace($tempIdentity)) {
+            throw ((
+                    "Cannot prepare a current-user-readable copy of ScpIdentityFile '{0}'. " +
+                    'The key is SYSTEM-hardened for the monitor; re-run elevated as an admin ' +
+                    'that can adjust the key ACL, or pass -GenerateIdentity.'
+                ) -f $identityForScp)
+        }
+        $identityForScp = $tempIdentity
+    }
+
     $argList = New-Object System.Collections.Generic.List[string]
     Add-ScpCommonSshOptions -ArgumentList $argList `
-        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -IdentityFile $identityForScp `
         -Port ([int]$Config.ScpPort) `
         -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
         -VerboseSsh
@@ -327,10 +341,14 @@ function Invoke-ScpCopyForTest {
         if ($run.TimedOut) {
             $stderr = (("timed out after {0}s (process killed)`r`n{1}" -f $timeoutSeconds, $stderr)).Trim()
         }
+        $exitCode = -1
+        if ($null -ne $run.ExitCode) {
+            $exitCode = [int]$run.ExitCode
+        }
         return [pscustomobject]@{
             ScpExe       = $scpExe
             RemoteTarget = $remoteTarget
-            ExitCode     = [int]$run.ExitCode
+            ExitCode     = $exitCode
             TimedOut     = [bool]$run.TimedOut
             StdOut       = $stdout
             StdErr       = $stderr
@@ -339,6 +357,10 @@ function Invoke-ScpCopyForTest {
     }
     finally {
         Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($tempIdentity) -and
+            (Test-Path -LiteralPath $tempIdentity)) {
+            Remove-Item -LiteralPath $tempIdentity -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -595,7 +617,8 @@ try {
     Write-ScpTestLine ''
     Write-ScpTestLine 'Step 4: scp copy (same options as monitor, plus -v)' -ForegroundColor Cyan
     $copyResult = Invoke-ScpCopyForTest -Config $runtimeCfg -Files $files
-    $ok = ($copyResult.ExitCode -eq 0)
+    $ok = -not (Test-ScpCopyFailed -ExitCode $copyResult.ExitCode `
+            -StdErr ([string]$copyResult.StdErr) -TimedOut ([bool]$copyResult.TimedOut))
     Write-Check -Name 'scp exit code' -Ok $ok -Detail ("{0} -> {1}" -f $copyResult.ExitCode, $copyResult.RemoteTarget)
 
     if (-not $ok) {

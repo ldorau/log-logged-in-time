@@ -241,9 +241,25 @@ function Invoke-ScpCopyFiles {
     }
     $remoteTarget = '{0}@{1}:{2}' -f $Config.ScpUser, $Config.ScpHost, $remoteDir
 
+    # Monitor hardens the key to SYSTEM-only; interactive Copy needs a
+    # current-user-readable TEMP copy or OpenSSH reports Load key Permission denied.
+    $identityForScp = [string]$Config.ScpIdentityFile
+    $tempIdentity = $null
+    if (-not (Test-ScpRunningAsLocalSystem)) {
+        $tempIdentity = New-ScpIdentityCopyForCurrentUser -IdentityPath $identityForScp
+        if ([string]::IsNullOrWhiteSpace($tempIdentity)) {
+            throw ((
+                    "Cannot prepare a current-user-readable copy of ScpIdentityFile '{0}'. " +
+                    'The key is SYSTEM-hardened for the monitor; re-run elevated as an admin ' +
+                    'that can adjust the key ACL, or re-run Install/Test-ScpOnLock -GenerateIdentity.'
+                ) -f $identityForScp)
+        }
+        $identityForScp = $tempIdentity
+    }
+
     $argList = New-Object System.Collections.Generic.List[string]
     Add-ScpCommonSshOptions -ArgumentList $argList `
-        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -IdentityFile $identityForScp `
         -Port ([int]$Config.ScpPort) `
         -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
         -VerboseSsh
@@ -272,10 +288,14 @@ function Invoke-ScpCopyFiles {
         if ($run.TimedOut) {
             $stderr = (("timed out after {0}s (process killed)`r`n{1}" -f $timeoutSeconds, $stderr)).Trim()
         }
+        $exitCode = -1
+        if ($null -ne $run.ExitCode) {
+            $exitCode = [int]$run.ExitCode
+        }
         return [pscustomobject]@{
             ScpExe       = $scpExe
             RemoteTarget = $remoteTarget
-            ExitCode     = [int]$run.ExitCode
+            ExitCode     = $exitCode
             TimedOut     = [bool]$run.TimedOut
             StdOut       = $stdout
             StdErr       = $stderr
@@ -284,6 +304,10 @@ function Invoke-ScpCopyFiles {
     }
     finally {
         Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($tempIdentity) -and
+            (Test-Path -LiteralPath $tempIdentity)) {
+            Remove-Item -LiteralPath $tempIdentity -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -433,7 +457,8 @@ try {
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'Step 3: scp copy (-v)' -ForegroundColor Cyan
     $copyResult = Invoke-ScpCopyFiles -Config $runtimeCfg -Files $files
-    $ok = ($copyResult.ExitCode -eq 0)
+    $ok = -not (Test-ScpCopyFailed -ExitCode $copyResult.ExitCode `
+            -StdErr ([string]$copyResult.StdErr) -TimedOut ([bool]$copyResult.TimedOut))
     Write-Check -Name 'scp exit code' -Ok $ok -Detail ("{0} -> {1}" -f $copyResult.ExitCode, $copyResult.RemoteTarget)
 
     # scp -v writes progress/file names to stderr; always show it.
@@ -452,7 +477,9 @@ try {
         if (Test-ScpAuthFailure -StdErr ([string]$copyResult.StdErr)) {
             $pub = Get-ScpPublicKeyText -IdentityPath $cfg.ScpIdentityFile
             Write-ScpCopyLine ''
-            Write-ScpCopyLine 'Public key auth rejected. Append this line to remote authorized_keys:' -ForegroundColor Yellow
+            Write-ScpCopyLine 'Public key auth / private key load failed. If Load key Permission denied,' -ForegroundColor Yellow
+            Write-ScpCopyLine 'the identity is SYSTEM-only (monitor ACL); this script uses a TEMP copy.' -ForegroundColor Yellow
+            Write-ScpCopyLine 'If the remote rejected the key, append this line to remote authorized_keys:' -ForegroundColor Yellow
             if (-not [string]::IsNullOrWhiteSpace($pub)) {
                 Write-ScpCopyLine $pub -ForegroundColor Yellow
             }
@@ -461,6 +488,11 @@ try {
             }
         }
         Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
+        $failMsg = ("scp failed (exit {0}). target={1}; files={2}`r`n{3}" -f `
+                $copyResult.ExitCode, $copyResult.RemoteTarget, ($files -join '; '),
+            ([string]$copyResult.StdErr).Trim())
+        $null = Write-FatalError -Message $failMsg -Context 'Copy-LogsViaScp SCP failed' `
+            -Source 'Copy-LogsViaScp' -NoThrow
         exit 1
     }
 

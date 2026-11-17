@@ -160,6 +160,80 @@ function Protect-ScpPrivateKeyFile {
     }
 }
 
+function Test-ScpRunningAsLocalSystem {
+    try {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        return ($null -ne $sid -and $sid.Value -eq 'S-1-5-18')
+    }
+    catch {
+        return $false
+    }
+}
+
+function New-ScpIdentityCopyForCurrentUser {
+    <#
+      Copy the SYSTEM-hardened private key to TEMP with an ACL that only the
+      current interactive user can read (OpenSSH requirement). Temporarily
+      grants the caller read on the source key, copies, then restores the
+      source ACL. Caller must delete the returned path when finished.
+      Returns '' on failure. Do not return from inside try/finally (PS 5.1
+      can drop that return value).
+    #>
+    param([Parameter(Mandatory)][string]$IdentityPath)
+
+    if ([string]::IsNullOrWhiteSpace($IdentityPath) -or
+        -not (Test-Path -LiteralPath $IdentityPath)) {
+        return ''
+    }
+
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $currentUser) {
+        return ''
+    }
+
+    $tmp = Join-Path $env:TEMP ('LoginTimeLogger-scp-id-' + [guid]::NewGuid().ToString('N'))
+    $aclOrig = $null
+    $result = ''
+    try {
+        $aclOrig = Get-Acl -LiteralPath $IdentityPath
+        $aclGrant = Get-Acl -LiteralPath $IdentityPath
+        $aclGrant.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $currentUser,
+                    [System.Security.AccessControl.FileSystemRights]::Read,
+                    [System.Security.AccessControl.AccessControlType]::Allow)))
+        Set-Acl -LiteralPath $IdentityPath -AclObject $aclGrant
+
+        Copy-Item -LiteralPath $IdentityPath -Destination $tmp -Force -ErrorAction Stop
+
+        $aclTmp = Get-Acl -LiteralPath $tmp
+        $aclTmp.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($aclTmp.Access)) {
+            $null = $aclTmp.RemoveAccessRule($rule)
+        }
+        $aclTmp.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $currentUser,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow)))
+        Set-Acl -LiteralPath $tmp -AclObject $aclTmp
+        $result = $tmp
+    }
+    catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        $result = ''
+    }
+    finally {
+        if ($null -ne $aclOrig) {
+            try {
+                Set-Acl -LiteralPath $IdentityPath -AclObject $aclOrig
+            }
+            catch {
+                try { Protect-ScpPrivateKeyFile -IdentityPath $IdentityPath } catch { }
+            }
+        }
+    }
+    return $result
+}
+
 function New-ScpIdentityKeyFile {
     <#
       Creates an ed25519 private key for SCP-on-lock when missing.
@@ -291,7 +365,31 @@ function Test-ScpAuthFailure {
         return $false
     }
     return ($StdErr -match '(?i)Permission denied \(publickey') -or
-        ($StdErr -match '(?i)No more authentication methods to try')
+        ($StdErr -match '(?i)No more authentication methods to try') -or
+        ($StdErr -match '(?i)Load key .+Permission denied') -or
+        ($StdErr -match '(?i)UNPROTECTED PRIVATE KEY')
+}
+
+function Test-ScpCopyFailed {
+    <#
+      True when scp exit code is non-zero/unknown, or stderr shows auth/key failure
+      even if ExitCode was mis-read as 0 (Windows Start-Process quirk).
+    #>
+    param(
+        [AllowNull()]$ExitCode,
+        [string]$StdErr = '',
+        [bool]$TimedOut = $false
+    )
+
+    if ($TimedOut) { return $true }
+    if ($null -eq $ExitCode) { return $true }
+    try {
+        if ([int]$ExitCode -ne 0) { return $true }
+    }
+    catch {
+        return $true
+    }
+    return (Test-ScpAuthFailure -StdErr $StdErr)
 }
 
 function Add-ScpCommonSshOptions {
@@ -423,9 +521,15 @@ function Invoke-ScpProcessWithTimeout {
         }
     }
 
+    # WaitForExit(ms) can return before ExitCode is populated; a follow-up
+    # WaitForExit() + Refresh is required. [int]$null is 0 in PowerShell, which
+    # falsely marks failed scp runs as success.
+    try { $null = $proc.WaitForExit() } catch { }
+    try { $proc.Refresh() } catch { }
+
     $code = -1
     try {
-        if ($proc.HasExited) {
+        if ($proc.HasExited -and $null -ne $proc.ExitCode) {
             $code = [int]$proc.ExitCode
         }
     }

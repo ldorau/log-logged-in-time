@@ -420,7 +420,9 @@ function Reset-LoginTimeLoggerOperationalLogs {
         }
     }
 
-    return ,$cleared.ToArray()
+    # Do not wrap with unary comma: callers use @() / -join and a wrapped
+    # array becomes one System.String[] element in the display string.
+    return [string[]]$cleared.ToArray()
 }
 
 function Write-ErrorLogFile {
