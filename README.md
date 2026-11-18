@@ -83,6 +83,12 @@ When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor also runs
 2. Immediately uploads a **0-byte** `LogDirectory\commands-empty\commands.txt` to overwrite the remote `commands.txt` (SCP failure is **FATAL**)
 3. Reads each non-empty, non-`#` line as `<command> [args…]`, logs a set `-x` style transcript under `LogDirectory\commands\commands-run-*.log`, and emails that transcript **inlined at the start of the body** (not as an attachment) only when the downloaded file is **non-empty** (size &gt; 0). Supported commands: `update` (force repo sync/publish), `restart` (restart the monitor), `reset` / `reset TIME` / `reset +TIME` / `reset -TIME` (same semantics as `Reset-CumulativeTime.ps1`). Then deletes the local download.
 
+List every remote command with arguments and description:
+
+```powershell
+.\scripts\Show-RemoteCommands.ps1
+```
+
 To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `unlocked-time-summary.csv`, and `state.json`):
 
 ```powershell
@@ -136,6 +142,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Status.ps1
 .\scripts\Get-LockedTime.ps1          # estimate locked/away time from log transitions
 .\scripts\Get-LockedTime.ps1 -AllDays
+.\scripts\Show-RemoteCommands.ps1     # list remote commands.txt verbs/args
 .\scripts\Reset-CumulativeTime.ps1              # set today's cumulative to 0
 .\scripts\Reset-CumulativeTime.ps1 01:30:00     # set to 1h30m
 .\scripts\Reset-CumulativeTime.ps1 +00:15:00    # add 15m

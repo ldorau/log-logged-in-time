@@ -1,0 +1,73 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Prints every remote commands.txt command with arguments and description.
+.DESCRIPTION
+  Documents the verbs the monitor accepts in ScpRemoteDirectory/commands.txt
+  (downloaded each 5-minute SCP cycle). One command per line; blank lines and
+  # comments are ignored. Does not contact the remote host.
+.EXAMPLE
+  .\scripts\Show-RemoteCommands.ps1
+#>
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$commands = @(
+    [pscustomobject]@{
+        Command     = 'update'
+        Arguments   = '(none)'
+        Description = 'Force-sync the update clone (git fetch + reset --hard), log git log -1 --oneline in the commands-run transcript, publish into Program Files when the installed commit changed, then restart the monitor. Always records HEAD after sync even when already up to date.'
+    }
+    [pscustomobject]@{
+        Command     = 'restart'
+        Arguments   = '(none)'
+        Description = 'Restart the LoginTimeLogger scheduled task (release mutex, delayed Start-ScheduledTask, exit). Runs after remote clear / email when queued with other commands; if update also runs and publishes, that restart covers it.'
+    }
+    [pscustomobject]@{
+        Command     = 'reset'
+        Arguments   = '(none)'
+        Description = 'Set today''s cumulative unlocked time (state.json UnlockedSecondsToday) to 0. Writes a CUMULATIVE_RESET line to the unlocked-time day log. Same semantics as Reset-CumulativeTime.ps1 with no TIME.'
+    }
+    [pscustomobject]@{
+        Command     = 'reset'
+        Arguments   = 'TIME'
+        Description = 'Set today''s cumulative unlocked time to TIME. TIME is HH:MM:SS (hours may exceed 24) or whole seconds (e.g. 01:30:00 or 5400). Logs CUMULATIVE_SET (or CUMULATIVE_RESET if TIME is 0).'
+    }
+    [pscustomobject]@{
+        Command     = 'reset'
+        Arguments   = '+TIME'
+        Description = 'Add TIME to today''s cumulative unlocked time. TIME is HH:MM:SS or whole seconds (e.g. +00:15:00 or +600). Logs CUMULATIVE_ADD.'
+    }
+    [pscustomobject]@{
+        Command     = 'reset'
+        Arguments   = '-TIME'
+        Description = 'Subtract TIME from today''s cumulative unlocked time (floored at 0). TIME is HH:MM:SS or whole seconds (e.g. -00:10:00 or -600). Logs CUMULATIVE_DEC.'
+    }
+)
+
+Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
+Write-Host 'File: ScpUser@ScpHost:ScpRemoteDirectory/commands.txt' -ForegroundColor DarkGray
+Write-Host 'Format: <command> [arg1] [arg2] ...' -ForegroundColor DarkGray
+Write-Host 'Ignored: blank lines and lines starting with #' -ForegroundColor DarkGray
+Write-Host ''
+
+$i = 0
+foreach ($c in $commands) {
+    $i++
+    Write-Host ('{0}. {1} {2}' -f $i, $c.Command, $c.Arguments) -ForegroundColor Yellow
+    Write-Host ('   {0}' -f $c.Description)
+    Write-Host ''
+}
+
+Write-Host 'Examples (remote commands.txt content):' -ForegroundColor Cyan
+Write-Host '  update'
+Write-Host '  restart'
+Write-Host '  reset'
+Write-Host '  reset 01:30:00'
+Write-Host '  reset +00:15:00'
+Write-Host '  reset -00:10:00'
+Write-Host '  update'
+Write-Host '  reset 0'
