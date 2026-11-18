@@ -2459,13 +2459,21 @@ function Invoke-ScpRemoteCommandsFile {
 function Send-ScpCommandsRunAlert {
     <#
       Email the commands run transcript (not treated as a failure).
-      commands-run-*.log is inlined at the start of the body (not attached).
+      Prefer Send-LoginTimeCommandsRunSmtpAlert (Common-Smtp) so update/publish
+      can reload that helper from disk before sending.
     #>
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$TraceLogPath,
         [Parameter(Mandatory)][string]$Body
     )
+
+    if (Get-Command Send-LoginTimeCommandsRunSmtpAlert -ErrorAction SilentlyContinue) {
+        return (Send-LoginTimeCommandsRunSmtpAlert `
+                -Config $Config `
+                -TraceLogPath $TraceLogPath `
+                -Body $Body)
+    }
 
     if (-not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
         return $false

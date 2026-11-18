@@ -371,18 +371,21 @@ function Send-LoginTimeSmtpAlert {
                 $attachmentNotes.Add(("attached: {0} ({1} bytes)" -f $full, $item.Length))
             }
 
-            # Mail clients often hide/block .log; attach service.log as *.txt.
+            # Mail clients often hide/block .log; attach as a real service.txt leaf name.
             if ([string]::Equals($item.Name, 'service.log', [StringComparison]::OrdinalIgnoreCase)) {
-                $txtPath = Join-Path $env:TEMP (
-                    'LoginTimeLogger-service-{0}.txt' -f [guid]::NewGuid().ToString('N'))
                 try {
+                    $txtDir = Join-Path $env:TEMP (
+                        'LoginTimeLogger-svc-{0}' -f [guid]::NewGuid().ToString('N'))
+                    New-Item -ItemType Directory -Path $txtDir -Force | Out-Null
+                    $txtPath = Join-Path $txtDir 'service.txt'
                     Copy-Item -LiteralPath $attachPath -Destination $txtPath -Force -ErrorAction Stop
                     $tempAttachments.Add($txtPath)
-                    $attachmentNotes.Add(('renamed for mail: service.log -> {0}' -f (Split-Path -Leaf $txtPath)))
+                    $tempAttachments.Add($txtDir)
+                    $attachmentNotes.Add('renamed for mail: service.log -> service.txt')
                     $attachPath = $txtPath
                 }
                 catch {
-                    $attachmentNotes.Add(('service.log .txt copy failed; attaching original: {0}' -f `
+                    $attachmentNotes.Add(('service.log -> service.txt copy failed; attaching original: {0}' -f `
                             $_.Exception.Message))
                 }
             }
@@ -438,7 +441,66 @@ function Send-LoginTimeSmtpAlert {
     }
     finally {
         foreach ($tmp in @($tempAttachments)) {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace($tmp)) { continue }
+            try {
+                if (Test-Path -LiteralPath $tmp -PathType Container) {
+                    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                else {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch { }
         }
     }
+}
+
+function Send-LoginTimeCommandsRunSmtpAlert {
+    <#
+      Commands.txt run alert: inline commands-run-*.log at the start of the body
+      and attach LogDirectory\service.log (sent as service.txt).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TraceLogPath,
+        [Parameter(Mandatory)][string]$Body
+    )
+
+    $traceText = ''
+    if (-not [string]::IsNullOrWhiteSpace($TraceLogPath) -and
+        (Test-Path -LiteralPath $TraceLogPath -PathType Leaf)) {
+        try {
+            $traceText = [string](Get-Content -LiteralPath $TraceLogPath -Raw -Encoding UTF8 `
+                    -ErrorAction Stop)
+        }
+        catch {
+            $traceText = ('(could not read trace log: {0})' -f $_.Exception.Message)
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($traceText)) {
+        $traceText = '(commands-run log empty or missing)'
+    }
+
+    $fullBody = @(
+        '--- commands-run log (set -x style) ---'
+        $traceText.TrimEnd()
+        '--- end commands-run log ---'
+        ''
+        $Body
+    ) -join [Environment]::NewLine
+
+    $attachments = New-Object System.Collections.Generic.List[string]
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        $svc = Join-Path ([string]$Config.LogDirectory) 'service.log'
+        if (Test-Path -LiteralPath $svc) {
+            $attachments.Add($svc)
+        }
+    }
+
+    $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmss')
+    return (Send-LoginTimeSmtpAlert `
+            -Subject 'Remote commands executed' `
+            -Body $fullBody `
+            -AlertKey ('scp-commands-ran-{0}' -f $stamp) `
+            -Attachment @($attachments))
 }

@@ -1309,6 +1309,90 @@ function Release-InstanceMutex {
     }
 }
 
+function Import-LoginTimeCommandsEmailHelpers {
+    <#
+      Re-dot-source Common-Smtp.ps1 from SourceRoot so a commands.txt "update"
+      email uses newly synced helpers (inline commands-run + service.txt) even
+      though this process still holds pre-publish function definitions.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot
+    )
+
+    $smtpPath = Join-Path $SourceRoot 'src\Common-Smtp.ps1'
+    if (-not (Test-Path -LiteralPath $smtpPath)) {
+        Write-LoggerEvent -Level WARN -Message (
+            "commands email helpers: Common-Smtp.ps1 not found at '{0}'" -f $smtpPath)
+        return $false
+    }
+
+    # Preserve SMTP init state across re-dot (Common-Smtp resets script vars).
+    $prevSmtpPath = $script:LoginTimeSmtpConfigPath
+    $prevSmtpCfg = $script:LoginTimeSmtpConfig
+    $prevCooldown = $script:LoginTimeSmtpCooldownPath
+    try {
+        . $smtpPath
+        if (-not [string]::IsNullOrWhiteSpace([string]$prevSmtpPath)) {
+            $script:LoginTimeSmtpConfigPath = $prevSmtpPath
+        }
+        if ($null -ne $prevSmtpCfg) {
+            $script:LoginTimeSmtpConfig = $prevSmtpCfg
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$prevCooldown)) {
+            $script:LoginTimeSmtpCooldownPath = $prevCooldown
+        }
+        Write-LoggerEvent ("commands email helpers: loaded '{0}'" -f $smtpPath)
+        return $true
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "commands email helpers: failed to load '{0}': {1}" -f $smtpPath, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Send-RemoteCommandsRunAlertAfterSync {
+    <#
+      After commands.txt update sync: reload Common-Smtp from disk, then send
+      the deferred commands-run email (inlined transcript + service.txt).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$SourceRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:ScpCommandsTraceLogPath) -or
+        [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsEmailBody)) {
+        return $false
+    }
+
+    $null = Import-LoginTimeCommandsEmailHelpers -SourceRoot $SourceRoot
+
+    if (Get-Command Send-LoginTimeCommandsRunSmtpAlert -ErrorAction SilentlyContinue) {
+        $trace = [string]$script:ScpCommandsTraceLogPath
+        $body = [string]$script:ScpCommandsEmailBody
+        if (Get-Command Write-ScpCommandsTrace -ErrorAction SilentlyContinue) {
+            Write-ScpCommandsTrace -LogPath $trace -Message (
+                'email: sending commands run transcript (post-sync helpers)')
+        }
+        $sent = Send-LoginTimeCommandsRunSmtpAlert `
+            -Config $Config `
+            -TraceLogPath $trace `
+            -Body $body
+        if (Get-Command Write-ScpCommandsTrace -ErrorAction SilentlyContinue) {
+            Write-ScpCommandsTrace -LogPath $trace -Message (
+                "email: sent={0}" -f [bool]$sent)
+        }
+        $script:ScpCommandsEmailBody = $null
+        return [bool]$sent
+    }
+
+    if (Get-Command Send-ScpCommandsDeferredRunAlert -ErrorAction SilentlyContinue) {
+        return [bool](Send-ScpCommandsDeferredRunAlert -Config $Config)
+    }
+    return $false
+}
+
 function Restart-LoginTimeLoggerProcess {
     param(
         [Parameter(Mandatory)][string]$ConfigPath,
@@ -1542,6 +1626,14 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 -UpdateState $updateState `
                 -StatePath $statePath `
                 -Config $Config
+            if ($fromRemoteCommands) {
+                try {
+                    $null = Send-RemoteCommandsRunAlertAfterSync `
+                        -Config $Config `
+                        -SourceRoot ([string]$Config.UpdateClonePath)
+                }
+                catch { }
+            }
             return
         }
 
@@ -1574,10 +1666,15 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
 
-        # Email commands transcript (includes post-sync git log) before restart.
-        if ($fromRemoteCommands -and
-            (Get-Command Send-ScpCommandsDeferredRunAlert -ErrorAction SilentlyContinue)) {
-            try { $null = Send-ScpCommandsDeferredRunAlert -Config $Config } catch { }
+        # Email commands transcript (includes post-sync git log) using helpers
+        # freshly loaded from the published install tree (not stale in-memory defs).
+        if ($fromRemoteCommands) {
+            try {
+                $null = Send-RemoteCommandsRunAlertAfterSync `
+                    -Config $Config `
+                    -SourceRoot $InstallRoot
+            }
+            catch { }
         }
 
         $gitLogNewText = '(git log -1 unavailable)'
