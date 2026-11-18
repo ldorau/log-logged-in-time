@@ -10,7 +10,8 @@ $script:LastBHistoryScpSucceeded = $false
 # Per staged leaf (log-history-op-<profile> / log-history-ch-<profile>): WriteUtc + Succeeded.
 $script:LastBHistoryStateByLeaf = @{}
 # Remote commands.txt "reset [[+|-]TIME]" adjustments applied by the monitor poll loop.
-$script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
+# Use ArrayList (not List[object]): @($list[object]) throws ArgumentException under PS 5.1 StrictMode.
+$script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
@@ -2169,9 +2170,9 @@ function Queue-RemoteCumulativeReset {
     )
 
     if ($null -eq $script:PendingCumulativeResets) {
-        $script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
+        $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
     }
-    $script:PendingCumulativeResets.Add($Spec)
+    [void]$script:PendingCumulativeResets.Add($Spec)
     Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
         "queue execute: reset mode={0} delta={1} tag={2}" -f `
             $Spec.Mode, $Spec.Label, $Spec.EventTag)
@@ -2192,8 +2193,8 @@ function Apply-PendingCumulativeResets {
         return $State
     }
 
-    $pending = @($script:PendingCumulativeResets)
-    $script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
+    $pending = @($script:PendingCumulativeResets.ToArray())
+    $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 
     $quotaMinutes = 30
     try {
@@ -2272,7 +2273,7 @@ function Invoke-ScpRemoteCommandsFile {
     $result = [pscustomobject]@{
         WantUpdate  = $false
         WantRestart = $false
-        ResetSpecs  = New-Object System.Collections.Generic.List[object]
+        ResetSpecs  = New-Object System.Collections.ArrayList
         RanAny      = $false
     }
 
@@ -2353,7 +2354,7 @@ function Invoke-ScpRemoteCommandsFile {
                 try {
                     $spec = New-RemoteCumulativeResetSpec -TimeArg $timeArg
                     $result.RanAny = $true
-                    $result.ResetSpecs.Add($spec)
+                    [void]$result.ResetSpecs.Add($spec)
                     Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
                         "queue execute: reset {0}" -f $(
                             if ([string]::IsNullOrWhiteSpace($timeArg)) { '(to 0)' } else { $timeArg }))
@@ -2381,6 +2382,7 @@ function Invoke-ScpRemoteCommandsFile {
 function Send-ScpCommandsRunAlert {
     <#
       Email the commands run transcript (not treated as a failure).
+      commands-run-*.log is inlined at the start of the body (not attached).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -2392,11 +2394,31 @@ function Send-ScpCommandsRunAlert {
         return $false
     }
 
+    $traceText = ''
+    if (-not [string]::IsNullOrWhiteSpace($TraceLogPath) -and
+        (Test-Path -LiteralPath $TraceLogPath -PathType Leaf)) {
+        try {
+            $traceText = [string](Get-Content -LiteralPath $TraceLogPath -Raw -Encoding UTF8 `
+                    -ErrorAction Stop)
+        }
+        catch {
+            $traceText = ('(could not read trace log: {0})' -f $_.Exception.Message)
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($traceText)) {
+        $traceText = '(commands-run log empty or missing)'
+    }
+
+    $fullBody = @(
+        '--- commands-run log (set -x style) ---'
+        $traceText.TrimEnd()
+        '--- end commands-run log ---'
+        ''
+        $Body
+    ) -join [Environment]::NewLine
+
     $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmss')
     $attachments = New-Object System.Collections.Generic.List[string]
-    if (Test-Path -LiteralPath $TraceLogPath) {
-        $attachments.Add($TraceLogPath)
-    }
     if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
         $svc = Join-Path ([string]$Config.LogDirectory) 'service.log'
         if (Test-Path -LiteralPath $svc) { $attachments.Add($svc) }
@@ -2404,7 +2426,7 @@ function Send-ScpCommandsRunAlert {
 
     return (Send-LoginTimeSmtpAlert `
             -Subject 'Remote commands executed' `
-            -Body $Body `
+            -Body $fullBody `
             -AlertKey ('scp-commands-ran-{0}' -f $stamp) `
             -Attachment @($attachments))
 }
@@ -2592,7 +2614,7 @@ function Invoke-ScpCommandsFileExchange {
     $cmdResult = [pscustomobject]@{
         WantUpdate  = $false
         WantRestart = $false
-        ResetSpecs  = New-Object System.Collections.Generic.List[object]
+        ResetSpecs  = New-Object System.Collections.ArrayList
         RanAny      = $false
     }
     if ($downloaded -and -not $remoteMissing) {
@@ -2612,7 +2634,12 @@ function Invoke-ScpCommandsFileExchange {
     }
 
     $resetCount = 0
-    try { $resetCount = @($cmdResult.ResetSpecs).Count } catch { $resetCount = 0 }
+    try {
+        if ($null -ne $cmdResult.ResetSpecs) {
+            $resetCount = [int]$cmdResult.ResetSpecs.Count
+        }
+    }
+    catch { $resetCount = 0 }
 
     # Email transcript before delete / terminating actions.
     $emailBody = @(
@@ -2626,8 +2653,6 @@ function Invoke-ScpCommandsFileExchange {
         ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
         ('WantRestart: {0}' -f $cmdResult.WantRestart)
         ('ResetCount: {0}' -f $resetCount)
-        ''
-        'See attached commands-run log (set -x style).'
     ) -join [Environment]::NewLine
 
     # Email only when a non-empty commands.txt was downloaded (skip missing/0-byte).
@@ -2664,7 +2689,21 @@ function Invoke-ScpCommandsFileExchange {
 
     # Deferred actions (after remote clear + email + local delete).
     # reset: queue for the monitor poll loop (applies to live $state before Write-State).
-    foreach ($spec in @($cmdResult.ResetSpecs)) {
+    # Do not wrap List[object] in @(...): that throws ArgumentException under PS 5.1 StrictMode.
+    $resetSpecsEnum = @()
+    if ($null -ne $cmdResult.PSObject.Properties['ResetSpecs'] -and $null -ne $cmdResult.ResetSpecs) {
+        if ($cmdResult.ResetSpecs -is [System.Collections.ArrayList] -or
+            $cmdResult.ResetSpecs -is [System.Array]) {
+            $resetSpecsEnum = @($cmdResult.ResetSpecs)
+        }
+        elseif ($cmdResult.ResetSpecs.PSObject.Methods['ToArray']) {
+            $resetSpecsEnum = @($cmdResult.ResetSpecs.ToArray())
+        }
+        else {
+            $resetSpecsEnum = @($cmdResult.ResetSpecs)
+        }
+    }
+    foreach ($spec in $resetSpecsEnum) {
         if ($null -eq $spec) { continue }
         try {
             Queue-RemoteCumulativeReset -Spec $spec -TraceLogPath $traceLogPath
