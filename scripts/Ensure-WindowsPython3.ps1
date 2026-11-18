@@ -141,6 +141,18 @@ function Find-WindowsPythonInstallPaths {
             $searchRoots.Add($pf)
         }
     }
+    # User-scoped installs (winget --scope user) live under C:\Users\<name>\...
+    # The SYSTEM monitor must still find them for BHistory CSV convert.
+    $usersRoot = Join-Path $env:SystemDrive 'Users'
+    if (Test-Path -LiteralPath $usersRoot) {
+        Get-ChildItem -LiteralPath $usersRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $candidate = Join-Path $_.FullName 'AppData\Local\Programs\Python'
+                if (Test-Path -LiteralPath $candidate) {
+                    $searchRoots.Add($candidate)
+                }
+            }
+    }
 
     foreach ($root in $searchRoots) {
         Get-ChildItem -LiteralPath $root -Directory -Filter 'Python*' -ErrorAction SilentlyContinue |
@@ -161,7 +173,23 @@ function Find-WindowsPythonInstallPaths {
     return @($paths)
 }
 
+function Test-RunningAsLocalSystemOrAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -ne $id -and $null -ne $id.User -and $id.User.Value -eq 'S-1-5-18') {
+            return $true
+        }
+        $principal = New-Object Security.Principal.WindowsPrincipal($id)
+        return [bool]$principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Resolve-WindowsPythonLauncher {
+    Update-ProcessPathFromMachineAndUser
     $candidates = @(
         ,@( 'python3' )
         ,@( 'python' )
@@ -203,9 +231,15 @@ function Install-WindowsPython3 {
             $logLines.Add(("winget install {0} ..." -f $id))
             Write-Host ("Installing Python via winget ({0})..." -f $id)
             try {
+                # Prefer machine scope when elevated/SYSTEM so the monitor can
+                # find Python; user scope is invisible to NT AUTHORITY\SYSTEM.
+                $wingetScope = 'user'
+                if (Test-RunningAsLocalSystemOrAdmin) {
+                    $wingetScope = 'machine'
+                }
                 $wingetArgs = @(
                     'install', '-e', '--id', $id,
-                    '--scope', 'user',
+                    '--scope', $wingetScope,
                     '--accept-package-agreements',
                     '--accept-source-agreements',
                     '--disable-interactivity'
@@ -280,6 +314,7 @@ function Install-WindowsPython3 {
 
 try {
     Write-Host 'Checking for Windows Python 3 (python3 / python / py -3)...'
+    Update-ProcessPathFromMachineAndUser
     $python = Resolve-WindowsPythonLauncher
     if ($null -eq $python) {
         Write-Host 'Windows Python 3 not found.'

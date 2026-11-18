@@ -1307,10 +1307,16 @@ function New-BHistoryCsvExports {
     param([Parameter(Mandatory)]$Config)
 
     $csvPaths = New-Object System.Collections.Generic.List[string]
+    $convertFailures = New-Object System.Collections.Generic.List[string]
     $convertScript = Resolve-ConvertLogBhToCsvScript
     if ([string]::IsNullOrWhiteSpace($convertScript)) {
         Write-BHistoryCsvEvent -Level WARN -Message (
             'BHistory CSV: Convert-LogBhToCsv.ps1 not found under install/repo scripts.')
+        $null = Send-LoginTimeLoggerFailureAlert `
+            -Subject 'BHistory CSV convert failed' `
+            -Body 'Convert-LogBhToCsv.ps1 not found under install/repo scripts.' `
+            -AlertKey 'bhist-csv-convert-failed' `
+            -Config $Config
         return [string[]]@()
     }
 
@@ -1332,6 +1338,7 @@ function New-BHistoryCsvExports {
         if ($staged.Count -eq 0) {
             Write-BHistoryCsvEvent -Level WARN -Message (
                 'BHistory CSV: no History DB could be staged for conversion.')
+            $convertFailures.Add('no History DB could be staged for conversion')
         }
 
         foreach ($dbPath in $staged) {
@@ -1352,35 +1359,57 @@ function New-BHistoryCsvExports {
                 # Avoid stale LASTEXITCODE from prior native commands in this runspace
                 # ([int]$null is 0, but a leftover 1 falsely marks Convert as failed).
                 $global:LASTEXITCODE = 0
-                $convertOut = @(& $convertScript -InputPath ([string]$dbPath) `
-                        -OutputPath $outPath -PreviousDays 1 2>&1)
+                $convertParams = @{
+                    InputPath    = [string]$dbPath
+                    OutputPath   = $outPath
+                    PreviousDays = 1
+                }
+                $runtimeConfigPath = ''
+                if ($Config -and $Config.PSObject.Properties['ConfigPath'] -and
+                    -not [string]::IsNullOrWhiteSpace([string]$Config.ConfigPath)) {
+                    $runtimeConfigPath = [string]$Config.ConfigPath
+                    $convertParams['ConfigPath'] = $runtimeConfigPath
+                }
+                $convertOut = @(& $convertScript @convertParams 2>&1)
                 if ($null -eq $LASTEXITCODE) {
                     $convertExit = 0
                 }
                 else {
                     $convertExit = [int]$LASTEXITCODE
                 }
+                $convertDetail = New-Object System.Collections.Generic.List[string]
                 foreach ($line in $convertOut) {
                     $text = [string]$line
-                    if (-not [string]::IsNullOrWhiteSpace($text)) {
-                        Write-BHistoryCsvEvent -Message $text
+                    if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                    Write-BHistoryCsvEvent -Message $text
+                    if ($convertDetail.Count -lt 12) {
+                        $convertDetail.Add($text.Trim())
                     }
                 }
                 if ($convertExit -ne 0) {
-                    Write-BHistoryCsvEvent -Level WARN -Message (
-                        'BHistory CSV convert failed for {0} (exit {1}).' -f $leaf, $convertExit)
+                    $detailSuffix = ''
+                    if ($convertDetail.Count -gt 0) {
+                        $detailSuffix = (' Detail: {0}' -f ($convertDetail -join ' | '))
+                    }
+                    $failLine = ('BHistory CSV convert failed for {0} (exit {1}).{2}' -f `
+                            $leaf, $convertExit, $detailSuffix)
+                    Write-BHistoryCsvEvent -Level WARN -Message $failLine
+                    $convertFailures.Add($failLine)
                 }
             }
             catch {
-                Write-BHistoryCsvEvent -Level WARN -Message (
-                    'BHistory CSV convert error for {0}: {1}' -f $leaf, $_.Exception.Message)
+                $failLine = ('BHistory CSV convert error for {0}: {1}' -f `
+                        $leaf, $_.Exception.Message)
+                Write-BHistoryCsvEvent -Level WARN -Message $failLine
+                $convertFailures.Add($failLine)
             }
             if (Test-Path -LiteralPath $outPath) {
                 $csvPaths.Add((Get-Item -LiteralPath $outPath -Force).FullName)
             }
             elseif ($convertExit -ne 0) {
-                Write-BHistoryCsvEvent -Level WARN -Message (
-                    'BHistory CSV: no output file after failed convert: {0}' -f $outPath)
+                $failLine = ('BHistory CSV: no output file after failed convert: {0}' -f $outPath)
+                Write-BHistoryCsvEvent -Level WARN -Message $failLine
+                $convertFailures.Add($failLine)
             }
             else {
                 # 0 visit rows for -PreviousDays 1: Convert exits 0 and omits the CSV by design.
@@ -1413,6 +1442,18 @@ function New-BHistoryCsvExports {
             'BHistory CSV: {0} file(s) ready for SCP upload for {1}: {2}' -f `
                 $csvPaths.Count, $day, (
                 ($csvPaths | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))
+
+        if ($convertFailures.Count -gt 0) {
+            $body = @(
+                ('BHistory CSV convert failures ({0}):' -f $convertFailures.Count)
+                ''
+            ) + @($convertFailures)
+            $null = Send-LoginTimeLoggerFailureAlert `
+                -Subject 'BHistory CSV convert failed' `
+                -Body ($body -join [Environment]::NewLine) `
+                -AlertKey 'bhist-csv-convert-failed' `
+                -Config $Config
+        }
     }
     finally {
         foreach ($tempCopy in @($staged)) {
@@ -1589,12 +1630,16 @@ function Get-ScpManualSourceFiles {
     return @($files)
 }
 
-function Send-ScpOnLockFailureAlert {
+function Send-LoginTimeLoggerFailureAlert {
     <#
-      Emails an SCP-on-lock failure with local error/service logs attached (when SMTP enabled).
+      Emails a monitor failure with errors.log / service.log attached (when SMTP
+      is enabled). Used for SCP-on-lock, SCP BHistory/daily, and BHistory CSV
+      convert failures.
     #>
     param(
+        [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][string]$AlertKey,
         [Parameter(Mandatory)]$Config,
         [string]$ErrorLogPath = '',
         [string[]]$ExtraAttachment = @()
@@ -1624,10 +1669,30 @@ function Send-ScpOnLockFailureAlert {
     }
 
     return (Send-LoginTimeSmtpAlert `
+            -Subject $Subject `
+            -Body $Body `
+            -AlertKey $AlertKey `
+            -Attachment @($attachments))
+}
+
+function Send-ScpOnLockFailureAlert {
+    <#
+      Emails an SCP-on-lock failure with local error/service logs attached (when SMTP enabled).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)]$Config,
+        [string]$ErrorLogPath = '',
+        [string[]]$ExtraAttachment = @()
+    )
+
+    return (Send-LoginTimeLoggerFailureAlert `
             -Subject 'SCP on lock failed' `
             -Body $Body `
             -AlertKey 'scp-on-lock-failed' `
-            -Attachment @($attachments))
+            -Config $Config `
+            -ErrorLogPath $ErrorLogPath `
+            -ExtraAttachment $ExtraAttachment)
 }
 
 function Invoke-ScpLogCopyOnLock {
@@ -2016,9 +2081,9 @@ function Invoke-ScpBHistoryCopy {
                 }
 
                 if ($run.TimedOut) {
-                    Write-LoggerEvent -Level WARN -Message (
-                        "SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
+                    $msg = ("SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
                             $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
+                    Write-LoggerEvent -Level WARN -Message $msg
                     if ($batch.Name -eq 'BHistory') {
                         $script:LastBHistoryScpSucceeded = $false
                         foreach ($bf in $batchFiles) {
@@ -2029,15 +2094,34 @@ function Invoke-ScpBHistoryCopy {
                             }
                         }
                     }
+                    $diagPath = Join-Path $env:TEMP (
+                        'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                    try {
+                        @(
+                            $msg
+                            ''
+                            '--- scp stderr ---'
+                            ("$stderr").Trim()
+                        ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                        $null = Send-LoginTimeLoggerFailureAlert `
+                            -Subject 'SCP BHistory/daily failed' `
+                            -Body $msg `
+                            -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
+                            -Config $Config `
+                            -ExtraAttachment @($diagPath)
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                    }
                     continue
                 }
                 if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
                     $reportedExit = $run.ExitCode
                     $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
                     if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
-                    Write-LoggerEvent -Level WARN -Message (
-                        "SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
+                    $msg = ("SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
                             $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
+                    Write-LoggerEvent -Level WARN -Message $msg
                     if ($batch.Name -eq 'BHistory') {
                         $script:LastBHistoryScpSucceeded = $false
                         foreach ($bf in $batchFiles) {
@@ -2047,6 +2131,25 @@ function Invoke-ScpBHistoryCopy {
                                 Succeeded = $false
                             }
                         }
+                    }
+                    $diagPath = Join-Path $env:TEMP (
+                        'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                    try {
+                        @(
+                            $msg
+                            ''
+                            '--- scp stderr ---'
+                            ("$stderr").Trim()
+                        ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                        $null = Send-LoginTimeLoggerFailureAlert `
+                            -Subject 'SCP BHistory/daily failed' `
+                            -Body $msg `
+                            -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
+                            -Config $Config `
+                            -ExtraAttachment @($diagPath)
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
                     }
                     continue
                 }
@@ -2077,7 +2180,12 @@ function Invoke-ScpBHistoryCopy {
         if ($includeBHistory) {
             $script:LastBHistoryScpSucceeded = $false
         }
-        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
+        $details = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
             'SCP BHistory/daily failed')
+        $null = Send-LoginTimeLoggerFailureAlert `
+            -Subject 'SCP BHistory/daily failed' `
+            -Body ([string]$details) `
+            -AlertKey 'scp-bhist-daily-failed' `
+            -Config $Config
     }
 }
