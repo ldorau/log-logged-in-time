@@ -130,6 +130,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Status.ps1
 .\scripts\Get-LockedTime.ps1          # estimate locked/away time from log transitions
 .\scripts\Get-LockedTime.ps1 -AllDays
+.\scripts\Reset-CumulativeTime.ps1              # set today's cumulative to 0
+.\scripts\Reset-CumulativeTime.ps1 01:30:00     # set to 1h30m
+.\scripts\Reset-CumulativeTime.ps1 +00:15:00    # add 15m
+.\scripts\Reset-CumulativeTime.ps1 '-00:10:00'  # subtract 10m (quote the leading '-')
 .\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + summary + state
 ```
 
@@ -141,7 +145,7 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 
 | File | Contents |
 |------|----------|
-| `unlocked-time-YYYY-MM-DD.log` | Lock/unlock transitions, heartbeats, day total |
+| `unlocked-time-YYYY-MM-DD.log` | Lock/unlock transitions, heartbeats, day total, manual cumulative tags |
 | `unlocked-time-summary.csv` | One row per completed day |
 | `state.json` | Running total for the current day |
 | `service.log` | Monitor diagnostics |
@@ -150,7 +154,21 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 
 **`cumulative_today=`**  
 Total unlocked time **so far today** (current calendar day), as `HH:MM:SS`.  
-It appears on `UNLOCKED_ACTIVE`, `LOCKED_OR_AWAY`, and `HEARTBEAT` lines and grows while the session is unlocked.
+It appears on `UNLOCKED_ACTIVE`, `LOCKED_OR_AWAY`, `HEARTBEAT`, and manual cumulative tags below, and grows while the session is unlocked.
+
+**Event tags**
+
+| Tag | Meaning |
+|-----|--------|
+| `UNLOCKED_ACTIVE` / `LOCKED_OR_AWAY` | Session became unlocked-active or locked/away |
+| `HEARTBEAT` | Periodic status sample |
+| `DAY_TOTAL` | Closed total for the day that just ended |
+| `CUMULATIVE_RESET` | `Reset-CumulativeTime.ps1` set today's counter to 0 |
+| `CUMULATIVE_SET` | `Reset-CumulativeTime.ps1` set today's counter to an absolute time |
+| `CUMULATIVE_ADD` | `Reset-CumulativeTime.ps1` added (`+TIME`) |
+| `CUMULATIVE_DEC` | `Reset-CumulativeTime.ps1` subtracted (`-TIME`) |
+
+Manual cumulative lines also include `previous=` (value before the change) and `adjustment=` (requested delta or absolute).
 
 **`unlocked=`** — two different meanings by line type:
 
