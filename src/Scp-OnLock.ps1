@@ -2512,12 +2512,20 @@ function Send-ScpCommandsDeferredRunAlert {
     <#
       Send the pending commands-run email using script:ScpCommandsTraceLogPath /
       script:ScpCommandsEmailBody (set before a remote "update" that may restart).
+      Never sends when the downloaded commands.txt was empty (size=0).
     #>
     param([Parameter(Mandatory)]$Config)
 
     $trace = [string]$script:ScpCommandsTraceLogPath
     $body = [string]$script:ScpCommandsEmailBody
     if ([string]::IsNullOrWhiteSpace($trace) -or [string]::IsNullOrWhiteSpace($body)) {
+        return $false
+    }
+    if ($null -ne $script:ScpCommandsDownloadedBytes -and
+        [int64]$script:ScpCommandsDownloadedBytes -le 0) {
+        Write-ScpCommandsTrace -LogPath $trace -Message (
+            'email: skipped (downloaded commands.txt size=0)')
+        $script:ScpCommandsEmailBody = $null
         return $false
     }
     if (-not (Get-Command Send-ScpCommandsRunAlert -ErrorAction SilentlyContinue)) {
@@ -2588,6 +2596,7 @@ function Invoke-ScpCommandsFileExchange {
 
     $downloaded = $false
     $downloadedBytes = [int64]0
+    $script:ScpCommandsDownloadedBytes = [int64]0
     $remoteMissing = $false
 
     # --- GET remote commands.txt -> local inbox ---
@@ -2656,6 +2665,7 @@ function Invoke-ScpCommandsFileExchange {
             catch { }
             Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
                 "downloaded OK ({0} byte(s)) -> {1}" -f $downloadedBytes, $paths.InboxFile)
+            $script:ScpCommandsDownloadedBytes = $downloadedBytes
         }
     }
     finally {
@@ -2711,13 +2721,36 @@ function Invoke-ScpCommandsFileExchange {
         Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
     }
 
+    # Empty download: clear local inbox, never interpret or email.
+    if ($downloaded -and $downloadedBytes -le 0) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'email: skipped (downloaded commands.txt size=0)')
+        if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
+            try {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    "rm '{0}'" -f $paths.InboxFile)
+                Remove-Item -LiteralPath $paths.InboxFile -Force -ErrorAction Stop
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'rm: OK'
+            }
+            catch {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                    "rm failed: {0}" -f $_.Exception.Message)
+            }
+        }
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'
+        $script:ScpCommandsDownloadedBytes = $null
+        $script:ScpCommandsEmailBody = $null
+        $script:ScpCommandsTraceLogPath = $null
+        return
+    }
+
     $cmdResult = [pscustomobject]@{
         WantUpdate  = $false
         WantRestart = $false
         ResetSpecs  = New-Object System.Collections.ArrayList
         RanAny      = $false
     }
-    if ($downloaded -and -not $remoteMissing) {
+    if ($downloaded -and -not $remoteMissing -and $downloadedBytes -gt 0) {
         try {
             $cmdResult = Invoke-ScpRemoteCommandsFile `
                 -Config $Config `
