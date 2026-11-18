@@ -2465,6 +2465,7 @@ function Invoke-ScpCommandsFileExchange {
         "begin commands exchange; remote={0}; inbox={1}" -f $remoteFile, $paths.InboxFile)
 
     $downloaded = $false
+    $downloadedBytes = [int64]0
     $remoteMissing = $false
 
     # --- GET remote commands.txt -> local inbox ---
@@ -2524,15 +2525,15 @@ function Invoke-ScpCommandsFileExchange {
         }
         else {
             $downloaded = $true
-            $bytes = 0
+            $downloadedBytes = [int64]0
             try {
                 if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
-                    $bytes = [int64](Get-Item -LiteralPath $paths.InboxFile -Force).Length
+                    $downloadedBytes = [int64](Get-Item -LiteralPath $paths.InboxFile -Force).Length
                 }
             }
             catch { }
             Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                "downloaded OK ({0} byte(s)) -> {1}" -f $bytes, $paths.InboxFile)
+                "downloaded OK ({0} byte(s)) -> {1}" -f $downloadedBytes, $paths.InboxFile)
         }
     }
     finally {
@@ -2629,8 +2630,8 @@ function Invoke-ScpCommandsFileExchange {
         'See attached commands-run log (set -x style).'
     ) -join [Environment]::NewLine
 
-    # Email only when a remote file was downloaded (avoid 5-minute spam on missing).
-    if ($downloaded) {
+    # Email only when a non-empty commands.txt was downloaded (skip missing/0-byte).
+    if ($downloaded -and $downloadedBytes -gt 0) {
         try {
             Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'email: sending commands run transcript'
             $sent = Send-ScpCommandsRunAlert -Config $Config -TraceLogPath $traceLogPath -Body $emailBody
@@ -2641,6 +2642,10 @@ function Invoke-ScpCommandsFileExchange {
             Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
                 "email: failed: {0}" -f $_.Exception.Message)
         }
+    }
+    elseif ($downloaded -and $downloadedBytes -le 0) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'email: skipped (downloaded commands.txt size=0)')
     }
 
     # Delete downloaded commands.txt (always when present).

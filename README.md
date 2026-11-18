@@ -81,7 +81,7 @@ When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor also runs
 
 1. Downloads `ScpRemoteDirectory/commands.txt` → `LogDirectory\commands\commands.txt` (missing remote file is OK; any other SCP failure is **FATAL**)
 2. Immediately uploads a **0-byte** `LogDirectory\commands-empty\commands.txt` to overwrite the remote `commands.txt` (SCP failure is **FATAL**)
-3. Reads each non-empty, non-`#` line as `<command> [args…]`, logs a set `-x` style transcript under `LogDirectory\commands\commands-run-*.log`, and emails that log when a file was downloaded. Supported commands: `update` (force repo sync/publish), `restart` (restart the monitor), `reset` / `reset TIME` / `reset +TIME` / `reset -TIME` (same semantics as `Reset-CumulativeTime.ps1`). Then deletes the local download.
+3. Reads each non-empty, non-`#` line as `<command> [args…]`, logs a set `-x` style transcript under `LogDirectory\commands\commands-run-*.log`, and emails that log only when the downloaded file is **non-empty** (size &gt; 0). Supported commands: `update` (force repo sync/publish), `restart` (restart the monitor), `reset` / `reset TIME` / `reset +TIME` / `reset -TIME` (same semantics as `Reset-CumulativeTime.ps1`). Then deletes the local download.
 
 To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `unlocked-time-summary.csv`, and `state.json`):
 
