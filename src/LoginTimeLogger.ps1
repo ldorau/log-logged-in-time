@@ -1285,6 +1285,18 @@ while ($true) {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
                     'Unexpected SCP BHistory failure')
             }
+            # Remote commands.txt "reset [[+|-]TIME]" — apply to live state this poll.
+            if (Get-Command Apply-PendingCumulativeResets -ErrorAction SilentlyContinue) {
+                try {
+                    $state = Apply-PendingCumulativeResets -State $state -Config $config
+                    $state = ConvertTo-LoggerStateObject -State $state `
+                        -UnlockQuotaMinutes ([int]$config.UnlockQuotaMinutes)
+                }
+                catch {
+                    $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                        'Apply-PendingCumulativeResets failed')
+                }
+            }
         }
 
         Write-State -Path $statePath -State $state

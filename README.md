@@ -77,6 +77,12 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 
 When SCP-on-lock is enabled, Install and the daily self-update check also reconcile an outbound Windows Firewall **Allow** rule for `ScpHost:ScpPort` (`scripts/Allow-ScpOutboundFirewall.ps1`, prefix `SCP-Allow:`).
 
+When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor also runs a **5‑minute** cycle that uploads today’s unlocked-time log and browser-history CSVs. At the **end** of that cycle it:
+
+1. Downloads `ScpRemoteDirectory/commands.txt` → `LogDirectory\commands\commands.txt` (missing remote file is OK; any other SCP failure is **FATAL**)
+2. Immediately uploads a **0-byte** `LogDirectory\commands-empty\commands.txt` to overwrite the remote `commands.txt` (SCP failure is **FATAL**)
+3. Reads each non-empty, non-`#` line as `<command> [args…]`, logs a set `-x` style transcript under `LogDirectory\commands\commands-run-*.log`, and emails that log when a file was downloaded. Supported commands: `update` (force repo sync/publish), `restart` (restart the monitor), `reset` / `reset TIME` / `reset +TIME` / `reset -TIME` (same semantics as `Reset-CumulativeTime.ps1`). Then deletes the local download.
+
 To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `unlocked-time-summary.csv`, and `state.json`):
 
 ```powershell

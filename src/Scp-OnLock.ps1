@@ -9,6 +9,8 @@ $script:LastBHistorySourceWriteUtc = $null
 $script:LastBHistoryScpSucceeded = $false
 # Per staged leaf (log-history-op-<profile> / log-history-ch-<profile>): WriteUtc + Succeeded.
 $script:LastBHistoryStateByLeaf = @{}
+# Remote commands.txt "reset [[+|-]TIME]" adjustments applied by the monitor poll loop.
+$script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
@@ -1918,6 +1920,818 @@ function Get-CurrentUnlockedTimeLogPath {
     return (Join-Path $logDir ('unlocked-time-{0:yyyy-MM-dd}.log' -f (Get-Date)))
 }
 
+function Get-ScpCommandsLocalPaths {
+    <#
+      Local dirs for remote commands.txt exchange:
+        LogDirectory\commands\commands.txt       - downloaded from remote
+        LogDirectory\commands-empty\commands.txt - 0-byte template uploaded back
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $logDir = [string]$Config.LogDirectory
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        throw (New-Object System.Exception('LogDirectory is empty; cannot resolve commands paths.'))
+    }
+    $inboxDir = Join-Path $logDir 'commands'
+    $emptyDir = Join-Path $logDir 'commands-empty'
+    return [pscustomobject]@{
+        InboxDirectory = $inboxDir
+        InboxFile      = Join-Path $inboxDir 'commands.txt'
+        EmptyDirectory = $emptyDir
+        EmptyFile      = Join-Path $emptyDir 'commands.txt'
+    }
+}
+
+function Ensure-ScpCommandsLocalLayout {
+    <#
+      Creates inbox/empty dirs and ensures the empty template is exactly 0 bytes.
+    #>
+    param([Parameter(Mandatory)]$Paths)
+
+    foreach ($dir in @($Paths.InboxDirectory, $Paths.EmptyDirectory)) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+    }
+
+    $emptyPath = [string]$Paths.EmptyFile
+    $needWrite = $true
+    if (Test-Path -LiteralPath $emptyPath -PathType Leaf) {
+        try {
+            if ((Get-Item -LiteralPath $emptyPath -Force).Length -eq 0) {
+                $needWrite = $false
+            }
+        }
+        catch {
+            $needWrite = $true
+        }
+    }
+    if ($needWrite) {
+        # No BOM / newline — true empty file for remote overwrite.
+        [System.IO.File]::WriteAllBytes($emptyPath, [byte[]]@())
+    }
+}
+
+function Test-ScpRemotePathMissing {
+    <#
+      True when scp stderr indicates the remote source file does not exist.
+      Missing remote commands.txt is treated as success (no work).
+    #>
+    param([string]$StdErr = '')
+
+    if ([string]::IsNullOrWhiteSpace($StdErr)) {
+        return $false
+    }
+    return ($StdErr -match '(?i)No such file or directory') -or
+        ($StdErr -match '(?i)not a regular file') -or
+        ($StdErr -match '(?i)Cannot download non-regular file') -or
+        ($StdErr -match '(?i)No such file\b')
+}
+
+function ConvertTo-ScpArgumentLine {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Arguments
+    )
+
+    $argLine = $null
+    if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
+        $argLine = ConvertTo-StartProcessArgumentString -Argument $Arguments
+    }
+    if ([string]::IsNullOrWhiteSpace($argLine)) {
+        $argLine = ($Arguments | ForEach-Object {
+                if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+            }) -join ' '
+    }
+    return [string]$argLine
+}
+
+function Write-ScpCommandsTrace {
+    <#
+      Append a set -x style line (+ ...) to the commands run log and service.log.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '{0} + {1}' -f $stamp, $Message
+    try {
+        $dir = Split-Path -Parent $LogPath
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and
+            -not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    }
+    catch { }
+    if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+        Write-LoggerEvent -Level $Level -Message $line
+    }
+}
+
+function Resolve-ScpCommandsInstallContext {
+    <#
+      InstallRoot + AdminAppDirectory for remote update/restart commands.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $installRoot = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:InstallRoot)) {
+        $installRoot = [string]$script:InstallRoot
+    }
+    else {
+        $pf = Join-Path $env:ProgramFiles 'LoginTimeLogger'
+        if (Test-Path -LiteralPath (Join-Path $pf 'src\LoginTimeLogger.ps1')) {
+            $installRoot = $pf
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir)) {
+            $installRoot = Split-Path -Parent $script:ScpOnLockScriptDir
+        }
+    }
+
+    $adminApp = ''
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.AdministratorProfile)) {
+        $adminApp = Join-Path ([string]$Config.AdministratorProfile) 'LoginTimeLogger'
+    }
+
+    return [pscustomobject]@{
+        InstallRoot        = $installRoot
+        AdminAppDirectory  = $adminApp
+    }
+}
+
+function ConvertFrom-RemoteCumulativeTimeText {
+    <#
+      Parses HH:MM:SS (hours may exceed 24) or a whole-second integer.
+      Returns $null when invalid.
+    #>
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+    $trimmed = $Text.Trim()
+    if ($trimmed -match '^(?<h>\d+):(?<m>[0-5]?\d):(?<s>[0-5]?\d)$') {
+        try {
+            return [double](
+                ([int]$Matches['h'] * 3600) +
+                ([int]$Matches['m'] * 60) +
+                [int]$Matches['s'])
+        }
+        catch {
+            return $null
+        }
+    }
+    if ($trimmed -match '^\d+$') {
+        try {
+            return [double][int]$trimmed
+        }
+        catch {
+            return $null
+        }
+    }
+    return $null
+}
+
+function Format-RemoteCumulativeDuration {
+    param([Parameter(Mandatory)][double]$Seconds)
+    if (Get-Command Format-Duration -ErrorAction SilentlyContinue) {
+        return (Format-Duration -Seconds $Seconds)
+    }
+    $ts = [TimeSpan]::FromSeconds([Math]::Max(0, [Math]::Floor($Seconds)))
+    return ('{0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($ts.TotalHours), $ts.Minutes, $ts.Seconds)
+}
+
+function New-RemoteCumulativeResetSpec {
+    <#
+      Build a pending reset spec from optional [[+|-]TIME] (empty = set to 0).
+    #>
+    param([AllowEmptyString()][string]$TimeArg = '')
+
+    $trimmed = if ($null -eq $TimeArg) { '' } else { $TimeArg.Trim() }
+    $mode = 'set'
+    $deltaSeconds = 0.0
+    $label = '0 (reset)'
+    $eventTag = 'CUMULATIVE_RESET'
+
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        # default: set to 0
+    }
+    elseif ($trimmed.StartsWith('+')) {
+        $mode = 'add'
+        $parsed = ConvertFrom-RemoteCumulativeTimeText -Text $trimmed.Substring(1)
+        if ($null -eq $parsed) {
+            throw ("Invalid reset +TIME '{0}' (use +HH:MM:SS or +seconds)." -f $trimmed)
+        }
+        $deltaSeconds = [double]$parsed
+        $label = ('+{0}' -f (Format-RemoteCumulativeDuration -Seconds $deltaSeconds))
+        $eventTag = 'CUMULATIVE_ADD'
+    }
+    elseif ($trimmed.StartsWith('-')) {
+        $mode = 'subtract'
+        $parsed = ConvertFrom-RemoteCumulativeTimeText -Text $trimmed.Substring(1)
+        if ($null -eq $parsed) {
+            throw ("Invalid reset -TIME '{0}' (use -HH:MM:SS or -seconds)." -f $trimmed)
+        }
+        $deltaSeconds = [double]$parsed
+        $label = ('-{0}' -f (Format-RemoteCumulativeDuration -Seconds $deltaSeconds))
+        $eventTag = 'CUMULATIVE_DEC'
+    }
+    else {
+        $mode = 'set'
+        $parsed = ConvertFrom-RemoteCumulativeTimeText -Text $trimmed
+        if ($null -eq $parsed) {
+            throw ("Invalid reset TIME '{0}' (use HH:MM:SS or seconds)." -f $trimmed)
+        }
+        $deltaSeconds = [double]$parsed
+        $label = Format-RemoteCumulativeDuration -Seconds $deltaSeconds
+        $eventTag = if ($deltaSeconds -le 0) { 'CUMULATIVE_RESET' } else { 'CUMULATIVE_SET' }
+    }
+
+    return [pscustomobject]@{
+        Mode         = $mode
+        DeltaSeconds = $deltaSeconds
+        Label        = $label
+        EventTag     = $eventTag
+        RawTimeArg   = $trimmed
+    }
+}
+
+function Queue-RemoteCumulativeReset {
+    param(
+        [Parameter(Mandatory)]$Spec,
+        [Parameter(Mandatory)][string]$TraceLogPath
+    )
+
+    if ($null -eq $script:PendingCumulativeResets) {
+        $script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
+    }
+    $script:PendingCumulativeResets.Add($Spec)
+    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+        "queue execute: reset mode={0} delta={1} tag={2}" -f `
+            $Spec.Mode, $Spec.Label, $Spec.EventTag)
+}
+
+function Apply-PendingCumulativeResets {
+    <#
+      Apply queued remote reset specs to the live monitor $state (same poll,
+      before Write-State). Writes CUMULATIVE_* lines to today's unlocked-time log.
+      Returns the (possibly updated) state object.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)]$Config
+    )
+
+    if ($null -eq $script:PendingCumulativeResets -or $script:PendingCumulativeResets.Count -eq 0) {
+        return $State
+    }
+
+    $pending = @($script:PendingCumulativeResets)
+    $script:PendingCumulativeResets = New-Object System.Collections.Generic.List[object]
+
+    $quotaMinutes = 30
+    try {
+        if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
+            $quotaMinutes = [int]$Config.UnlockQuotaMinutes
+        }
+    }
+    catch { }
+    $quotaSeconds = [double]($quotaMinutes * 60)
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    $dailyPath = $null
+    if (Get-Command Get-DailyLogPath -ErrorAction SilentlyContinue) {
+        $dailyPath = Get-DailyLogPath -LogDirectory ([string]$Config.LogDirectory) -Date (Get-Date)
+    }
+    else {
+        $dailyPath = Join-Path ([string]$Config.LogDirectory) ('unlocked-time-{0}.log' -f $today)
+    }
+
+    foreach ($spec in $pending) {
+        if ($null -eq $spec) { continue }
+        $previous = 0.0
+        try { $previous = [double]$State.UnlockedSecondsToday } catch { $previous = 0.0 }
+
+        switch ([string]$spec.Mode) {
+            'add' { $newSeconds = $previous + [double]$spec.DeltaSeconds }
+            'subtract' { $newSeconds = $previous - [double]$spec.DeltaSeconds }
+            default { $newSeconds = [double]$spec.DeltaSeconds }
+        }
+        if ($newSeconds -lt 0) { $newSeconds = 0.0 }
+        $newSeconds = [double][Math]::Floor($newSeconds)
+        $newBucket = [int][Math]::Floor($newSeconds / $quotaSeconds)
+
+        if (Get-Command ConvertTo-LoggerStateObject -ErrorAction SilentlyContinue) {
+            $State = ConvertTo-LoggerStateObject -State $State -UnlockQuotaMinutes $quotaMinutes
+        }
+        $State.Date = $today
+        $State.UnlockedSecondsToday = $newSeconds
+        $State.LastUnlockQuotaBucket = $newBucket
+
+        $prevText = Format-RemoteCumulativeDuration -Seconds $previous
+        $newText = Format-RemoteCumulativeDuration -Seconds $newSeconds
+        $line = ('{0:yyyy-MM-dd HH:mm:ss} | {1} | cumulative_today={2} | previous={3} | adjustment={4}' -f `
+                (Get-Date), [string]$spec.EventTag, $newText, $prevText, [string]$spec.Label)
+        try {
+            if (Get-Command Write-DailyLogLine -ErrorAction SilentlyContinue) {
+                Write-DailyLogLine -Path $dailyPath -Line $line
+            }
+            else {
+                Add-Content -LiteralPath $dailyPath -Value $line -Encoding UTF8
+            }
+        }
+        catch {
+            Write-LoggerEvent -Level WARN -Message (
+                "Remote reset: day-log append failed: {0}" -f $_.Exception.Message)
+        }
+        Write-LoggerEvent ("Remote reset applied: {0}" -f $line)
+    }
+
+    return $State
+}
+
+function Invoke-ScpRemoteCommandsFile {
+    <#
+      Read LogDirectory\commands\commands.txt line by line, interpret/execute
+      supported commands (update, restart, reset), write a set -x style transcript,
+      email the transcript, then delete the downloaded file.
+      Returns: WantUpdate / WantRestart / ResetSpecs (terminating actions deferred
+      until after remote empty-PUT and email).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$InboxFile,
+        [Parameter(Mandatory)][string]$TraceLogPath
+    )
+
+    $result = [pscustomobject]@{
+        WantUpdate  = $false
+        WantRestart = $false
+        ResetSpecs  = New-Object System.Collections.Generic.List[object]
+        RanAny      = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $InboxFile -PathType Leaf)) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            "skip: inbox missing '{0}'" -f $InboxFile)
+        return $result
+    }
+
+    $bytes = 0
+    try { $bytes = [int64](Get-Item -LiteralPath $InboxFile -Force).Length } catch { }
+    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+        "open '{0}' ({1} byte(s))" -f $InboxFile, $bytes)
+
+    if ($bytes -le 0) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message 'skip: empty commands.txt'
+        return $result
+    }
+
+    $rawLines = @(Get-Content -LiteralPath $InboxFile -Encoding UTF8 -ErrorAction Stop)
+    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+        "read {0} line(s)" -f $rawLines.Count)
+
+    $lineNo = 0
+    foreach ($raw in $rawLines) {
+        $lineNo++
+        $line = if ($null -eq $raw) { '' } else { ([string]$raw).Trim() }
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            "read line {0}: {1}" -f $lineNo, $(if ($line.Length -eq 0) { '(blank)' } else { $line }))
+
+        if ($line.Length -eq 0) {
+            Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                "interpret line {0}: skip blank" -f $lineNo)
+            continue
+        }
+        if ($line.StartsWith('#')) {
+            Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                "interpret line {0}: skip comment" -f $lineNo)
+            continue
+        }
+
+        $tokens = @([regex]::Split($line, '\s+') | Where-Object { $_ -ne '' })
+        if ($tokens.Count -eq 0) {
+            continue
+        }
+        $verb = [string]$tokens[0]
+        $args = @()
+        if ($tokens.Count -gt 1) {
+            $args = @($tokens[1..($tokens.Count - 1)])
+        }
+        $argText = if ($args.Count -gt 0) { ($args -join ' ') } else { '(none)' }
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            "interpret line {0}: command='{1}' args={2}" -f $lineNo, $verb, $argText)
+
+        $verbKey = $verb.ToLowerInvariant()
+        switch ($verbKey) {
+            'update' {
+                $result.RanAny = $true
+                $result.WantUpdate = $true
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    "queue execute: update (force repo sync + publish; implies restart if changed)")
+            }
+            'restart' {
+                $result.RanAny = $true
+                $result.WantRestart = $true
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: restart (deferred until after remote clear + email)')
+            }
+            'reset' {
+                $timeArg = ''
+                if ($args.Count -gt 0) {
+                    $timeArg = [string]$args[0]
+                }
+                if ($args.Count -gt 1) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: reset ignores extra args after TIME" -f $lineNo)
+                }
+                try {
+                    $spec = New-RemoteCumulativeResetSpec -TimeArg $timeArg
+                    $result.RanAny = $true
+                    $result.ResetSpecs.Add($spec)
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                        "queue execute: reset {0}" -f $(
+                            if ([string]::IsNullOrWhiteSpace($timeArg)) { '(to 0)' } else { $timeArg }))
+                }
+                catch {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: reset rejected: {1}" -f $lineNo, $_.Exception.Message)
+                }
+            }
+            default {
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                    "interpret line {0}: unknown command '{1}' (ignored)" -f $lineNo, $verb)
+            }
+        }
+    }
+
+    if ($result.WantUpdate -and $result.WantRestart) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            'note: both update and restart queued; update will restart when it applies changes, else restart runs after')
+    }
+
+    return $result
+}
+
+function Send-ScpCommandsRunAlert {
+    <#
+      Email the commands run transcript (not treated as a failure).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TraceLogPath,
+        [Parameter(Mandatory)][string]$Body
+    )
+
+    if (-not (Get-Command Send-LoginTimeSmtpAlert -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmss')
+    $attachments = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $TraceLogPath) {
+        $attachments.Add($TraceLogPath)
+    }
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.LogDirectory)) {
+        $svc = Join-Path ([string]$Config.LogDirectory) 'service.log'
+        if (Test-Path -LiteralPath $svc) { $attachments.Add($svc) }
+    }
+
+    return (Send-LoginTimeSmtpAlert `
+            -Subject 'Remote commands executed' `
+            -Body $Body `
+            -AlertKey ('scp-commands-ran-{0}' -f $stamp) `
+            -Attachment @($attachments))
+}
+
+function Invoke-ScpCommandsFatal {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [string]$Context = 'SCP commands exchange'
+    )
+
+    if (Get-Command Write-FatalError -ErrorAction SilentlyContinue) {
+        $null = Write-FatalError -Message $Message -Context $Context `
+            -Source 'ScpCommands' -NoThrow
+    }
+    else {
+        Write-LoggerEvent -Level ERROR -Message ("{0}: {1}" -f $Context, $Message)
+    }
+}
+
+function Invoke-ScpCommandsFileExchange {
+    <#
+      After the periodic upload cycle:
+        1) download ScpRemoteDirectory/commands.txt -> LogDirectory\commands\
+           (missing remote file is OK; any other SCP failure is FATAL)
+        2) upload 0-byte LogDirectory\commands-empty\commands.txt to overwrite remote
+           (SCP failure is FATAL) — immediately after download
+        3) read/interpret/execute lines (update, restart, reset); set -x style log
+        4) email the run log
+        5) delete the downloaded commands.txt
+        6) run deferred update and/or restart (may exit the process)
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$ScpExe
+    )
+
+    $paths = Get-ScpCommandsLocalPaths -Config $Config
+    Ensure-ScpCommandsLocalLayout -Paths $paths
+
+    $traceStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $traceLogPath = Join-Path $paths.InboxDirectory (
+        'commands-run-{0}.log' -f $traceStamp)
+
+    $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim()
+    if (-not $remoteDir.EndsWith('/')) {
+        $remoteDir = $remoteDir + '/'
+    }
+    $scpHost = ([string]$Config.ScpHost).Trim()
+    $scpUser = ([string]$Config.ScpUser).Trim()
+    $remoteFile = '{0}@{1}:{2}commands.txt' -f $scpUser, $scpHost, $remoteDir
+
+    $port = 22
+    if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
+        $port = [int]$Config.ScpPort
+    }
+
+    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+        "begin commands exchange; remote={0}; inbox={1}" -f $remoteFile, $paths.InboxFile)
+
+    $downloaded = $false
+    $remoteMissing = $false
+
+    # --- GET remote commands.txt -> local inbox ---
+    $getArgs = New-Object System.Collections.Generic.List[string]
+    Add-ScpCommonSshOptions -ArgumentList $getArgs `
+        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -Port $port `
+        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+        -VerboseSsh
+    $getArgs.Add($remoteFile)
+    $getArgs.Add([string]$paths.InboxFile)
+
+    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+        "scp get {0} {1}" -f $remoteFile, $paths.InboxFile)
+
+    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.out' -f [guid]::NewGuid().ToString('N'))
+    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.err' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $argLine = ConvertTo-ScpArgumentLine -Arguments $getArgs.ToArray()
+        $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
+            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 60
+        $stderr = ''
+        if (Test-Path -LiteralPath $errFile) {
+            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        }
+
+        if ($run.TimedOut) {
+            $msg = ("SCP commands download timed out after 60s. remote={0}; stderr={1}" -f `
+                    $remoteFile, ("$stderr").Trim())
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+            return
+        }
+        if (Test-ScpAuthFailure -StdErr "$stderr") {
+            $msg = ("SCP commands download auth failed. remote={0}; stderr={1}" -f `
+                    $remoteFile, ("$stderr").Trim())
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+            return
+        }
+        if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+            if (Test-ScpRemotePathMissing -StdErr "$stderr") {
+                $remoteMissing = $true
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    "remote commands.txt not present (OK). remote={0}" -f $remoteFile)
+            }
+            else {
+                $reportedExit = $run.ExitCode
+                $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                $msg = ("SCP commands download failed (exit {0}). remote={1}; stderr={2}" -f `
+                        $reportedExit, $remoteFile, ("$stderr").Trim())
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+                return
+            }
+        }
+        else {
+            $downloaded = $true
+            $bytes = 0
+            try {
+                if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
+                    $bytes = [int64](Get-Item -LiteralPath $paths.InboxFile -Force).Length
+                }
+            }
+            catch { }
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "downloaded OK ({0} byte(s)) -> {1}" -f $bytes, $paths.InboxFile)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- PUT empty immediately after download (clear remote before local processing) ---
+    Ensure-ScpCommandsLocalLayout -Paths $paths
+    $putArgs = New-Object System.Collections.Generic.List[string]
+    Add-ScpCommonSshOptions -ArgumentList $putArgs `
+        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -Port $port `
+        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+        -VerboseSsh
+    $putArgs.Add([string]$paths.EmptyFile)
+    $putArgs.Add($remoteFile)
+
+    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+        "scp put empty {0} -> {1}" -f $paths.EmptyFile, $remoteFile)
+
+    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.out' -f [guid]::NewGuid().ToString('N'))
+    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.err' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $argLine = ConvertTo-ScpArgumentLine -Arguments $putArgs.ToArray()
+        $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
+            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 60
+        $stderr = ''
+        if (Test-Path -LiteralPath $errFile) {
+            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        }
+
+        if ($run.TimedOut) {
+            $msg = ("SCP commands empty upload timed out after 60s. remote={0}; stderr={1}" -f `
+                    $remoteFile, ("$stderr").Trim())
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
+            return
+        }
+        if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+            $reportedExit = $run.ExitCode
+            $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+            if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+            $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
+                    $reportedExit, $remoteFile, ("$stderr").Trim())
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
+            return
+        }
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            "remote commands.txt cleared (empty upload OK) -> {0}" -f $remoteFile)
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+
+    $cmdResult = [pscustomobject]@{
+        WantUpdate  = $false
+        WantRestart = $false
+        ResetSpecs  = New-Object System.Collections.Generic.List[object]
+        RanAny      = $false
+    }
+    if ($downloaded -and -not $remoteMissing) {
+        try {
+            $cmdResult = Invoke-ScpRemoteCommandsFile `
+                -Config $Config `
+                -InboxFile ([string]$paths.InboxFile) `
+                -TraceLogPath $traceLogPath
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                "command file processing failed: {0}" -f $errMsg)
+            Invoke-ScpCommandsFatal -Message $errMsg -Context 'SCP commands interpret/execute'
+            # Still email + delete local below when possible.
+        }
+    }
+
+    $resetCount = 0
+    try { $resetCount = @($cmdResult.ResetSpecs).Count } catch { $resetCount = 0 }
+
+    # Email transcript before delete / terminating actions.
+    $emailBody = @(
+        'LoginTimeLogger remote commands.txt was processed.'
+        ''
+        ('Remote: {0}' -f $remoteFile)
+        ('Inbox: {0}' -f $paths.InboxFile)
+        ('Trace: {0}' -f $traceLogPath)
+        ('Downloaded: {0}' -f $downloaded)
+        ('RemoteMissing: {0}' -f $remoteMissing)
+        ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
+        ('WantRestart: {0}' -f $cmdResult.WantRestart)
+        ('ResetCount: {0}' -f $resetCount)
+        ''
+        'See attached commands-run log (set -x style).'
+    ) -join [Environment]::NewLine
+
+    # Email only when a remote file was downloaded (avoid 5-minute spam on missing).
+    if ($downloaded) {
+        try {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'email: sending commands run transcript'
+            $sent = Send-ScpCommandsRunAlert -Config $Config -TraceLogPath $traceLogPath -Body $emailBody
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "email: sent={0}" -f [bool]$sent)
+        }
+        catch {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                "email: failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # Delete downloaded commands.txt (always when present).
+    if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
+        try {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "rm '{0}'" -f $paths.InboxFile)
+            Remove-Item -LiteralPath $paths.InboxFile -Force -ErrorAction Stop
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'rm: OK'
+        }
+        catch {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                "rm failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # Deferred actions (after remote clear + email + local delete).
+    # reset: queue for the monitor poll loop (applies to live $state before Write-State).
+    foreach ($spec in @($cmdResult.ResetSpecs)) {
+        if ($null -eq $spec) { continue }
+        try {
+            Queue-RemoteCumulativeReset -Spec $spec -TraceLogPath $traceLogPath
+        }
+        catch {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                "execute reset queue failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    $ctx = Resolve-ScpCommandsInstallContext -Config $Config
+    if ($cmdResult.WantUpdate) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: update'
+        if (-not [bool]$Config.UpdateEnabled) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                'execute update: skipped (UpdateEnabled=false)')
+        }
+        elseif ([string]::IsNullOrWhiteSpace($ctx.InstallRoot) -or
+            [string]::IsNullOrWhiteSpace($ctx.AdminAppDirectory)) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                'execute update: InstallRoot/AdminAppDirectory unresolved')
+            Invoke-ScpCommandsFatal -Message (
+                'Cannot run remote update: InstallRoot/AdminAppDirectory unresolved.') `
+                -Context 'SCP commands update'
+        }
+        elseif (-not (Get-Command Invoke-LoginTimeLoggerUpdateCheck -ErrorAction SilentlyContinue)) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                'execute update: Invoke-LoginTimeLoggerUpdateCheck not loaded')
+            Invoke-ScpCommandsFatal -Message (
+                'Cannot run remote update: Invoke-LoginTimeLoggerUpdateCheck not loaded.') `
+                -Context 'SCP commands update'
+        }
+        else {
+            # May exit 0 after a successful sync+publish (Restart-LoginTimeLoggerProcess).
+            Invoke-LoginTimeLoggerUpdateCheck `
+                -Config $Config `
+                -InstallRoot $ctx.InstallRoot `
+                -AdminAppDirectory $ctx.AdminAppDirectory `
+                -Force
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                'execute update: returned (no restart; already current or postponed)')
+        }
+    }
+
+    if ($cmdResult.WantRestart) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: restart'
+        if ([string]::IsNullOrWhiteSpace($ctx.InstallRoot) -or
+            [string]::IsNullOrWhiteSpace([string]$Config.ConfigPath)) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                'execute restart: InstallRoot/ConfigPath unresolved')
+            Invoke-ScpCommandsFatal -Message (
+                'Cannot run remote restart: InstallRoot/ConfigPath unresolved.') `
+                -Context 'SCP commands restart'
+            return
+        }
+        if (-not (Get-Command Restart-LoginTimeLoggerProcess -ErrorAction SilentlyContinue)) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                'execute restart: Restart-LoginTimeLoggerProcess not loaded')
+            Invoke-ScpCommandsFatal -Message (
+                'Cannot run remote restart: Restart-LoginTimeLoggerProcess not loaded.') `
+                -Context 'SCP commands restart'
+            return
+        }
+        # Exits the process.
+        Restart-LoginTimeLoggerProcess `
+            -ConfigPath ([string]$Config.ConfigPath) `
+            -InstallRoot $ctx.InstallRoot
+    }
+
+    Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'
+}
+
 function Invoke-ScpBHistoryCopy {
     <#
     .SYNOPSIS
@@ -1926,7 +2740,9 @@ function Invoke-ScpBHistoryCopy {
       log-history-op-<profile>-YYYY-MM-DD.csv /
       log-history-ch-<profile>-YYYY-MM-DD.csv under LogDirectory\bhist,
       SCP all of today's those CSVs when present, and upload today's
-      unlocked-time-*.log. Failures are logged; they do not stop the monitor.
+      unlocked-time-*.log. Then exchange remote commands.txt (download to
+      LogDirectory\commands\, upload empty from LogDirectory\commands-empty\).
+      Failures are logged; they do not stop the monitor.
     #>
     param(
         [Parameter(Mandatory)]$Config
@@ -1990,10 +2806,6 @@ function Invoke-ScpBHistoryCopy {
             $uploadFiles.Add($dailyPath)
         }
 
-        if ($uploadFiles.Count -eq 0) {
-            return
-        }
-
         $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim()
         if (-not $remoteDir.EndsWith('/')) {
             $remoteDir = $remoteDir + '/'
@@ -2007,173 +2819,176 @@ function Invoke-ScpBHistoryCopy {
             $port = [int]$Config.ScpPort
         }
 
-        # Upload daily log first (small/fast), then BHistory CSVs separately.
-        $dailyFiles = New-Object System.Collections.Generic.List[string]
-        $historyFiles = New-Object System.Collections.Generic.List[string]
-        foreach ($f in $uploadFiles) {
-            $leaf = Split-Path -Leaf $f
-            if ($leaf -like 'unlocked-time-*.log') {
-                $dailyFiles.Add($f)
+        if ($uploadFiles.Count -gt 0) {
+            # Upload daily log first (small/fast), then BHistory CSVs separately.
+            $dailyFiles = New-Object System.Collections.Generic.List[string]
+            $historyFiles = New-Object System.Collections.Generic.List[string]
+            foreach ($f in $uploadFiles) {
+                $leaf = Split-Path -Leaf $f
+                if ($leaf -like 'unlocked-time-*.log') {
+                    $dailyFiles.Add($f)
+                }
+                else {
+                    $historyFiles.Add($f)
+                }
             }
-            else {
-                $historyFiles.Add($f)
+
+            $uploadBatches = @(
+                @{ Name = 'daily'; Files = @($dailyFiles); TimeoutSeconds = 60 }
+                @{ Name = 'BHistory'; Files = @($historyFiles); TimeoutSeconds = 0 }
+            )
+
+            foreach ($batch in $uploadBatches) {
+                $batchFiles = @($batch.Files)
+                if ($batchFiles.Count -eq 0) {
+                    continue
+                }
+
+                $scpTimeoutSeconds = [int]$batch.TimeoutSeconds
+                if ($scpTimeoutSeconds -le 0) {
+                    # Scale with payload size (~50 KiB/s floor + 60s slack), clamp 120..600.
+                    $totalBytes = [int64]0
+                    foreach ($bf in $batchFiles) {
+                        try {
+                            $totalBytes += [int64](Get-Item -LiteralPath $bf -Force).Length
+                        }
+                        catch { }
+                    }
+                    $scpTimeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
+                    if ($scpTimeoutSeconds -lt 120) { $scpTimeoutSeconds = 120 }
+                    if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
+                }
+
+                $scpArgList = New-Object System.Collections.Generic.List[string]
+                Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+                    -IdentityFile ([string]$Config.ScpIdentityFile) `
+                    -Port $port `
+                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                    -VerboseSsh
+                foreach ($f in $batchFiles) {
+                    $scpArgList.Add($f)
+                }
+                $scpArgList.Add($remoteTarget)
+
+                Write-LoggerEvent ("SCP BHistory/daily ({0}): uploading {1} file(s) to {2} (timeout {3}s): {4}" -f `
+                        $batch.Name, $batchFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($batchFiles -join '; '))
+
+                $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
+                $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    $argLine = ConvertTo-ScpArgumentLine -Arguments $scpArgList.ToArray()
+
+                    $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                        -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
+                    $stderr = ''
+                    if (Test-Path -LiteralPath $errFile) {
+                        $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+                    }
+
+                    if ($run.TimedOut) {
+                        $msg = ("SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
+                                $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
+                        Write-LoggerEvent -Level WARN -Message $msg
+                        if ($batch.Name -eq 'BHistory') {
+                            $script:LastBHistoryScpSucceeded = $false
+                            foreach ($bf in $batchFiles) {
+                                $leaf = Split-Path -Leaf $bf
+                                $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
+                                    WriteUtc  = $null
+                                    Succeeded = $false
+                                }
+                            }
+                        }
+                        $diagPath = Join-Path $env:TEMP (
+                            'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                        try {
+                            @(
+                                $msg
+                                ''
+                                '--- scp stderr ---'
+                                ("$stderr").Trim()
+                            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                            $null = Send-LoginTimeLoggerFailureAlert `
+                                -Subject 'SCP BHistory/daily failed' `
+                                -Body $msg `
+                                -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
+                                -Config $Config `
+                                -ExtraAttachment @($diagPath)
+                        }
+                        finally {
+                            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                        }
+                        continue
+                    }
+                    if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+                        $reportedExit = $run.ExitCode
+                        $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                        if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                        $msg = ("SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
+                                $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
+                        Write-LoggerEvent -Level WARN -Message $msg
+                        if ($batch.Name -eq 'BHistory') {
+                            $script:LastBHistoryScpSucceeded = $false
+                            foreach ($bf in $batchFiles) {
+                                $leaf = Split-Path -Leaf $bf
+                                $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
+                                    WriteUtc  = $null
+                                    Succeeded = $false
+                                }
+                            }
+                        }
+                        $diagPath = Join-Path $env:TEMP (
+                            'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                        try {
+                            @(
+                                $msg
+                                ''
+                                '--- scp stderr ---'
+                                ("$stderr").Trim()
+                            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                            $null = Send-LoginTimeLoggerFailureAlert `
+                                -Subject 'SCP BHistory/daily failed' `
+                                -Body $msg `
+                                -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
+                                -Config $Config `
+                                -ExtraAttachment @($diagPath)
+                        }
+                        finally {
+                            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                        }
+                        continue
+                    }
+
+                    if ($batch.Name -eq 'BHistory' -and $includeBHistory) {
+                        $script:LastBHistoryScpSucceeded = $true
+                        $nowUtc = [datetime]::UtcNow
+                        foreach ($bf in $batchFiles) {
+                            $leaf = Split-Path -Leaf $bf
+                            $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
+                                WriteUtc  = $nowUtc
+                                Succeeded = $true
+                            }
+                            if ($leaf -like 'log-history-op-*.csv') {
+                                $script:LastBHistorySourceWriteUtc = $nowUtc
+                            }
+                        }
+                    }
+                    Write-LoggerEvent ("SCP BHistory/daily ({0}) succeeded ({1} file(s)) -> {2}: {3}" -f `
+                            $batch.Name, $batchFiles.Count, $remoteTarget, ($batchFiles -join '; '))
+                }
+                finally {
+                    Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+                }
             }
         }
 
-        $uploadBatches = @(
-            @{ Name = 'daily'; Files = @($dailyFiles); TimeoutSeconds = 60 }
-            @{ Name = 'BHistory'; Files = @($historyFiles); TimeoutSeconds = 0 }
-        )
-
-        foreach ($batch in $uploadBatches) {
-            $batchFiles = @($batch.Files)
-            if ($batchFiles.Count -eq 0) {
-                continue
-            }
-
-            $scpTimeoutSeconds = [int]$batch.TimeoutSeconds
-            if ($scpTimeoutSeconds -le 0) {
-                # Scale with payload size (~50 KiB/s floor + 60s slack), clamp 120..600.
-                $totalBytes = [int64]0
-                foreach ($bf in $batchFiles) {
-                    try {
-                        $totalBytes += [int64](Get-Item -LiteralPath $bf -Force).Length
-                    }
-                    catch { }
-                }
-                $scpTimeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
-                if ($scpTimeoutSeconds -lt 120) { $scpTimeoutSeconds = 120 }
-                if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
-            }
-
-            $scpArgList = New-Object System.Collections.Generic.List[string]
-            Add-ScpCommonSshOptions -ArgumentList $scpArgList `
-                -IdentityFile ([string]$Config.ScpIdentityFile) `
-                -Port $port `
-                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                -VerboseSsh
-            foreach ($f in $batchFiles) {
-                $scpArgList.Add($f)
-            }
-            $scpArgList.Add($remoteTarget)
-
-            Write-LoggerEvent ("SCP BHistory/daily ({0}): uploading {1} file(s) to {2} (timeout {3}s): {4}" -f `
-                    $batch.Name, $batchFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($batchFiles -join '; '))
-
-            $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
-            $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
-            try {
-                $argLine = $null
-                if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
-                    $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
-                }
-                if ([string]::IsNullOrWhiteSpace($argLine)) {
-                    $argLine = ($scpArgList | ForEach-Object {
-                            if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
-                        }) -join ' '
-                }
-
-                $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
-                    -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
-                $stderr = ''
-                if (Test-Path -LiteralPath $errFile) {
-                    $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-                }
-
-                if ($run.TimedOut) {
-                    $msg = ("SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
-                            $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
-                    Write-LoggerEvent -Level WARN -Message $msg
-                    if ($batch.Name -eq 'BHistory') {
-                        $script:LastBHistoryScpSucceeded = $false
-                        foreach ($bf in $batchFiles) {
-                            $leaf = Split-Path -Leaf $bf
-                            $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                                WriteUtc  = $null
-                                Succeeded = $false
-                            }
-                        }
-                    }
-                    $diagPath = Join-Path $env:TEMP (
-                        'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                    try {
-                        @(
-                            $msg
-                            ''
-                            '--- scp stderr ---'
-                            ("$stderr").Trim()
-                        ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                        $null = Send-LoginTimeLoggerFailureAlert `
-                            -Subject 'SCP BHistory/daily failed' `
-                            -Body $msg `
-                            -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
-                            -Config $Config `
-                            -ExtraAttachment @($diagPath)
-                    }
-                    finally {
-                        Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
-                    }
-                    continue
-                }
-                if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
-                    $reportedExit = $run.ExitCode
-                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
-                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
-                    $msg = ("SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
-                            $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
-                    Write-LoggerEvent -Level WARN -Message $msg
-                    if ($batch.Name -eq 'BHistory') {
-                        $script:LastBHistoryScpSucceeded = $false
-                        foreach ($bf in $batchFiles) {
-                            $leaf = Split-Path -Leaf $bf
-                            $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                                WriteUtc  = $null
-                                Succeeded = $false
-                            }
-                        }
-                    }
-                    $diagPath = Join-Path $env:TEMP (
-                        'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                    try {
-                        @(
-                            $msg
-                            ''
-                            '--- scp stderr ---'
-                            ("$stderr").Trim()
-                        ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                        $null = Send-LoginTimeLoggerFailureAlert `
-                            -Subject 'SCP BHistory/daily failed' `
-                            -Body $msg `
-                            -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
-                            -Config $Config `
-                            -ExtraAttachment @($diagPath)
-                    }
-                    finally {
-                        Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
-                    }
-                    continue
-                }
-
-                if ($batch.Name -eq 'BHistory' -and $includeBHistory) {
-                    $script:LastBHistoryScpSucceeded = $true
-                    $nowUtc = [datetime]::UtcNow
-                    foreach ($bf in $batchFiles) {
-                        $leaf = Split-Path -Leaf $bf
-                        $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                            WriteUtc  = $nowUtc
-                            Succeeded = $true
-                        }
-                        if ($leaf -like 'log-history-op-*.csv') {
-                            $script:LastBHistorySourceWriteUtc = $nowUtc
-                        }
-                    }
-                }
-                Write-LoggerEvent ("SCP BHistory/daily ({0}) succeeded ({1} file(s)) -> {2}: {3}" -f `
-                        $batch.Name, $batchFiles.Count, $remoteTarget, ($batchFiles -join '; '))
-            }
-            finally {
-                Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
-            }
+        # Always run after uploads (or when there was nothing to upload).
+        try {
+            Invoke-ScpCommandsFileExchange -Config $Config -ScpExe $scpExe
+        }
+        catch {
+            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                'SCP commands.txt exchange failed')
         }
     }
     catch {

@@ -1364,7 +1364,9 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$AdminAppDirectory,
-        [string]$TaskName = 'LoginTimeLogger'
+        [string]$TaskName = 'LoginTimeLogger',
+        # Skip the NextUpdateCheckUtc schedule gate (e.g. remote commands.txt).
+        [switch]$Force
     )
 
     if (-not $Config.UpdateEnabled) {
@@ -1387,7 +1389,7 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $nextDue = [datetime]::UtcNow
     }
 
-    if ([datetime]::UtcNow -lt $nextDue) {
+    if (-not $Force -and [datetime]::UtcNow -lt $nextDue) {
         return
     }
 
