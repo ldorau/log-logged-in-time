@@ -503,9 +503,10 @@ function Stop-ScpProcessTree {
 
 function Invoke-ScpProcessWithTimeout {
     <#
-      Starts scp and waits up to TimeoutSeconds. On timeout, kills the process
-      tree and returns TimedOut=$true with ExitCode=-1.
-      ConnectTimeout alone is not enough: a stalled transfer can block for hours.
+      Starts scp via System.Diagnostics.Process (not Start-Process -PassThru,
+      which often leaves ExitCode unset/-1 with empty redirect files on Windows).
+      Waits up to TimeoutSeconds; on timeout kills the process tree.
+      Captures stdout/stderr asynchronously and writes them to StdOutPath/StdErrPath.
     #>
     param(
         [Parameter(Mandatory)][string]$ScpExe,
@@ -516,56 +517,127 @@ function Invoke-ScpProcessWithTimeout {
         [int]$TimeoutSeconds = 90
     )
 
-    $proc = Start-Process -FilePath $ScpExe -ArgumentList $ArgumentList `
-        -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
-
-    if ($null -eq $proc) {
-        return [pscustomobject]@{
-            ExitCode = -1
-            TimedOut = $false
-            Process  = $null
-        }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ScpExe
+    $psi.Arguments = $ArgumentList
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    if (-not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-Path -LiteralPath $env:TEMP)) {
+        $psi.WorkingDirectory = $env:TEMP
     }
 
-    $timeoutMs = [Math]::Max(1000, $TimeoutSeconds * 1000)
-    $exited = $false
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $stdoutText = ''
+    $stderrText = ''
+
     try {
-        $exited = $proc.WaitForExit($timeoutMs)
-    }
-    catch {
-        $exited = $false
-    }
+        if (-not $proc.Start()) {
+            return [pscustomobject]@{
+                ExitCode = -1
+                TimedOut = $false
+                Process  = $null
+            }
+        }
 
-    if (-not $exited) {
-        Stop-ScpProcessTree -Process $proc
+        # Read streams async before WaitForExit to avoid pipe-buffer deadlocks.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        $timeoutMs = [Math]::Max(1000, $TimeoutSeconds * 1000)
+        $exited = $false
+        try {
+            $exited = $proc.WaitForExit($timeoutMs)
+        }
+        catch {
+            $exited = $false
+        }
+
+        if (-not $exited) {
+            Stop-ScpProcessTree -Process $proc
+            try {
+                if ($null -ne $stdoutTask -and $stdoutTask.Wait(2000)) {
+                    $stdoutText = [string]$stdoutTask.Result
+                }
+            }
+            catch { }
+            try {
+                if ($null -ne $stderrTask -and $stderrTask.Wait(2000)) {
+                    $stderrText = [string]$stderrTask.Result
+                }
+            }
+            catch { }
+            try {
+                if (-not [string]::IsNullOrEmpty($StdOutPath)) {
+                    Set-Content -LiteralPath $StdOutPath -Value $stdoutText -Encoding UTF8
+                }
+                if (-not [string]::IsNullOrEmpty($StdErrPath)) {
+                    Set-Content -LiteralPath $StdErrPath -Value $stderrText -Encoding UTF8
+                }
+            }
+            catch { }
+            return [pscustomobject]@{
+                ExitCode = -1
+                TimedOut = $true
+                Process  = $proc
+            }
+        }
+
+        # Drain async readers, then ExitCode is reliable on Process (unlike Start-Process).
+        try { $null = $proc.WaitForExit() } catch { }
+        try {
+            if ($null -ne $stdoutTask) { $stdoutText = [string]$stdoutTask.Result }
+        }
+        catch { }
+        try {
+            if ($null -ne $stderrTask) { $stderrText = [string]$stderrTask.Result }
+        }
+        catch { }
+
+        $code = -1
+        $gotCode = $false
+        for ($i = 0; $i -lt 30 -and -not $gotCode; $i++) {
+            try {
+                $proc.Refresh()
+                if ($proc.HasExited) {
+                    $code = [int]$proc.ExitCode
+                    $gotCode = $true
+                }
+            }
+            catch {
+                Start-Sleep -Milliseconds 20
+            }
+            if (-not $gotCode) {
+                Start-Sleep -Milliseconds 20
+            }
+        }
+
+        try {
+            if (-not [string]::IsNullOrEmpty($StdOutPath)) {
+                Set-Content -LiteralPath $StdOutPath -Value $stdoutText -Encoding UTF8
+            }
+            if (-not [string]::IsNullOrEmpty($StdErrPath)) {
+                Set-Content -LiteralPath $StdErrPath -Value $stderrText -Encoding UTF8
+            }
+        }
+        catch { }
+
         return [pscustomobject]@{
-            ExitCode = -1
-            TimedOut = $true
+            ExitCode = $code
+            TimedOut = $false
             Process  = $proc
         }
     }
-
-    # WaitForExit(ms) can return before ExitCode is populated; a follow-up
-    # WaitForExit() + Refresh is required. [int]$null is 0 in PowerShell, which
-    # falsely marks failed scp runs as success.
-    try { $null = $proc.WaitForExit() } catch { }
-    try { $proc.Refresh() } catch { }
-
-    $code = -1
-    try {
-        if ($proc.HasExited -and $null -ne $proc.ExitCode) {
-            $code = [int]$proc.ExitCode
+    finally {
+        try {
+            if ($null -ne $proc -and -not $proc.HasExited) { }
         }
-    }
-    catch {
-        $code = -1
-    }
-
-    return [pscustomobject]@{
-        ExitCode = $code
-        TimedOut = $false
-        Process  = $proc
+        catch { }
+        try { $proc.Dispose() } catch { }
     }
 }
 
@@ -1630,7 +1702,8 @@ function Invoke-ScpLogCopyOnLock {
         Add-ScpCommonSshOptions -ArgumentList $scpArgList `
             -IdentityFile ([string]$Config.ScpIdentityFile) `
             -Port $port `
-            -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+            -VerboseSsh
         foreach ($f in $files) {
             $scpArgList.Add($f)
         }
@@ -1912,7 +1985,8 @@ function Invoke-ScpBHistoryCopy {
             Add-ScpCommonSshOptions -ArgumentList $scpArgList `
                 -IdentityFile ([string]$Config.ScpIdentityFile) `
                 -Port $port `
-                -KnownHostsFile ([string]$Config.ScpKnownHostsFile)
+                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                -VerboseSsh
             foreach ($f in $batchFiles) {
                 $scpArgList.Add($f)
             }
