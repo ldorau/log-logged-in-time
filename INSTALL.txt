@@ -161,13 +161,15 @@ What the installer does
 2. Writes the runtime config under AdministratorProfile (example):
      C:\Users\AdminName\LoginTimeLogger\config.json
    ACLs: AdministratorProfile account + SYSTEM full control; target user
-   read-only (ReadAndExecute). SSH keys under LoginTimeLogger\ssh stay
-   admin + SYSTEM only. (Does not require BUILTIN\Administrators.)
+   Deny FullControl (no read/write/execute). SSH keys under
+   LoginTimeLogger\ssh stay admin + SYSTEM only. (Does not require
+   BUILTIN\Administrators.)
 3. Creates the log directory under AdministratorProfile with the same
-   admin/SYSTEM full + target read-only ACLs:
+   admin/SYSTEM full + target deny ACLs:
      C:\Users\AdminName\LoginTimeLogs
 4. Copies monitor scripts (not the config) into:
      C:\Program Files\LoginTimeLogger
+   (admin + SYSTEM full; target Deny FullControl — no access to sources/scripts)
 5. Registers scheduled task "LoginTimeLogger" pointing at that runtime
    config path:
      - Trigger: At system startup
@@ -177,11 +179,11 @@ What the installer does
 
 Verify installation
 -------------------
-Check the task, monitor process/mutex, and today's totals (admin or target user):
+Check the task, monitor process/mutex, and today's totals (as the install admin):
   .\scripts\Status.ps1
   LastResult 267009 (0x41301) while State=Running means the monitor is still running
   (normal). Status treats that as healthy and does not treat it as a failure.
-  Target user can run Status/Get-LockedTime after install (read-only logs/config).
+  The measured target user cannot read logs, config, or Program Files sources.
 
 Estimate locked/away time from existing daily logs (transition timestamps):
   .\scripts\Get-LockedTime.ps1

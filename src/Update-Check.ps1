@@ -1483,6 +1483,13 @@ function Invoke-LoginTimeLoggerUpdateCheck {
 
         $newHead = Sync-UpdateRepository -GitExe $gitExe -RepoUrl $Config.UpdateRepoUrl -Branch $Config.UpdateBranch -ClonePath $Config.UpdateClonePath
         Publish-InstalledFilesFromRepo -ClonePath $Config.UpdateClonePath -InstallRoot $InstallRoot
+        if (Get-Command Initialize-SecureInstallRoot -ErrorAction SilentlyContinue) {
+            Initialize-SecureInstallRoot `
+                -InstallRoot $InstallRoot `
+                -TargetUsername ([string]$Config.TargetUsername) `
+                -AdministratorProfile ([string]$Config.AdministratorProfile) `
+                -AdminUsername ([string]$Config.AdminUsername)
+        }
         Merge-InstalledConfigFilesFromRepo `
             -ClonePath $Config.UpdateClonePath `
             -AdminAppDirectory $AdminAppDirectory `

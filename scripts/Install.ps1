@@ -876,8 +876,8 @@ Write-Output ('compiled; sessions=' + `$sessions.Count)
 
 function Set-ProtectedDirectory {
     <#
-      Admin + SYSTEM: FullControl. Target user: ReadAndExecute (read-only), or
-      skipped when target == admin. Does not grant write/delete/change-permissions.
+      Admin + SYSTEM: FullControl. Target user: Deny FullControl (no read/write/
+      execute), or skipped when target == admin (testing). Inheritance broken.
     #>
     param(
         [Parameter(Mandatory)][string]$Directory,
@@ -917,28 +917,28 @@ function Set-ProtectedDirectory {
     if ($targetSid) {
         if ($targetSid.Value -eq $AllowedAdminSid.Value) {
             # Allowed for testing when AdminUsername == TargetUsername.
-            Write-Host ("  Note: measured user equals admin account; skipping target read ACE on '{0}' (OK for testing)." -f $Directory) -ForegroundColor Yellow
+            Write-Host ("  Note: measured user equals admin account; skipping target deny ACE on '{0}' (OK for testing)." -f $Directory) -ForegroundColor Yellow
         }
         else {
             try {
-                # ReadAndExecute: list/read files only (no write/delete/ACL change).
+                # Explicit Deny so the target cannot read, write, or execute.
                 $acl.AddAccessRule((New-SidFileSystemAccessRule `
                             -Sid $targetSid `
-                            -Rights ReadAndExecute `
+                            -Rights FullControl `
                             -InheritanceFlags 'ContainerInherit,ObjectInherit' `
                             -PropagationFlags None `
-                            -AccessControlType Allow))
+                            -AccessControlType Deny))
             }
             catch {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Install' -Context (
-                    "Could not add target read ACE; user='{0}'; sid='{1}'; directory='{2}'" -f `
+                    "Could not add target deny ACE; user='{0}'; sid='{1}'; directory='{2}'" -f `
                         $TargetUsername, $targetSid.Value, $Directory)
             }
         }
     }
     else {
         $null = Write-ErrorMessage -Level WARN -Source 'Install' -Message (
-            "Could not resolve '{0}' to a SID for read ACE on '{1}'. Directory is still admin-profile + SYSTEM only." -f `
+            "Could not resolve '{0}' to a SID for deny ACE on '{1}'. Directory is still admin-profile + SYSTEM only." -f `
                 $TargetUsername, $Directory)
     }
 
@@ -1260,7 +1260,7 @@ SystemDrive: $env:SystemDrive
         $configJson | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
         Set-ProtectedDirectory -Directory $logDirectory -TargetUsername $targetUsername `
             -AllowedAdminSid $allowedAdminSid -AdministratorProfile $administratorProfile
-        # Private keys must stay admin/SYSTEM-only even though LoginTimeLogger is readable.
+        # Private keys stay admin/SYSTEM-only (parent already denies the target).
         $sshDir = Join-Path $adminAppDirectory 'ssh'
         Set-ProtectedSshDirectory `
             -Directory $sshDir `
@@ -1329,7 +1329,8 @@ SystemDrive: $env:SystemDrive
         throw (New-Object System.Exception($details, $_.Exception))
     }
 
-    # SessionSwitch signal dir: target user must write; SYSTEM/admin read (separate from read-only logs).
+    # SessionSwitch signal dir: target user must write; SYSTEM/admin read
+    # (separate from logs/config/sources, which deny the target).
     try {
         $lockSignalDir = Split-Path -Parent $lockSignalPath
         if (-not (Test-Path -LiteralPath $lockSignalDir)) {
@@ -1493,13 +1494,13 @@ SystemDrive: $env:SystemDrive
     }
 
     try {
+        # Sources/scripts under Program Files: admin + SYSTEM only; deny target.
         $installedAcl = Get-Acl -LiteralPath $installRoot
         $installedAcl.SetAccessRuleProtection($true, $false)
         foreach ($rule in @($installedAcl.Access)) {
             $null = $installedAcl.RemoveAccessRule($rule)
         }
         $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-        $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
         $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
                     -Sid $allowedAdminSid `
                     -Rights FullControl `
@@ -1512,13 +1513,24 @@ SystemDrive: $env:SystemDrive
                     -InheritanceFlags 'ContainerInherit,ObjectInherit' `
                     -PropagationFlags None `
                     -AccessControlType Allow))
-        $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
-                    -Sid $sidUsers `
-                    -Rights ReadAndExecute `
-                    -InheritanceFlags 'ContainerInherit,ObjectInherit' `
-                    -PropagationFlags None `
-                    -AccessControlType Allow))
+        $installTargetSid = Resolve-AccountSid -UserName $targetUsername `
+            -ProfilePath $administratorProfile
+        if ($installTargetSid -and $installTargetSid.Value -ne $allowedAdminSid.Value) {
+            $installedAcl.AddAccessRule((New-SidFileSystemAccessRule `
+                        -Sid $installTargetSid `
+                        -Rights FullControl `
+                        -InheritanceFlags 'ContainerInherit,ObjectInherit' `
+                        -PropagationFlags None `
+                        -AccessControlType Deny))
+        }
         Set-Acl -LiteralPath $installRoot -AclObject $installedAcl
+        Get-ChildItem -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try {
+                    Set-Acl -LiteralPath $_.FullName -AclObject $installedAcl
+                }
+                catch { }
+            }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (

@@ -3,9 +3,8 @@
 .SYNOPSIS
   Shows LoginTimeLogger task state and today's unlocked-time summary.
 .DESCRIPTION
-  Readable by the install admin (full) or the measured target user (read-only
-  logs/config). Does not require elevation. Target users cannot change ACLs
-  or start the SYSTEM monitor task.
+  Readable by the install admin (logs/config are denied to the measured
+  target user). Does not require elevation for the admin account.
 #>
 [CmdletBinding()]
 param(

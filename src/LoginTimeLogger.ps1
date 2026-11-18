@@ -307,7 +307,7 @@ function Initialize-SecureLogDirectory {
 
         # Allow the admin account + SYSTEM. Prefer AdminUsername (DOMAIN\user / UPN);
         # fall back to ProfileList match on AdministratorProfile (works under SYSTEM).
-        # Target gets ReadAndExecute only (Status / Get-LockedTime as measured user).
+        # Target gets Deny FullControl (no read/write/execute) unless target == admin.
         $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
         $allowedAdminSid = $null
         if (-not [string]::IsNullOrWhiteSpace($AdminUsername)) {
@@ -332,17 +332,17 @@ function Initialize-SecureLogDirectory {
             if ($targetSid.Value -eq $allowedAdminSid.Value) {
                 # Allowed for testing when admin and measured user are the same account.
                 Write-LoggerEvent -Level INFO -Message (
-                    "TargetUsername '{0}' matches admin profile account; skipping target read ACE on '{1}' (OK for testing)." -f `
+                    "TargetUsername '{0}' matches admin profile account; skipping target deny ACE on '{1}' (OK for testing)." -f `
                         $TargetUsername, $Directory)
             }
             else {
                 try {
                     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                                $targetSid, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                                $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')))
                 }
                 catch {
                     $details = Format-ErrorDetails -ErrorRecord $_ -Context (
-                        "Adding target read ACE failed; user='{0}'; sid='{1}'; directory='{2}'" -f `
+                        "Adding target deny ACE failed; user='{0}'; sid='{1}'; directory='{2}'" -f `
                             $TargetUsername, $targetSid.Value, $Directory)
                     Write-LoggerEvent -Level WARN -Message $details
                 }
@@ -350,7 +350,7 @@ function Initialize-SecureLogDirectory {
         }
         else {
             Write-LoggerEvent -Level WARN -Message (
-                "Could not resolve '{0}' to a SID for read ACE on '{1}'." -f $TargetUsername, $Directory)
+                "Could not resolve '{0}' to a SID for deny ACE on '{1}'." -f $TargetUsername, $Directory)
         }
 
         Set-Acl -LiteralPath $Directory -AclObject $acl
@@ -359,6 +359,75 @@ function Initialize-SecureLogDirectory {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
             "Initialize-SecureLogDirectory failed; directory='{0}'; targetUser='{1}'" -f $Directory, $TargetUsername)
         throw (New-Object System.Exception($details, $_.Exception))
+    }
+}
+
+function Initialize-SecureInstallRoot {
+    <#
+      Program Files\LoginTimeLogger: admin + SYSTEM FullControl; target Deny
+      FullControl (no read/write/execute of sources/scripts).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$TargetUsername,
+        [Parameter(Mandatory)][string]$AdministratorProfile,
+        [string]$AdminUsername = ''
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $InstallRoot)) {
+            return
+        }
+
+        $acl = Get-Acl -LiteralPath $InstallRoot
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            $null = $acl.RemoveAccessRule($rule)
+        }
+
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $allowedAdminSid = $null
+        if (-not [string]::IsNullOrWhiteSpace($AdminUsername)) {
+            $allowedAdminSid = Resolve-WindowsAccountSid -UserName $AdminUsername -ProfilePath $AdministratorProfile
+        }
+        if (-not $allowedAdminSid) {
+            $allowedAdminSid = Resolve-WindowsAccountSid -UserName $AdministratorProfile -ProfilePath $AdministratorProfile
+        }
+        if (-not $allowedAdminSid) {
+            throw ("Could not resolve administrator account for install-root ACL. AdminUsername='{0}'; profile='{1}'." -f `
+                    $AdminUsername, $AdministratorProfile)
+        }
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $allowedAdminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+
+        $targetSid = Resolve-WindowsAccountSid -UserName $TargetUsername -ProfilePath $AdministratorProfile
+        if ($targetSid -and $targetSid.Value -ne $allowedAdminSid.Value) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+        }
+        elseif ($targetSid -and $targetSid.Value -eq $allowedAdminSid.Value) {
+            Write-LoggerEvent -Level INFO -Message (
+                "TargetUsername '{0}' matches admin; skipping deny ACE on install root '{1}'." -f `
+                    $TargetUsername, $InstallRoot)
+        }
+
+        Set-Acl -LiteralPath $InstallRoot -AclObject $acl
+        Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try {
+                    Set-Acl -LiteralPath $_.FullName -AclObject $acl
+                }
+                catch { }
+            }
+    }
+    catch {
+        $details = Format-ErrorDetails -ErrorRecord $_ -Context (
+            "Initialize-SecureInstallRoot failed; installRoot='{0}'; targetUser='{1}'" -f `
+                $InstallRoot, $TargetUsername)
+        Write-LoggerEvent -Level WARN -Message $details
     }
 }
 
@@ -1017,6 +1086,11 @@ try {
         -AdminUsername $config.AdminUsername
     Initialize-SecureSshDirectory `
         -Directory (Join-Path $adminAppDirectory 'ssh') `
+        -AdministratorProfile $config.AdministratorProfile `
+        -AdminUsername $config.AdminUsername
+    Initialize-SecureInstallRoot `
+        -InstallRoot (Join-Path $env:ProgramFiles 'LoginTimeLogger') `
+        -TargetUsername $config.TargetUsername `
         -AdministratorProfile $config.AdministratorProfile `
         -AdminUsername $config.AdminUsername
 

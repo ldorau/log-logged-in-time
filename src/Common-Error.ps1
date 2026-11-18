@@ -279,8 +279,8 @@ function Resolve-ErrorLogPathFromConfig {
 function Get-LoginTimeLoggerRuntimeConfigPath {
     <#
       Resolves the installed runtime config path from the LoginTimeLogger task
-      (-ConfigPath argument). Lets Status/Get-LockedTime run as the target user
-      without guessing the admin profile.
+      (-ConfigPath argument). Lets Status/Get-LockedTime find the admin
+      runtime config without guessing the profile path.
     #>
     param([string]$TaskName = 'LoginTimeLogger')
 

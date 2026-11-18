@@ -7,7 +7,7 @@
   unlocked-time-YYYY-MM-DD.log and sums intervals between them.
   Does not change monitor behavior or other scripts. LOCKED_OR_AWAY means
   not unlocked-active (screen lock or away / no active session).
-  Works for the install admin or the measured target user (read-only logs).
+  Run as the install admin (logs are denied to the measured target user).
 .PARAMETER Date
   Calendar day to analyze (local). Default: today.
 .PARAMETER AllDays

@@ -289,6 +289,43 @@ try {
             -ClonePath $sourceRoot `
             -InstallRoot $installRoot
 
+        # Re-deny the measured user on Program Files sources/scripts after publish.
+        try {
+            $targetUsername = [string](Get-OptionalPropertyValue `
+                    -InputObject $runtimeRaw -Name 'TargetUsername')
+            if (-not [string]::IsNullOrWhiteSpace($adminUsername) -and
+                -not [string]::IsNullOrWhiteSpace($targetUsername) -and
+                (Test-Path -LiteralPath $installRoot)) {
+                $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+                $adminSid = Resolve-WindowsAccountSid -UserName $adminUsername `
+                    -ProfilePath $adminProfile
+                $targetSid = Resolve-WindowsAccountSid -UserName $targetUsername `
+                    -ProfilePath $adminProfile
+                if ($adminSid) {
+                    $installedAcl = Get-Acl -LiteralPath $installRoot
+                    $installedAcl.SetAccessRuleProtection($true, $false)
+                    foreach ($rule in @($installedAcl.Access)) {
+                        $null = $installedAcl.RemoveAccessRule($rule)
+                    }
+                    $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                $adminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                    $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                    if ($targetSid -and $targetSid.Value -ne $adminSid.Value) {
+                        $installedAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                    $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+                    }
+                    Set-Acl -LiteralPath $installRoot -AclObject $installedAcl
+                    Write-Host ("Install-root ACL: admin+SYSTEM full; target '{0}' denied." -f $targetUsername) `
+                        -ForegroundColor DarkGray
+                }
+            }
+        }
+        catch {
+            Write-Host ("WARNING: could not harden install-root ACL: {0}" -f $_.Exception.Message) `
+                -ForegroundColor Yellow
+        }
+
         # Record tip when possible so the next self-update is not confused.
         $gitExe = $null
         if (Get-Command Find-GitExecutable -ErrorAction SilentlyContinue) {
