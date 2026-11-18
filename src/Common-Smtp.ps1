@@ -371,6 +371,22 @@ function Send-LoginTimeSmtpAlert {
                 $attachmentNotes.Add(("attached: {0} ({1} bytes)" -f $full, $item.Length))
             }
 
+            # Mail clients often hide/block .log; attach service.log as *.txt.
+            if ([string]::Equals($item.Name, 'service.log', [StringComparison]::OrdinalIgnoreCase)) {
+                $txtPath = Join-Path $env:TEMP (
+                    'LoginTimeLogger-service-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    Copy-Item -LiteralPath $attachPath -Destination $txtPath -Force -ErrorAction Stop
+                    $tempAttachments.Add($txtPath)
+                    $attachmentNotes.Add(('renamed for mail: service.log -> {0}' -f (Split-Path -Leaf $txtPath)))
+                    $attachPath = $txtPath
+                }
+                catch {
+                    $attachmentNotes.Add(('service.log .txt copy failed; attaching original: {0}' -f `
+                            $_.Exception.Message))
+                }
+            }
+
             $attachmentPaths.Add($attachPath)
         }
 

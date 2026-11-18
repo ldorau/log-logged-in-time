@@ -1440,7 +1440,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $updateState.LastLocalCommit = $localSha
         $updateState.LastUpdateCheckUtc = [datetime]::UtcNow.ToString('o')
 
-        if ($localSha -and ($localSha -eq $remoteSha)) {
+        # commands.txt "update" sets ScpCommandsTraceLogPath: always sync the clone,
+        # then log `git log -1 --oneline` (even when already on remote tip).
+        $fromRemoteCommands = $Force -and
+            -not [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsTraceLogPath)
+
+        if ($localSha -and ($localSha -eq $remoteSha) -and -not $fromRemoteCommands) {
             $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
             $updateState.LastResult = 'up-to-date'
             Write-UpdateState -Path $statePath -State $updateState
@@ -1481,9 +1486,65 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             return
         }
 
-        Write-LoggerEvent ("Update available: local={0}; remote={1}. Syncing repository..." -f $(if ($localSha) { $localSha } else { '(none)' }), $remoteSha)
+        if ($localSha -and ($localSha -eq $remoteSha) -and $fromRemoteCommands) {
+            Write-LoggerEvent ("commands.txt update: already on {0}; syncing clone then logging git log -1 --oneline." -f $remoteSha)
+        }
+        else {
+            Write-LoggerEvent ("Update available: local={0}; remote={1}. Syncing repository..." -f $(if ($localSha) { $localSha } else { '(none)' }), $remoteSha)
+        }
 
         $newHead = Sync-UpdateRepository -GitExe $gitExe -RepoUrl $Config.UpdateRepoUrl -Branch $Config.UpdateBranch -ClonePath $Config.UpdateClonePath
+
+        # commands.txt "update": always log HEAD after the repo sync.
+        if ($fromRemoteCommands -and
+            (Get-Command Write-ScpCommandsGitHeadOneline -ErrorAction SilentlyContinue)) {
+            try {
+                Write-ScpCommandsGitHeadOneline -Config $Config `
+                    -TraceLogPath ([string]$script:ScpCommandsTraceLogPath)
+            }
+            catch { }
+        }
+
+        # Already installed tip after sync: no publish/restart; still email commands transcript.
+        if ($localSha -and ($localSha -eq $newHead)) {
+            $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
+            $updateState.LastResult = 'up-to-date'
+            Write-UpdateState -Path $statePath -State $updateState
+            Write-LoggerEvent ("Update check: already on latest commit {0} after sync." -f $newHead)
+            if (-not [string]::IsNullOrWhiteSpace([string]$Config.UpdateClonePath) -and
+                (Test-Path -LiteralPath ([string]$Config.UpdateClonePath))) {
+                Merge-InstalledConfigFilesFromRepo `
+                    -ClonePath $Config.UpdateClonePath `
+                    -AdminAppDirectory $AdminAppDirectory `
+                    -ConfigPath ([string]$Config.ConfigPath) `
+                    -Config $Config `
+                    -OptInUnlockQuotaOnExisting
+            }
+            Invoke-DailyDnsForceLocalResolver `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath `
+                -Config $Config
+            Invoke-DailyDoHFirewallBlock `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath
+            Invoke-DailyVpnFirewallBlock `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath
+            Invoke-DailyScpOutboundAllow `
+                -InstallRoot $InstallRoot `
+                -ClonePath ([string]$Config.UpdateClonePath) `
+                -UpdateState $updateState `
+                -StatePath $statePath `
+                -Config $Config
+            return
+        }
+
         Publish-InstalledFilesFromRepo -ClonePath $Config.UpdateClonePath -InstallRoot $InstallRoot
         if (Get-Command Initialize-SecureInstallRoot -ErrorAction SilentlyContinue) {
             Initialize-SecureInstallRoot `
@@ -1512,6 +1573,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
         $updateState.LastResult = 'updated-restarting'
         Write-UpdateState -Path $statePath -State $updateState
         Write-LoggerEvent ("Updated installed files to commit {0}." -f $newHead)
+
+        # Email commands transcript (includes post-sync git log) before restart.
+        if ($fromRemoteCommands -and
+            (Get-Command Send-ScpCommandsDeferredRunAlert -ErrorAction SilentlyContinue)) {
+            try { $null = Send-ScpCommandsDeferredRunAlert -Config $Config } catch { }
+        }
 
         $gitLogNewText = '(git log -1 unavailable)'
         try {

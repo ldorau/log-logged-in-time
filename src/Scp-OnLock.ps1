@@ -2163,6 +2163,83 @@ function New-RemoteCumulativeResetSpec {
     }
 }
 
+function Write-ScpCommandsGitHeadOneline {
+    <#
+      Trace `git log -1 --oneline` for UpdateClonePath (commands.txt update).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TraceLogPath
+    )
+
+    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message 'git log -1 --oneline'
+    $repo = ''
+    if ($Config -and -not [string]::IsNullOrWhiteSpace([string]$Config.UpdateClonePath)) {
+        $repo = [string]$Config.UpdateClonePath
+    }
+    if ([string]::IsNullOrWhiteSpace($repo) -or -not (Test-Path -LiteralPath $repo -PathType Container)) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+            "git log -1 --oneline: UpdateClonePath missing or not a directory ('{0}')" -f $repo)
+        return
+    }
+
+    $gitExe = $null
+    if (Get-Command Find-GitExecutable -ErrorAction SilentlyContinue) {
+        try { $gitExe = Find-GitExecutable } catch { $gitExe = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($gitExe)) {
+        $cmd = Get-Command git.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $gitExe = [string]$cmd.Source }
+    }
+    if ([string]::IsNullOrWhiteSpace($gitExe)) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+            'git log -1 --oneline: git.exe not found')
+        return
+    }
+
+    try {
+        if (Get-Command Invoke-GitCommand -ErrorAction SilentlyContinue) {
+            $gitResult = Invoke-GitCommand -GitExe $gitExe -RepoPath $repo `
+                -Arguments @('log', '-1', '--oneline')
+            $out = [string]$gitResult.Output
+            if ([string]::IsNullOrWhiteSpace($out)) {
+                $out = '(no output)'
+            }
+            foreach ($line in @(($out -split '\r?\n'))) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message $line.TrimEnd()
+            }
+            if ([int]$gitResult.ExitCode -ne 0) {
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                    "git log -1 --oneline: exit {0}" -f $gitResult.ExitCode)
+            }
+        }
+        else {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = & $gitExe -C $repo @('log', '-1', '--oneline') 2>&1
+                $exitCode = [int]$LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $prevEap
+            }
+            foreach ($line in @($output | ForEach-Object { "$_" })) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message $line.TrimEnd()
+            }
+            if ($exitCode -ne 0) {
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                    "git log -1 --oneline: exit {0}" -f $exitCode)
+            }
+        }
+    }
+    catch {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+            "git log -1 --oneline failed: {0}" -f $_.Exception.Message)
+    }
+}
+
 function Queue-RemoteCumulativeReset {
     param(
         [Parameter(Mandatory)]$Spec,
@@ -2431,6 +2508,29 @@ function Send-ScpCommandsRunAlert {
             -Attachment @($attachments))
 }
 
+function Send-ScpCommandsDeferredRunAlert {
+    <#
+      Send the pending commands-run email using script:ScpCommandsTraceLogPath /
+      script:ScpCommandsEmailBody (set before a remote "update" that may restart).
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $trace = [string]$script:ScpCommandsTraceLogPath
+    $body = [string]$script:ScpCommandsEmailBody
+    if ([string]::IsNullOrWhiteSpace($trace) -or [string]::IsNullOrWhiteSpace($body)) {
+        return $false
+    }
+    if (-not (Get-Command Send-ScpCommandsRunAlert -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    Write-ScpCommandsTrace -LogPath $trace -Message 'email: sending commands run transcript'
+    $sent = Send-ScpCommandsRunAlert -Config $Config -TraceLogPath $trace -Body $body
+    Write-ScpCommandsTrace -LogPath $trace -Message ("email: sent={0}" -f [bool]$sent)
+    $script:ScpCommandsEmailBody = $null
+    return [bool]$sent
+}
+
 function Invoke-ScpCommandsFatal {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -2641,7 +2741,6 @@ function Invoke-ScpCommandsFileExchange {
     }
     catch { $resetCount = 0 }
 
-    # Email transcript before delete / terminating actions.
     $emailBody = @(
         'LoginTimeLogger remote commands.txt was processed.'
         ''
@@ -2655,25 +2754,7 @@ function Invoke-ScpCommandsFileExchange {
         ('ResetCount: {0}' -f $resetCount)
     ) -join [Environment]::NewLine
 
-    # Email only when a non-empty commands.txt was downloaded (skip missing/0-byte).
-    if ($downloaded -and $downloadedBytes -gt 0) {
-        try {
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'email: sending commands run transcript'
-            $sent = Send-ScpCommandsRunAlert -Config $Config -TraceLogPath $traceLogPath -Body $emailBody
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                "email: sent={0}" -f [bool]$sent)
-        }
-        catch {
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-                "email: failed: {0}" -f $_.Exception.Message)
-        }
-    }
-    elseif ($downloaded -and $downloadedBytes -le 0) {
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-            'email: skipped (downloaded commands.txt size=0)')
-    }
-
-    # Delete downloaded commands.txt (always when present).
+    # Delete downloaded commands.txt (always when present) before deferred actions.
     if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
         try {
             Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
@@ -2687,7 +2768,7 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
-    # Deferred actions (after remote clear + email + local delete).
+    # Deferred actions (after remote clear + local delete).
     # reset: queue for the monitor poll loop (applies to live $state before Write-State).
     # Do not wrap List[object] in @(...): that throws ArgumentException under PS 5.1 StrictMode.
     $resetSpecsEnum = @()
@@ -2714,6 +2795,31 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
+    # When "update" will run, defer email until after the repo sync so the
+    # inlined transcript includes `git log -1 --oneline` of the new HEAD.
+    $deferEmailForUpdate = [bool]$cmdResult.WantUpdate -and [bool]$Config.UpdateEnabled
+    if ($downloaded -and $downloadedBytes -gt 0 -and -not $deferEmailForUpdate) {
+        try {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'email: sending commands run transcript'
+            $sent = Send-ScpCommandsRunAlert -Config $Config -TraceLogPath $traceLogPath -Body $emailBody
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "email: sent={0}" -f [bool]$sent)
+        }
+        catch {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                "email: failed: {0}" -f $_.Exception.Message)
+        }
+    }
+    elseif ($downloaded -and $downloadedBytes -le 0) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'email: skipped (downloaded commands.txt size=0)')
+    }
+    elseif ($deferEmailForUpdate) {
+        $script:ScpCommandsEmailBody = $emailBody
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'email: deferred until after update (to include git log -1 --oneline)')
+    }
+
     $ctx = Resolve-ScpCommandsInstallContext -Config $Config
     if ($cmdResult.WantUpdate) {
         Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: update'
@@ -2738,13 +2844,47 @@ function Invoke-ScpCommandsFileExchange {
         }
         else {
             # May exit 0 after a successful sync+publish (Restart-LoginTimeLoggerProcess).
-            Invoke-LoginTimeLoggerUpdateCheck `
-                -Config $Config `
-                -InstallRoot $ctx.InstallRoot `
-                -AdminAppDirectory $ctx.AdminAppDirectory `
-                -Force
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                'execute update: returned (no restart; already current or postponed)')
+            # Update-Check logs `git log -1 --oneline` and emails after the repo update.
+            $script:ScpCommandsTraceLogPath = $traceLogPath
+            $script:ScpCommandsEmailBody = $emailBody
+            $updateEmailSent = $false
+            try {
+                Invoke-LoginTimeLoggerUpdateCheck `
+                    -Config $Config `
+                    -InstallRoot $ctx.InstallRoot `
+                    -AdminAppDirectory $ctx.AdminAppDirectory `
+                    -Force
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    'execute update: returned (no restart; already current or postponed)')
+                # No repo change / no restart: still send the deferred commands email.
+                if ($downloaded -and $downloadedBytes -gt 0 -and
+                    -not [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsEmailBody)) {
+                    try {
+                        $null = Send-ScpCommandsDeferredRunAlert -Config $Config
+                        $updateEmailSent = $true
+                    }
+                    catch {
+                        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                            "email: failed: {0}" -f $_.Exception.Message)
+                    }
+                }
+            }
+            finally {
+                if (-not $updateEmailSent -and
+                    $downloaded -and $downloadedBytes -gt 0 -and
+                    -not [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsEmailBody)) {
+                    # Update returned without restart (or failed before exit): still email.
+                    try { $null = Send-ScpCommandsDeferredRunAlert -Config $Config } catch { }
+                }
+                $script:ScpCommandsTraceLogPath = $null
+                $script:ScpCommandsEmailBody = $null
+            }
+        }
+        elseif ($downloaded -and $downloadedBytes -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsEmailBody)) {
+            # update was queued but skipped/failed before Invoke: flush deferred email.
+            try { $null = Send-ScpCommandsDeferredRunAlert -Config $Config } catch { }
+            $script:ScpCommandsEmailBody = $null
         }
     }
 
