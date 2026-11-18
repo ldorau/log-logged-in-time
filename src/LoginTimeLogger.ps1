@@ -1273,7 +1273,7 @@ while ($true) {
         # Periodic BHistory CSV convert + today's unlocked-time log via SCP.
         $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
         if ($bHistoryIntervalMin -le 0) {
-            $bHistoryIntervalMin = 5
+            $bHistoryIntervalMin = 1
         }
         $dueBHistory = ($nowUtc - $script:LastBHistoryScpUtc).TotalMinutes -ge $bHistoryIntervalMin
         if ($dueBHistory) {

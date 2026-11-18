@@ -6,8 +6,10 @@
   Reads the LoginTimeLogger runtime config and uploads:
     - every unlocked-time-*.log under LogDirectory
     - all error logs (errors.log / *error*.log, plus Get-ErrorLogPath)
-    - unlocked-time-summary.csv
     - state.json
+    - every *.csv under LogDirectory (recursive), including
+      unlocked-time-summary.csv and LogDirectory\bhist\ history CSVs
+      (today's history CSVs are refreshed via convert before collect)
     - raw browser History DBs: log-history-op-<profile> and
       log-history-ch-<profile> for every discovered browser profile
       (Default, Profile-1, …); also any non-.csv log-history-* already under

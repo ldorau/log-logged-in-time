@@ -67,8 +67,9 @@ Existing installs that receive `UnlockQuota*` via **self-update** merge get `Unl
 
 - the **two newest** `unlocked-time-*.log` files under `LogDirectory`
 - all error logs (`errors.log` / `*error*.log`, including the configured error log path)
+- `service.log`
 
-to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`), `ServerAliveInterval` keepalives, and a **90s hard process timeout** so a stalled transfer cannot block the monitor for hours. Defaults for empty key paths:
+to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (`BatchMode=yes`), `ServerAliveInterval` keepalives, and a **payload-scaled hard process timeout** (90–600s) so a stalled transfer cannot block the monitor for hours. Defaults for empty key paths:
 
 - `ScpIdentityFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\id_ed25519`
 - `ScpKnownHostsFile` → `<AdministratorProfile>\LoginTimeLogger\ssh\known_hosts`
@@ -77,7 +78,7 @@ to `ScpUser@ScpHost:ScpRemoteDirectory/`. Uses OpenSSH `scp.exe` with key auth (
 
 When SCP-on-lock is enabled, Install and the daily self-update check also reconcile an outbound Windows Firewall **Allow** rule for `ScpHost:ScpPort` (`scripts/Allow-ScpOutboundFirewall.ps1`, prefix `SCP-Allow:`).
 
-When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor also runs a **5‑minute** cycle that uploads today’s unlocked-time log and browser-history CSVs. At the **end** of that cycle it:
+When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor also runs a **1‑minute** cycle that uploads today’s unlocked-time log. At the **end** of that cycle it:
 
 1. Downloads `ScpRemoteDirectory/commands.txt` → `LogDirectory\commands\commands.txt` (missing remote file is OK; any other SCP failure is **FATAL**)
 2. Immediately uploads a **0-byte** `LogDirectory\commands-empty\commands.txt` to overwrite the remote `commands.txt` (SCP failure is **FATAL**)
@@ -89,7 +90,7 @@ List every remote command with arguments and description:
 .\scripts\Show-RemoteCommands.ps1
 ```
 
-To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `unlocked-time-summary.csv`, and `state.json`):
+To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, every `*.csv` under `LogDirectory`, and `state.json`):
 
 ```powershell
 .\scripts\Copy-LogsViaScp.ps1 -Force
@@ -147,7 +148,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Reset-CumulativeTime.ps1 01:30:00     # set to 1h30m
 .\scripts\Reset-CumulativeTime.ps1 +00:15:00    # add 15m
 .\scripts\Reset-CumulativeTime.ps1 '-00:10:00'  # subtract 10m (quote the leading '-')
-.\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + summary + state
+.\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + CSVs + state
 ```
 
 **Unlocked-time logs** (when the target user was logged in with the screen unlocked):

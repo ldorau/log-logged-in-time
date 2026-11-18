@@ -4,7 +4,7 @@
   Prints every remote commands.txt command with arguments and description.
 .DESCRIPTION
   Documents the verbs the monitor accepts in ScpRemoteDirectory/commands.txt
-  (downloaded each 5-minute SCP cycle). One command per line; blank lines and
+  (downloaded each 1-minute SCP cycle). One command per line; blank lines and
   # comments are ignored. Does not contact the remote host.
 .EXAMPLE
   .\scripts\Show-RemoteCommands.ps1

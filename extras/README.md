@@ -1,8 +1,11 @@
-# Extras: DNS forcing, DoH/DoT, and VPN firewall helpers
+# Extras: DNS forcing, DoH/DoT, VPN firewall helpers, and browser history
 
-Optional helpers under `scripts/`. They are not part of the core LoginTimeLogger
-time-tracking flow documented in the main README. Elevation required for
-add/remove (verify can run without elevation for DoH/VPN).
+Optional helpers under `scripts/` and docs in this folder. They are not part of
+the core LoginTimeLogger time-tracking flow documented in the main README.
+Elevation required for firewall add/remove (verify can run without elevation
+for DoH/VPN).
+
+Browser history CSV/DB export and SCP upload details: **[BROWSER-HISTORY.md](BROWSER-HISTORY.md)**.
 
 | Script | Role |
 |--------|------|

