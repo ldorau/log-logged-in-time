@@ -19,7 +19,7 @@ $commands = @(
     [pscustomobject]@{
         Command     = 'update'
         Arguments   = '(none)'
-        Description = 'Force-sync the update clone (git fetch + reset --hard), log git log -1 --oneline in the commands-run transcript, publish into Program Files when the installed commit changed, then restart the monitor. Always records HEAD after sync even when already up to date.'
+        Description = 'Force-sync the update clone (git fetch + reset --hard), log git log -1 --oneline in the commands-run transcript, always publish into Program Files from the synced clone, then restart the monitor.'
     }
     [pscustomobject]@{
         Command     = 'restart'

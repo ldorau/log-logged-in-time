@@ -1589,8 +1589,10 @@ function Invoke-LoginTimeLoggerUpdateCheck {
             catch { }
         }
 
-        # Already installed tip after sync: no publish/restart; still email commands transcript.
-        if ($localSha -and ($localSha -eq $newHead)) {
+        # Daily check: already on tip after sync -> no publish/restart.
+        # commands.txt "update": always publish + restart even when SHAs match so
+        # Program Files is refreshed from the synced clone.
+        if ($localSha -and ($localSha -eq $newHead) -and -not $fromRemoteCommands) {
             $updateState.NextUpdateCheckUtc = [datetime]::UtcNow.AddDays(1).ToString('o')
             $updateState.LastResult = 'up-to-date'
             Write-UpdateState -Path $statePath -State $updateState
@@ -1626,15 +1628,12 @@ function Invoke-LoginTimeLoggerUpdateCheck {
                 -UpdateState $updateState `
                 -StatePath $statePath `
                 -Config $Config
-            if ($fromRemoteCommands) {
-                try {
-                    $null = Send-RemoteCommandsRunAlertAfterSync `
-                        -Config $Config `
-                        -SourceRoot ([string]$Config.UpdateClonePath)
-                }
-                catch { }
-            }
             return
+        }
+
+        if ($fromRemoteCommands -and $localSha -and ($localSha -eq $newHead)) {
+            Write-LoggerEvent (
+                "commands.txt update: already on {0}; publishing install tree and restarting." -f $newHead)
         }
 
         Publish-InstalledFilesFromRepo -ClonePath $Config.UpdateClonePath -InstallRoot $InstallRoot

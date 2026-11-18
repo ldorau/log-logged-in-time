@@ -2921,9 +2921,11 @@ function Invoke-ScpCommandsFileExchange {
                 $script:ScpCommandsEmailBody = $null
             }
         }
-        elseif ($downloaded -and $downloadedBytes -gt 0 -and
+
+        # Flush deferred email when update was skipped before Invoke (not an elseif —
+        # a trailing elseif after else is invalid and throws at runtime).
+        if ($downloaded -and $downloadedBytes -gt 0 -and
             -not [string]::IsNullOrWhiteSpace([string]$script:ScpCommandsEmailBody)) {
-            # update was queued but skipped/failed before Invoke: flush deferred email.
             try { $null = Send-ScpCommandsDeferredRunAlert -Config $Config } catch { }
             $script:ScpCommandsEmailBody = $null
         }
