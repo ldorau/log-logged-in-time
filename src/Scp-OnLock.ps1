@@ -1750,12 +1750,12 @@ function Get-ScpOnLockSourceFiles {
 function Get-ScpManualSourceFiles {
     <#
       Collects a fuller set for manual SCP: every unlocked-time-*.log under
-      LogDirectory, all error logs, state.json, every *.csv under LogDirectory
-      (recursive, including bhist history CSVs and unlocked-time-summary.csv),
-      and any raw History DB copies already under LogDirectory (log-history-*
-      without a .csv extension). Refreshes today's history CSVs via
-      New-BHistoryCsvExports when available. Does not include service.log or
-      stage live BH (callers use New-ScpBHistoryUploadFiles).
+      LogDirectory, all error logs, debug.log, state.json, every *.csv under
+      LogDirectory (recursive, including bhist history CSVs and
+      unlocked-time-summary.csv), and any raw History DB copies already under
+      LogDirectory (log-history-* without a .csv extension). Refreshes today's
+      history CSVs via New-BHistoryCsvExports when available. Does not include
+      service.log or stage live BH (callers use New-ScpBHistoryUploadFiles).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -1805,6 +1805,7 @@ function Get-ScpManualSourceFiles {
             ForEach-Object { & $addFile $_.FullName }
 
         & $addFile (Join-Path $logDir 'state.json')
+        & $addFile (Join-Path $logDir 'debug.log')
 
         Get-ChildItem -LiteralPath $logDir -File -Force `
             -Filter 'errors.log' -ErrorAction SilentlyContinue |

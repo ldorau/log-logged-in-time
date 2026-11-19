@@ -90,7 +90,7 @@ List every remote command with arguments and description:
 .\scripts\Show-RemoteCommands.ps1
 ```
 
-To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, every `*.csv` under `LogDirectory`, and `state.json`):
+To upload a fuller set **manually** (every `unlocked-time-*.log`, all error logs, `debug.log`, every `*.csv` under `LogDirectory`, and `state.json`):
 
 ```powershell
 .\scripts\Copy-LogsViaScp.ps1 -Force

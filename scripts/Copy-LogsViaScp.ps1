@@ -6,6 +6,7 @@
   Reads the LoginTimeLogger runtime config and uploads:
     - every unlocked-time-*.log under LogDirectory
     - all error logs (errors.log / *error*.log, plus Get-ErrorLogPath)
+    - debug.log (break / unlock-warn traces under LogDirectory)
     - state.json
     - every *.csv under LogDirectory (recursive), including
       unlocked-time-summary.csv and LogDirectory\bhist\ history CSVs
