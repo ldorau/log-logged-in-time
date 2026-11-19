@@ -142,7 +142,21 @@ if ($Remove) {
     exit 0
 }
 
-# Resolve host/port from parameters and/or config.
+# Default ConfigPath to the installed runtime config when omitted so callers
+# (Copy-LogsViaScp / monitor) can rely on ScpHost without re-passing it.
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    if (Get-Command Get-LoginTimeLoggerRuntimeConfigPath -ErrorAction SilentlyContinue) {
+        try { $ConfigPath = [string](Get-LoginTimeLoggerRuntimeConfigPath) } catch { $ConfigPath = '' }
+    }
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $guess = Join-Path $env:USERPROFILE 'LoginTimeLogger\config.json'
+        if (Test-Path -LiteralPath $guess) {
+            $ConfigPath = $guess
+        }
+    }
+}
+
+# Resolve host/port from parameters and/or config (ScpHost / ScpPort).
 if ([string]::IsNullOrWhiteSpace($RemoteHost) -or $RemotePort -le 0) {
     $fromConfig = Resolve-ScpTargetFromConfig -Path $ConfigPath
     if ($fromConfig) {
@@ -159,7 +173,13 @@ if ($RemotePort -le 0) {
 }
 
 if ([string]::IsNullOrWhiteSpace($RemoteHost)) {
-    throw 'RemoteHost is required (pass -RemoteHost or a -ConfigPath with ScpHost set).'
+    $hint = if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        "ConfigPath='$ConfigPath' has empty ScpHost."
+    }
+    else {
+        'Pass -RemoteHost or -ConfigPath pointing at LoginTimeLogger config.json with ScpHost.'
+    }
+    throw ("RemoteHost is required. {0}" -f $hint)
 }
 
 $ruleName = '{0} TCP/{1} to {2}' -f $RulePrefix, $RemotePort, $RemoteHost

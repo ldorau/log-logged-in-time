@@ -267,8 +267,9 @@ function Test-ScpCopyTcpEndpoint {
 
 function Invoke-ScpOutboundFirewallReconcile {
     param(
-        [Parameter(Mandatory)][string]$RemoteHost,
-        [Parameter(Mandatory)][int]$RemotePort
+        [string]$RemoteHost = '',
+        [int]$RemotePort = 0,
+        [string]$ConfigPath = ''
     )
 
     $candidates = @(
@@ -289,19 +290,51 @@ function Invoke-ScpOutboundFirewallReconcile {
         }
     }
 
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $ConfigPath = [string]$resolvedConfigPath
+    }
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        try { $ConfigPath = [string](Get-LoginTimeLoggerRuntimeConfigPath) } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $guess = Join-Path $env:USERPROFILE 'LoginTimeLogger\config.json'
+        if (Test-Path -LiteralPath $guess) { $ConfigPath = $guess }
+    }
+
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $args = @(
-        '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
-        '-File', $scriptPath,
-        '-RemoteHost', $RemoteHost,
-        '-RemotePort', "$RemotePort"
-    )
+    # Build one ArgumentList string: Start-Process + string[] drops/mis-parses
+    # -RemoteHost on Windows PowerShell 5.1.
+    $argParts = New-Object System.Collections.Generic.List[string]
+    foreach ($a in @(
+            '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
+            '-File', $scriptPath
+        )) {
+        if ($a -match '[\s"]') {
+            $argParts.Add(('"{0}"' -f ($a -replace '"', '\"')))
+        }
+        else {
+            $argParts.Add($a)
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $argParts.Add('-ConfigPath')
+        $argParts.Add(('"{0}"' -f ($ConfigPath -replace '"', '\"')))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteHost)) {
+        $argParts.Add('-RemoteHost')
+        $argParts.Add($RemoteHost)
+    }
+    if ($RemotePort -gt 0) {
+        $argParts.Add('-RemotePort')
+        $argParts.Add("$RemotePort")
+    }
+    $argLine = $argParts -join ' '
     try {
-        $p = Start-Process -FilePath $psExe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+        $p = Start-Process -FilePath $psExe -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
         $code = if ($null -ne $p) { [int]$p.ExitCode } else { -1 }
         return [pscustomobject]@{
             Ok     = ($code -eq 0)
-            Detail = ("{0} exit={1}" -f $scriptPath, $code)
+            Detail = ("{0} exit={1}; args={2}" -f $scriptPath, $code, $argLine)
         }
     }
     catch {
@@ -317,10 +350,14 @@ function Get-ScpCopyFileBatches {
       Split manual uploads into small batches so a single OpenSSH connect
       failure / command-line limit does not abort the entire set. Large raw
       History DBs (no .csv / .log / .json) go one per batch.
+
+      Returns PSCustomObject rows @{ Files = string[] }. Avoid List[object] /
+      @($list) — those throw ArgumentException ("Niezgodne typy argumentów")
+      under PS 5.1 StrictMode.
     #>
     param([Parameter(Mandatory)][string[]]$Files)
 
-    $batches = New-Object System.Collections.Generic.List[object]
+    $batches = New-Object System.Collections.ArrayList
     $current = New-Object System.Collections.Generic.List[string]
     $currentBytes = [int64]0
     $maxFiles = 8
@@ -339,29 +376,41 @@ function Get-ScpCopyFileBatches {
         $isRawHistory = ($leaf -like 'log-history-*') -and ($ext -ne '.csv')
         if ($isRawHistory) {
             if ($current.Count -gt 0) {
-                $batches.Add(@($current.ToArray()))
+                [void]$batches.Add([pscustomobject]@{
+                        Files = [string[]]$current.ToArray()
+                    })
                 $current.Clear()
                 $currentBytes = [int64]0
             }
-            $batches.Add(@($path))
+            [void]$batches.Add([pscustomobject]@{
+                    Files = [string[]]@($path)
+                })
             continue
         }
 
         if ($current.Count -ge $maxFiles -or
             ($current.Count -gt 0 -and ($currentBytes + $size) -gt $maxBytes)) {
             if ($current.Count -gt 0) {
-                $batches.Add(@($current.ToArray()))
+                [void]$batches.Add([pscustomobject]@{
+                        Files = [string[]]$current.ToArray()
+                    })
                 $current.Clear()
                 $currentBytes = [int64]0
             }
         }
-        $current.Add($path)
+        [void]$current.Add($path)
         $currentBytes += $size
     }
     if ($current.Count -gt 0) {
-        $batches.Add(@($current.ToArray()))
+        [void]$batches.Add([pscustomobject]@{
+                Files = [string[]]$current.ToArray()
+            })
     }
-    return @($batches)
+    if ($batches.Count -eq 0) {
+        return @()
+    }
+    # Caller wraps with @(): a single PSCustomObject batch stays one item.
+    return [object[]]$batches.ToArray()
 }
 
 function Invoke-ScpCopyFiles {
@@ -397,6 +446,7 @@ function Invoke-ScpCopyFiles {
         $identityForScp = $tempIdentity
     }
 
+    # Keep @() around the call result; each item is a PSCustomObject with .Files.
     $batches = @(Get-ScpCopyFileBatches -Files $Files)
     if ($batches.Count -eq 0) {
         throw 'No existing files to copy.'
@@ -413,7 +463,16 @@ function Invoke-ScpCopyFiles {
         $batchIndex = 0
         foreach ($batch in $batches) {
             $batchIndex++
-            $batchFiles = @($batch)
+            $batchFiles = @()
+            if ($null -ne $batch -and $null -ne $batch.PSObject.Properties['Files']) {
+                $batchFiles = @($batch.Files)
+            }
+            elseif ($batch -is [string]) {
+                $batchFiles = [string[]]@($batch)
+            }
+            elseif ($batch -is [System.Array]) {
+                $batchFiles = [string[]]@($batch)
+            }
             if ($batchFiles.Count -eq 0) { continue }
 
             $totalBytes = [int64]0
@@ -629,7 +688,8 @@ try {
     Write-ScpCopyLine 'Step 1b: outbound SCP firewall + TCP reachability' -ForegroundColor Cyan
     $fw = Invoke-ScpOutboundFirewallReconcile `
         -RemoteHost ([string]$cfg.ScpHost) `
-        -RemotePort ([int]$cfg.ScpPort)
+        -RemotePort ([int]$cfg.ScpPort) `
+        -ConfigPath ([string]$cfg.ConfigPath)
     Write-Check -Name 'SCP-Allow firewall' -Ok $fw.Ok -Status $(if ($fw.Ok) { 'OK' } else { 'WARN' }) `
         -Detail $fw.Detail
 

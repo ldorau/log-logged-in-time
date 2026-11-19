@@ -550,14 +550,26 @@ function Invoke-ScpOutboundAllowReconcile {
 
     $script:LastScpAllowReconcileUtc = $now
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = @(
+    # Single ArgumentList string: string[] form drops -RemoteHost on WinPS 5.1.
+    $quote = {
+        param([string]$Value)
+        if ($Value -match '[\s"]') {
+            return ('"{0}"' -f ($Value -replace '"', '\"'))
+        }
+        return $Value
+    }
+    $argParts = @(
         '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
-        '-File', $scriptPath,
+        '-File', (& $quote $scriptPath),
         '-RemoteHost', ([string]$Config.ScpHost).Trim(),
         '-RemotePort', "$port"
     )
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ConfigPath)) {
+        $argParts += @('-ConfigPath', (& $quote ([string]$Config.ConfigPath)))
+    }
+    $argLine = $argParts -join ' '
     try {
-        $p = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru -WindowStyle Hidden
+        $p = Start-Process -FilePath $psExe -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
         $code = if ($null -ne $p) { [int]$p.ExitCode } else { -1 }
         if ($code -eq 0) {
             Write-LoggerEvent ("SCP-Allow firewall reconcile OK ({0}:{1})" -f $Config.ScpHost, $port)
