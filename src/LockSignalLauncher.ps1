@@ -1,5 +1,11 @@
 # Shared helper: write the hidden wscript launcher for LockSignalWatcher.
-# Dot-sourced by Install.ps1 and Update-Check.ps1.
+# Dot-sourced by Install.ps1, Update-Check.ps1, and Restart.ps1.
+#
+# IMPORTANT: The lock-signal scheduled task runs as the *target* interactive
+# user. Program Files\LoginTimeLogger denies that user (no read/execute), so
+# the VBS + watcher must live under the ProgramData lock-signal directory
+# (target already has Modify there). Otherwise the task exits 1 immediately
+# and lock-signal.json goes stale.
 
 function Write-LockSignalHiddenLauncher {
     <#
@@ -41,4 +47,209 @@ function Write-LockSignalHiddenLauncher {
         'sh.Run cmd, 0, True'
     ) -join "`r`n"
     Set-Content -LiteralPath $LauncherPath -Value $vbs -Encoding ASCII
+}
+
+function Get-LockSignalUserReadableDirectory {
+    <#
+      Directory that the interactive target user can read/execute (ProgramData
+      lock-signal folder). Falls back to %ProgramData%\LoginTimeLogger.
+    #>
+    param([string]$SignalPath = '')
+
+    if (-not [string]::IsNullOrWhiteSpace($SignalPath)) {
+        $parent = Split-Path -Parent $SignalPath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            return $parent
+        }
+    }
+    return (Join-Path $env:ProgramData 'LoginTimeLogger')
+}
+
+function Publish-LockSignalWatcherForUserLaunch {
+    <#
+      Copies LockSignalWatcher.ps1 into the user-readable signal directory and
+      writes Start-LockSignalWatcher.vbs there (not under Program Files Deny).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceWatcherPath,
+        [Parameter(Mandatory)][string]$TargetUsername,
+        [Parameter(Mandatory)][string]$SignalPath,
+        [int]$HeartbeatSeconds = 15
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceWatcherPath)) {
+        throw ("LockSignalWatcher source missing: {0}" -f $SourceWatcherPath)
+    }
+
+    $destDir = Get-LockSignalUserReadableDirectory -SignalPath $SignalPath
+    if (-not (Test-Path -LiteralPath $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+
+    $destWatcher = Join-Path $destDir 'LockSignalWatcher.ps1'
+    $destLauncher = Join-Path $destDir 'Start-LockSignalWatcher.vbs'
+    Copy-Item -LiteralPath $SourceWatcherPath -Destination $destWatcher -Force
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Write-LockSignalHiddenLauncher `
+        -LauncherPath $destLauncher `
+        -PowerShellExe $windowsPowerShell `
+        -WatcherScript $destWatcher `
+        -TargetUsername $TargetUsername `
+        -SignalPath $SignalPath `
+        -HeartbeatSeconds $HeartbeatSeconds
+
+    return [pscustomobject]@{
+        Directory     = $destDir
+        WatcherScript = $destWatcher
+        LauncherVbs   = $destLauncher
+    }
+}
+
+function Ensure-LockSignalScheduledTask {
+    <#
+      Registers/updates LoginTimeLoggerLockSignal to run the user-readable VBS
+      as the target interactive user, then best-effort Start-ScheduledTask.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TargetUsername,
+        [Parameter(Mandatory)][string]$LauncherVbsPath,
+        [string]$TaskName = 'LoginTimeLoggerLockSignal'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetUsername)) {
+        throw 'TargetUsername is required for Ensure-LockSignalScheduledTask.'
+    }
+    if (-not (Test-Path -LiteralPath $LauncherVbsPath)) {
+        throw ("Lock-signal launcher VBS missing: {0}" -f $LauncherVbsPath)
+    }
+
+    $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $lockWatcherArgs = '//B //Nologo "{0}"' -f $LauncherVbsPath
+    $lockAction = New-ScheduledTaskAction -Execute $wscriptExe -Argument $lockWatcherArgs
+    $lockTrigger = New-ScheduledTaskTrigger -AtLogOn -User $TargetUsername
+    $lockSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -MultipleInstances IgnoreNew `
+        -DontStopOnIdleEnd `
+        -Hidden
+    $lockPrincipal = New-ScheduledTaskPrincipal -UserId $TargetUsername -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $TaskName -Action $lockAction -Trigger $lockTrigger `
+        -Settings $lockSettings -Principal $lockPrincipal -Force -ErrorAction Stop | Out-Null
+
+    $started = $false
+    $startError = ''
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        $started = $true
+    }
+    catch {
+        $startError = $_.Exception.Message
+        try {
+            $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+            $proc = Start-Process -FilePath $schtasks -ArgumentList @('/Run', '/TN', $TaskName) `
+                -Wait -PassThru -WindowStyle Hidden
+            if ($null -ne $proc -and [int]$proc.ExitCode -eq 0) {
+                $started = $true
+                $startError = ''
+            }
+            else {
+                $exit = if ($null -ne $proc) { $proc.ExitCode } else { '(null)' }
+                $startError = ("schtasks /Run exit={0}; {1}" -f $exit, $startError)
+            }
+        }
+        catch {
+            $startError = $_.Exception.Message
+        }
+    }
+
+    return [pscustomobject]@{
+        TaskName  = $TaskName
+        Started   = $started
+        StartError = $startError
+        Launcher  = $LauncherVbsPath
+    }
+}
+
+function Test-LockSignalFileFresh {
+    <#
+      True when lock-signal.json UpdatedUtc is within MaxAgeSeconds (default 90).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SignalPath,
+        [int]$MaxAgeSeconds = 90
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SignalPath) -or -not (Test-Path -LiteralPath $SignalPath)) {
+        return $false
+    }
+    try {
+        $sig = Get-Content -LiteralPath $SignalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $updatedUtc = $null
+        $prop = $sig.PSObject.Properties['UpdatedUtc']
+        if ($null -ne $prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+            $updatedUtc = [datetime]::Parse(
+                [string]$prop.Value, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+        }
+        if ($null -eq $updatedUtc) {
+            return $false
+        }
+        $ageSec = ([datetime]::UtcNow - $updatedUtc.ToUniversalTime()).TotalSeconds
+        return ($ageSec -ge -60 -and $ageSec -le $MaxAgeSeconds)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Start-LockSignalTaskIfStale {
+    <#
+      Best-effort Start-ScheduledTask when the signal file is missing/stale.
+      Safe to call from SYSTEM monitor; fails quietly if no interactive session.
+    #>
+    param(
+        [string]$SignalPath = '',
+        [string]$TaskName = 'LoginTimeLoggerLockSignal',
+        [int]$MaxAgeSeconds = 90
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SignalPath)) {
+        $SignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    }
+
+    if (Test-LockSignalFileFresh -SignalPath $SignalPath -MaxAgeSeconds $MaxAgeSeconds) {
+        return $false
+    }
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        return $false
+    }
+    if ($task.State -eq 'Running') {
+        # Running but stale: kill/restart so a wedged wscript is replaced.
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch { }
+        Start-Sleep -Seconds 1
+    }
+
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        return $true
+    }
+    catch {
+        try {
+            $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+            $proc = Start-Process -FilePath $schtasks -ArgumentList @('/Run', '/TN', $TaskName) `
+                -Wait -PassThru -WindowStyle Hidden
+            return ($null -ne $proc -and [int]$proc.ExitCode -eq 0)
+        }
+        catch {
+            return $false
+        }
+    }
 }

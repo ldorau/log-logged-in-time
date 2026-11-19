@@ -1567,41 +1567,33 @@ SystemDrive: $env:SystemDrive
     }
 
     # User-context SessionSwitch watcher (primary Win+L signal when WTS/Desktop lie).
-    # Launch via wscript (hidden) - direct powershell.exe Interactive tasks flash a console.
+    # Must NOT launch from Program Files: that tree Denies the target user, so the
+    # Interactive task would exit 1 and leave lock-signal.json stale. Stage under
+    # the ProgramData signal directory (target already has Modify).
     $installedLockWatcher = Join-Path $installSrc 'LockSignalWatcher.ps1'
-    $lockLauncherVbs = Join-Path $installSrc 'Start-LockSignalWatcher.vbs'
-    $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    Write-LockSignalHiddenLauncher `
-        -LauncherPath $lockLauncherVbs `
-        -PowerShellExe $windowsPowerShell `
-        -WatcherScript $installedLockWatcher `
-        -TargetUsername $targetUsername `
-        -SignalPath $lockSignalPath `
-        -HeartbeatSeconds 15
-    $lockWatcherArgs = '//B //Nologo "{0}"' -f $lockLauncherVbs
     try {
-        $lockAction = New-ScheduledTaskAction -Execute $wscriptExe -Argument $lockWatcherArgs
-        $lockTrigger = New-ScheduledTaskTrigger -AtLogOn -User $targetUsername
-        # RestartInterval minimum accepted by Task Scheduler is 1 minute (PT15S fails with 0x80041318).
-        $lockSettings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable `
-            -RestartCount 999 `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
-            -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -MultipleInstances IgnoreNew `
-            -DontStopOnIdleEnd `
-            -Hidden
-        $lockPrincipal = New-ScheduledTaskPrincipal -UserId $targetUsername -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $lockSignalTaskName -Action $lockAction -Trigger $lockTrigger `
-            -Settings $lockSettings -Principal $lockPrincipal -Force -ErrorAction Stop | Out-Null
-        $registeredLock = Get-ScheduledTask -TaskName $lockSignalTaskName -ErrorAction Stop
-        if (-not $registeredLock) {
-            throw "Lock signal task '$lockSignalTaskName' was not present after Register-ScheduledTask."
+        $publishedLock = Publish-LockSignalWatcherForUserLaunch `
+            -SourceWatcherPath $installedLockWatcher `
+            -TargetUsername $targetUsername `
+            -SignalPath $lockSignalPath `
+            -HeartbeatSeconds 15
+        # Also keep a copy next to install sources for updates/reference.
+        $pfLauncher = Join-Path $installSrc 'Start-LockSignalWatcher.vbs'
+        Copy-Item -LiteralPath $publishedLock.LauncherVbs -Destination $pfLauncher -Force -ErrorAction SilentlyContinue
+
+        $ensureLock = Ensure-LockSignalScheduledTask `
+            -TargetUsername $targetUsername `
+            -LauncherVbsPath $publishedLock.LauncherVbs `
+            -TaskName $lockSignalTaskName
+        Write-Host ("Installed scheduled task '{0}' (At logon as {1}; launcher={2})." -f `
+                $lockSignalTaskName, $targetUsername, $publishedLock.LauncherVbs)
+        if ($ensureLock.Started) {
+            Write-Host ("Lock signal task '{0}' started." -f $lockSignalTaskName)
         }
-        Write-Host ("Installed scheduled task '{0}' (At logon as {1}, hidden wscript lock signal)." -f `
-                $lockSignalTaskName, $targetUsername)
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$ensureLock.StartError)) {
+            Write-Warning ("Could not start '{0}' now (user may need to log off/on): {1}" -f `
+                    $lockSignalTaskName, $ensureLock.StartError)
+        }
     }
     catch {
         $details = Format-ErrorDetails -ErrorRecord $_ -Context (
@@ -1628,9 +1620,11 @@ SystemDrive: $env:SystemDrive
             throw (New-Object System.Exception($details, $_.Exception))
         }
 
+        # Lock-signal start was already attempted in Ensure-LockSignalScheduledTask;
+        # retry once more after the monitor is up (interactive session may be ready).
         try {
             Start-ScheduledTask -TaskName $lockSignalTaskName -ErrorAction Stop
-            Write-Host ("Lock signal task '{0}' started (needs interactive logon session)." -f $lockSignalTaskName)
+            Write-Host ("Lock signal task '{0}' start requested (needs interactive logon session)." -f $lockSignalTaskName)
         }
         catch {
             Write-Warning ("Could not start '{0}' now (user may need to log off/on): {1}" -f `

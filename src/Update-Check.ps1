@@ -1272,7 +1272,6 @@ function Update-LockSignalHiddenLauncherFromConfig {
     . $launcherHelper
 
     $watcherScript = Join-Path $InstallRoot 'src\LockSignalWatcher.ps1'
-    $launcherPath = Join-Path $InstallRoot 'src\Start-LockSignalWatcher.vbs'
     if (-not (Test-Path -LiteralPath $watcherScript)) {
         Write-LoggerEvent -Level WARN -Message ("LockSignalWatcher.ps1 missing after update: {0}" -f $watcherScript)
         return
@@ -1283,15 +1282,43 @@ function Update-LockSignalHiddenLauncherFromConfig {
         $signalPath = [string]$Config.LockSignalPath
     }
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    Write-LockSignalHiddenLauncher `
-        -LauncherPath $launcherPath `
-        -PowerShellExe $windowsPowerShell `
-        -WatcherScript $watcherScript `
-        -TargetUsername ([string]$Config.TargetUsername) `
+    $targetUser = [string]$Config.TargetUsername
+    if ([string]::IsNullOrWhiteSpace($targetUser)) {
+        Write-LoggerEvent -Level WARN -Message 'Lock-signal refresh skipped: TargetUsername empty.'
+        return
+    }
+
+    # Stage under ProgramData (user-readable); PF Deny would exit the task with 1.
+    $published = Publish-LockSignalWatcherForUserLaunch `
+        -SourceWatcherPath $watcherScript `
+        -TargetUsername $targetUser `
         -SignalPath $signalPath `
         -HeartbeatSeconds 15
-    Write-LoggerEvent ("Refreshed lock-signal hidden launcher: {0}" -f $launcherPath)
+    # Keep a mirror under install src for reference / older tooling.
+    try {
+        Copy-Item -LiteralPath $published.LauncherVbs `
+            -Destination (Join-Path $InstallRoot 'src\Start-LockSignalWatcher.vbs') -Force
+    }
+    catch { }
+
+    Write-LoggerEvent ("Refreshed lock-signal hidden launcher: {0}" -f $published.LauncherVbs)
+
+    try {
+        $ensure = Ensure-LockSignalScheduledTask `
+            -TargetUsername $targetUser `
+            -LauncherVbsPath $published.LauncherVbs
+        if ($ensure.Started) {
+            Write-LoggerEvent ("Lock-signal task started after update ({0})." -f $ensure.TaskName)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$ensure.StartError)) {
+            Write-LoggerEvent -Level WARN -Message (
+                "Lock-signal task start after update: {0}" -f $ensure.StartError)
+        }
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "Lock-signal task ensure after update failed: {0}" -f $_.Exception.Message)
+    }
 }
 
 function Release-InstanceMutex {

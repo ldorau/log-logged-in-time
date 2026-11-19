@@ -8,7 +8,8 @@
   Program Files\LoginTimeLogger, merges missing config fields from the
   same checkout (not a stale UpdateClonePath), then restarts the
   LoginTimeLogger task. Use after git pull when self-update is stuck.
-  Does not git pull and does not touch the lock-signal task.
+  Does not git pull. Also republishes the lock-signal watcher to the
+  user-readable ProgramData path and restarts LoginTimeLoggerLockSignal.
 .PARAMETER TaskName
   Scheduled task name (default LoginTimeLogger).
 .PARAMETER ConfigPath
@@ -43,6 +44,7 @@ $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyI
 $repoRoot = Split-Path -Parent $scriptDir
 $commonErrorPath = Join-Path $repoRoot 'src\Common-Error.ps1'
 $updateCheckPath = Join-Path $repoRoot 'src\Update-Check.ps1'
+$lockSignalLauncherPath = Join-Path $repoRoot 'src\LockSignalLauncher.ps1'
 if (-not (Test-Path -LiteralPath $commonErrorPath)) {
     throw "Common-Error.ps1 missing at '$commonErrorPath'."
 }
@@ -50,6 +52,9 @@ if (-not (Test-Path -LiteralPath $updateCheckPath)) {
     throw "Update-Check.ps1 missing at '$updateCheckPath'."
 }
 . $commonErrorPath
+if (Test-Path -LiteralPath $lockSignalLauncherPath) {
+    . $lockSignalLauncherPath
+}
 
 # Used by Update-Check merge helpers when dotted into this script.
 function Write-LoggerEvent {
@@ -444,6 +449,52 @@ Install first: .\scripts\Install.ps1 -AdminUsername <admin> -TargetUsername <use
     }
     if ($null -ne $infoBefore -and $null -ne $infoAfter) {
         Write-Host ("Previous LastRun was: {0}" -f $infoBefore.LastRunTime)
+    }
+
+    # Republish lock-signal watcher outside Program Files Deny and restart the task.
+    $lockSignalTaskName = 'LoginTimeLoggerLockSignal'
+    $targetUsername = [string](Get-OptionalPropertyValue -InputObject $runtimeRaw -Name 'TargetUsername')
+    $lockSignalPath = Join-Path $env:ProgramData 'LoginTimeLogger\lock-signal.json'
+    $cfgLockSignal = Get-OptionalPropertyValue -InputObject $runtimeRaw -Name 'LockSignalPath'
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfgLockSignal)) {
+        $lockSignalPath = [string]$cfgLockSignal
+    }
+    $watcherSrc = Join-Path $installRoot 'src\LockSignalWatcher.ps1'
+    if (-not (Test-Path -LiteralPath $watcherSrc)) {
+        $watcherSrc = Join-Path $sourceRoot 'src\LockSignalWatcher.ps1'
+    }
+    if ((Get-Command Publish-LockSignalWatcherForUserLaunch -ErrorAction SilentlyContinue) -and
+        (Get-Command Ensure-LockSignalScheduledTask -ErrorAction SilentlyContinue) -and
+        -not [string]::IsNullOrWhiteSpace($targetUsername) -and
+        (Test-Path -LiteralPath $watcherSrc)) {
+        try {
+            Write-Host ("Refreshing lock-signal watcher for '{0}'..." -f $targetUsername) -ForegroundColor Cyan
+            $publishedLock = Publish-LockSignalWatcherForUserLaunch `
+                -SourceWatcherPath $watcherSrc `
+                -TargetUsername $targetUsername `
+                -SignalPath $lockSignalPath `
+                -HeartbeatSeconds 15
+            $ensureLock = Ensure-LockSignalScheduledTask `
+                -TargetUsername $targetUsername `
+                -LauncherVbsPath $publishedLock.LauncherVbs `
+                -TaskName $lockSignalTaskName
+            Write-Host ("Lock-signal launcher: {0}" -f $publishedLock.LauncherVbs)
+            if ($ensureLock.Started) {
+                Write-Host ("Lock-signal task '{0}' started." -f $lockSignalTaskName) -ForegroundColor Green
+            }
+            else {
+                Write-Host ("WARNING: could not start '{0}': {1}" -f `
+                        $lockSignalTaskName, $ensureLock.StartError) -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host ("WARNING: lock-signal refresh failed: {0}" -f $_.Exception.Message) `
+                -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host ("WARNING: skipped lock-signal refresh (missing helper/watcher/target).") `
+            -ForegroundColor Yellow
     }
 
     if ($taskAfter.State -ne 'Running') {

@@ -309,6 +309,10 @@ try {
                 elseif ($lockCode -eq [uint32]0) {
                     $lockNote = ' = success'
                 }
+                elseif ($lockCode -eq [uint32]1) {
+                    $lockNote = (' = exit 1 (often VBS/watcher unreadable under Program Files ' +
+                        'Deny; run elevated .\scripts\Restart.ps1)')
+                }
             }
         }
         catch {
@@ -319,7 +323,8 @@ try {
                 $lockSignalTask.State, $lockLast, $lockNote)
         if ($lockSignalTask.State -ne 'Running') {
             Write-Host ('WARNING: Lock signal task is not Running - Win+L may not be ' +
-                'detected. Start-ScheduledTask LoginTimeLoggerLockSignal (or log off/on).') `
+                'detected. Prefer elevated .\scripts\Restart.ps1 (republishes watcher to ' +
+                'ProgramData), or Start-ScheduledTask LoginTimeLoggerLockSignal / log off/on.') `
                 -ForegroundColor Yellow
         }
     }

@@ -1421,6 +1421,11 @@ try {
     }
     . $scpHelper
 
+    $lockSignalLauncherHelper = Join-Path $scriptDir 'LockSignalLauncher.ps1'
+    if (Test-Path -LiteralPath $lockSignalLauncherHelper) {
+        . $lockSignalLauncherHelper
+    }
+
     $csPath = Join-Path $scriptDir 'SessionQuery.cs'
     Import-SessionQueryType -SourcePath $csPath
     if (-not [string]::IsNullOrWhiteSpace([string]$config.LockSignalPath)) {
@@ -1480,6 +1485,20 @@ try {
     Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s" -f `
             $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds)
 
+    # If the interactive lock-signal watcher died (common after PF ACL Deny on the
+    # old Program Files VBS path), ask Task Scheduler to start it again.
+    if (Get-Command Start-LockSignalTaskIfStale -ErrorAction SilentlyContinue) {
+        try {
+            if (Start-LockSignalTaskIfStale -SignalPath ([string]$config.LockSignalPath)) {
+                Write-LoggerEvent 'Started LoginTimeLoggerLockSignal (lock-signal.json was stale/missing).'
+            }
+        }
+        catch {
+            Write-LoggerEvent -Level WARN -Message (
+                "Lock-signal stale start skipped: {0}" -f $_.Exception.Message)
+        }
+    }
+
     # Persist InstalledCommitSha into state.json on startup (and every later Write-State).
     Write-State -Path $statePath -State $state
     $state = ConvertTo-LoggerStateObject `
@@ -1502,6 +1521,7 @@ $script:LastBHistoryScpUtc = [datetime]::MinValue
 $script:LastBHistorySourceWriteUtc = [datetime]::MinValue
 $script:LastBHistoryScpSucceeded = $false
 $script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
+$script:LastLockSignalStaleCheckUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -1516,6 +1536,24 @@ while ($true) {
         $nowLocal = Get-Date
         $nowUtc = [datetime]::UtcNow
         $today = $nowLocal.ToString('yyyy-MM-dd')
+
+        # Every ~5 minutes: restart LoginTimeLoggerLockSignal if signal is stale.
+        if (Get-Command Start-LockSignalTaskIfStale -ErrorAction SilentlyContinue) {
+            $dueStaleCheck = $true
+            if ($script:LastLockSignalStaleCheckUtc -is [datetime]) {
+                $dueStaleCheck = (($nowUtc - $script:LastLockSignalStaleCheckUtc).TotalMinutes -ge 5)
+            }
+            if ($dueStaleCheck) {
+                $script:LastLockSignalStaleCheckUtc = $nowUtc
+                try {
+                    if (Start-LockSignalTaskIfStale -SignalPath ([string]$config.LockSignalPath)) {
+                        Write-LoggerEvent -Level WARN -Message (
+                            'Restarted LoginTimeLoggerLockSignal (lock-signal.json was stale/missing).')
+                    }
+                }
+                catch { }
+            }
+        }
 
         # Re-wrap every poll so a polluted/partial $state cannot throw
         # PropertyNotFoundStrict on .Date under Set-StrictMode.
