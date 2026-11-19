@@ -996,8 +996,11 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
-    # Child exit 0 means ShowDialog completed and LockWorkStation reported success.
-    # Confirm the session locked; for break, trust the child if the probe lags.
+    # Child exit 0 means ShowDialog completed and LockWorkStation reported success
+    # inside the user session. Confirm with a short probe; if the probe lags
+    # (stale lock-signal / WTS), still treat exit 0 as success so the quota
+    # bucket advances. Returning false here used to re-show the dialog every
+    # UnlockQuotaRetryAfterUtc (60s) — looking like "every 1 minute".
     $stillUnlocked = $true
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
@@ -1014,18 +1017,14 @@ function Invoke-UnlockQuotaWarningAndLock {
     Write-DebugLog -Source 'UnlockWarn' -Message (
         "post-launch stillUnlocked={0} (probe after child exit 0)" -f $stillUnlocked)
     if ($stillUnlocked) {
-        if ($BreakMessage) {
-            Write-LoggerEvent -Level WARN -Message (
-                ("Remote break: child exited 0 but session still reports unlocked for {0}; " +
-                    "treating dialog as shown.") -f $Config.TargetUsername)
-            Write-DebugLog -Source 'UnlockWarn' -Message 'SUCCESS tag=break; trusting child exit 0 despite probe'
-            return $true
-        }
         Write-LoggerEvent -Level WARN -Message (
-            ("Unlock-quota: warning ran but session still unlocked for {0} " +
-                "(lock may have failed); will retry without advancing bucket.") -f `
-                $Config.TargetUsername)
-        return $false
+            ("{0}: child exited 0 but session still reports unlocked for {1}; " +
+                "treating dialog+LockWorkStation as success (probe lag).") -f `
+                $(if ($BreakMessage) { 'Remote break' } else { 'Unlock-quota' }),
+            $Config.TargetUsername)
+        Write-DebugLog -Source 'UnlockWarn' -Message (
+            "SUCCESS tag={0}; trusting child exit 0 despite probe" -f $tag)
+        return $true
     }
 
     if ($BreakMessage) {
