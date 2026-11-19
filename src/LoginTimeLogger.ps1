@@ -16,8 +16,11 @@ $ErrorActionPreference = 'Stop'
 
 # Initialize before any Write-LoggerEvent call (StrictMode forbids reading unset script vars).
 $script:ServiceLogPath = $null
+$script:DebugLogPath = $null
 $script:InstanceMutex = $null
 $script:InstallRoot = $null
+# Remote "break" launch retries (cleared only after success or max attempts).
+$script:PendingBreakAttempts = 0
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -60,6 +63,34 @@ function Write-LoggerEvent {
     }
     if ($Level -eq 'ERROR' -or $Level -eq 'WARN') {
         $null = Write-ErrorMessage -Message $Message -Level $Level -Source 'LoginTimeLogger'
+    }
+}
+
+function Write-DebugLog {
+    <#
+      Append a debug line to LogDirectory\debug.log (and Host). Never throws.
+      Used to diagnose remote commands.txt "break" and other hard-to-see paths.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [string]$Source = 'LoginTimeLogger'
+    )
+
+    $line = '{0:yyyy-MM-dd HH:mm:ss.fff} [DEBUG] [{1}] {2}' -f (Get-Date), $Source, $Message
+    try { Write-Host $line } catch { }
+    $path = [string]$script:DebugLogPath
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return
+    }
+    try {
+        $dir = Split-Path -Parent $path
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Add-Content -LiteralPath $path -Value $line -Encoding UTF8
+    }
+    catch {
+        # Never fail the monitor on debug I/O.
     }
 }
 
@@ -711,14 +742,23 @@ function Invoke-UnlockQuotaWarningAndLock {
         [double]$UnlockedSeconds = -1
     )
 
+    $tag = if ($BreakMessage) { 'break' } else { 'unlock-quota' }
+    Write-DebugLog -Source 'UnlockWarn' -Message (
+        "begin tag={0}; target={1}; script={2}; exists={3}; minutes={4}; countdown={5}; unlockedSeconds={6}; debugLog={7}" -f `
+            $tag, $Config.TargetUsername, $WarningScriptPath,
+        (Test-Path -LiteralPath $WarningScriptPath), $ElapsedMinutes, $CountdownSeconds,
+        $UnlockedSeconds, $script:DebugLogPath)
+
     if (-not (Test-Path -LiteralPath $WarningScriptPath)) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota warning script missing: {0}" -f $WarningScriptPath)
+        Write-DebugLog -Source 'UnlockWarn' -Message ("ABORT: warning script missing: {0}" -f $WarningScriptPath)
         return $false
     }
 
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $psExe)) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota: powershell.exe not found at {0}" -f $psExe)
+        Write-DebugLog -Source 'UnlockWarn' -Message ("ABORT: powershell.exe missing: {0}" -f $psExe)
         return $false
     }
 
@@ -739,12 +779,24 @@ function Invoke-UnlockQuotaWarningAndLock {
     if ($UnlockedSeconds -ge 0) {
         $arguments += (' -UnlockedSeconds {0}' -f ([int][Math]::Floor($UnlockedSeconds)))
     }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:DebugLogPath)) {
+        $arguments += (' -DebugLogPath "{0}"' -f $script:DebugLogPath)
+    }
 
     # Wait for countdown + LockWorkStation + script teardown, with grace.
     $waitMs = ($seconds * 1000) + 15000
+    $sessionUnlocked = $null
+    try { $sessionUnlocked = [SessionQuery]::IsUserUnlocked($Config.TargetUsername) } catch { $sessionUnlocked = "err:$($_.Exception.Message)" }
+    Write-DebugLog -Source 'UnlockWarn' -Message (
+        "launch psExe={0}; waitMs={1}; sessionUnlocked={2}; args={3}" -f `
+            $psExe, $waitMs, $sessionUnlocked, $arguments)
+
     $launchError = ''
     $ok = [SessionQuery]::LaunchInUserSession(
         $Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $false, $waitMs)
+    Write-DebugLog -Source 'UnlockWarn' -Message (
+        "LaunchInUserSession ok={0}; error={1}; LastError={2}" -f `
+            $ok, $launchError, $(try { [SessionQuery]::LastError } catch { '(n/a)' }))
     if (-not $ok) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota launch failed: {0}" -f $launchError)
         return $false
@@ -766,6 +818,8 @@ function Invoke-UnlockQuotaWarningAndLock {
             # Probe failed; keep trying briefly.
         }
     }
+    Write-DebugLog -Source 'UnlockWarn' -Message (
+        "post-launch stillUnlocked={0} (probe after child exit 0)" -f $stillUnlocked)
     if ($stillUnlocked) {
         Write-LoggerEvent -Level WARN -Message (
             ("Unlock-quota: warning ran but session still unlocked for {0} " +
@@ -781,6 +835,7 @@ function Invoke-UnlockQuotaWarningAndLock {
         Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; session locked." -f `
                 $seconds, $ElapsedMinutes)
     }
+    Write-DebugLog -Source 'UnlockWarn' -Message ("SUCCESS tag={0}; session locked" -f $tag)
     return $true
 }
 
@@ -788,7 +843,8 @@ function Apply-PendingRemoteBreak {
     <#
       After remote commands.txt "break": show the break dialog on the target
       desktop (cumulative time + PRZERWA message, 5s countdown) then lock.
-      Does not change LastUnlockQuotaBucket.
+      Does not change LastUnlockQuotaBucket. Keeps the pending flag until
+      launch succeeds (or max attempts) so a failed poll can retry.
     #>
     param(
         [Parameter(Mandatory)]$State,
@@ -796,10 +852,28 @@ function Apply-PendingRemoteBreak {
         [Parameter(Mandatory)][string]$WarningScriptPath
     )
 
-    if (-not [bool]$script:PendingBreakRequested) {
+    $pending = $false
+    try { $pending = [bool]$script:PendingBreakRequested } catch { $pending = $false }
+    Write-DebugLog -Source 'Break' -Message (
+        "Apply-PendingRemoteBreak enter; PendingBreakRequested={0}; attempts={1}; warnScript={2}; exists={3}" -f `
+            $pending, $script:PendingBreakAttempts, $WarningScriptPath,
+        (Test-Path -LiteralPath $WarningScriptPath))
+
+    if (-not $pending) {
         return $false
     }
-    $script:PendingBreakRequested = $false
+
+    $maxAttempts = 5
+    $script:PendingBreakAttempts = [int]$script:PendingBreakAttempts + 1
+    if ($script:PendingBreakAttempts -gt $maxAttempts) {
+        Write-DebugLog -Source 'Break' -Message (
+            "ABORT: exceeded max attempts ({0}); clearing PendingBreakRequested" -f $maxAttempts)
+        Write-LoggerEvent -Level WARN -Message (
+            "Remote break: giving up after {0} failed launch attempts." -f $maxAttempts)
+        $script:PendingBreakRequested = $false
+        $script:PendingBreakAttempts = 0
+        return $false
+    }
 
     $unlockedSeconds = 0.0
     try { $unlockedSeconds = [double]$State.UnlockedSecondsToday } catch { $unlockedSeconds = 0.0 }
@@ -807,6 +881,11 @@ function Apply-PendingRemoteBreak {
 
     $elapsedMinutes = [int][Math]::Floor($unlockedSeconds / 60.0)
     if ($elapsedMinutes -lt 1) { $elapsedMinutes = 1 }
+
+    Write-DebugLog -Source 'Break' -Message (
+        "launching dialog; attempt={0}/{1}; unlockedSeconds={2}; elapsedMinutes={3}; target={4}" -f `
+            $script:PendingBreakAttempts, $maxAttempts, $unlockedSeconds, $elapsedMinutes,
+        $Config.TargetUsername)
 
     $launched = $false
     try {
@@ -820,8 +899,21 @@ function Apply-PendingRemoteBreak {
     }
     catch {
         $launched = $false
+        Write-DebugLog -Source 'Break' -Message (
+            "Invoke-UnlockQuotaWarningAndLock threw: {0}" -f $_.Exception.Message)
         $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
             'Remote break warning/lock launch failed')
+    }
+
+    if ($launched) {
+        Write-DebugLog -Source 'Break' -Message 'launch OK; clearing PendingBreakRequested'
+        $script:PendingBreakRequested = $false
+        $script:PendingBreakAttempts = 0
+    }
+    else {
+        Write-DebugLog -Source 'Break' -Message (
+            "launch FAILED; keeping PendingBreakRequested for retry (attempt {0}/{1})" -f `
+                $script:PendingBreakAttempts, $maxAttempts)
     }
     return $launched
 }
@@ -1156,6 +1248,10 @@ try {
         -AdminUsername $config.AdminUsername
 
     $script:ServiceLogPath = Join-Path $config.LogDirectory 'service.log'
+    $script:DebugLogPath = Join-Path $config.LogDirectory 'debug.log'
+    Write-DebugLog -Source 'LoginTimeLogger' -Message (
+        "monitor start; DebugLogPath={0}; ServiceLogPath={1}; TargetUsername={2}" -f `
+            $script:DebugLogPath, $script:ServiceLogPath, $config.TargetUsername)
     $summaryPath = Get-SummaryPath -LogDirectory $config.LogDirectory
     try {
         if (Repair-UnlockedTimeSummaryCsv -Path $summaryPath) {
@@ -1358,19 +1454,26 @@ while ($true) {
                         'Apply-PendingCumulativeResets failed')
                 }
             }
-            # Remote commands.txt "break" — dialog + lock (after any resets so cumulative is current).
-            if (Get-Command Apply-PendingRemoteBreak -ErrorAction SilentlyContinue) {
-                try {
-                    $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
-                    $null = Apply-PendingRemoteBreak `
-                        -State $state `
-                        -Config $config `
-                        -WarningScriptPath $warnScript
-                }
-                catch {
-                    $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
-                        'Apply-PendingRemoteBreak failed')
-                }
+        }
+
+        # Remote commands.txt "break" — every poll so a failed launch can retry.
+        $breakPending = $false
+        try { $breakPending = [bool]$script:PendingBreakRequested } catch { $breakPending = $false }
+        if ($breakPending -and (Get-Command Apply-PendingRemoteBreak -ErrorAction SilentlyContinue)) {
+            Write-DebugLog -Source 'Break' -Message (
+                "poll: PendingBreakRequested=true; applying (after resets/SCP this cycle)")
+            try {
+                $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+                $null = Apply-PendingRemoteBreak `
+                    -State $state `
+                    -Config $config `
+                    -WarningScriptPath $warnScript
+            }
+            catch {
+                Write-DebugLog -Source 'Break' -Message (
+                    "Apply-PendingRemoteBreak threw: {0}" -f $_.Exception.Message)
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'Apply-PendingRemoteBreak failed')
             }
         }
 

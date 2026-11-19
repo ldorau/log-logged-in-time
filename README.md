@@ -163,6 +163,7 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 | `unlocked-time-summary.csv` | One row per completed day |
 | `state.json` | Running total for the current day |
 | `service.log` | Monitor diagnostics |
+| `debug.log` | Verbose traces (e.g. remote `break` dialog/launch) |
 
 ### Daily log field meanings (`unlocked-time-YYYY-MM-DD.log`)
 

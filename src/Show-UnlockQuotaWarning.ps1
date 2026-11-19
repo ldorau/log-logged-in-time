@@ -14,11 +14,33 @@ param(
     # When set, show the remote "break" message instead of the quota rest text.
     [switch]$BreakMessage,
     # When >= 0, display this cumulative unlocked time (seconds) as HH:MM:SS.
-    [double]$UnlockedSeconds = -1
+    [double]$UnlockedSeconds = -1,
+    # Optional path for debug traces (LogDirectory\debug.log from the monitor).
+    [string]$DebugLogPath = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Write-UnlockWarnDebug {
+    param([Parameter(Mandatory)][string]$Message)
+    $line = '{0:yyyy-MM-dd HH:mm:ss.fff} [DEBUG] [Show-UnlockQuotaWarning] {1}' -f (Get-Date), $Message
+    try { [Console]::Error.WriteLine($line) } catch { }
+    if ([string]::IsNullOrWhiteSpace($DebugLogPath)) { return }
+    try {
+        $dir = Split-Path -Parent $DebugLogPath
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Add-Content -LiteralPath $DebugLogPath -Value $line -Encoding UTF8
+    }
+    catch { }
+}
+
+Write-UnlockWarnDebug (
+    "start; BreakMessage={0}; Minutes={1}; CountdownSeconds={2}; UnlockedSeconds={3}; User={4}; SessionId={5}" -f `
+        [bool]$BreakMessage, $Minutes, $CountdownSeconds, $UnlockedSeconds,
+    $env:USERNAME, $env:SESSIONNAME)
 
 if ($Minutes -lt 1) { $Minutes = 30 }
 if ($CountdownSeconds -lt 1) { $CountdownSeconds = 3 }
@@ -40,14 +62,26 @@ else {
     $elapsedHm = '{0}:{1:D2}' -f $elapsedHours, $elapsedMins
 }
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -Namespace User32 -Name Native -MemberDefinition @"
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -Namespace User32 -Name Native -MemberDefinition @"
 [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
 public static extern bool LockWorkStation();
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 "@ -ErrorAction SilentlyContinue
+    Write-UnlockWarnDebug 'Add-Type WinForms/User32 OK'
+}
+catch {
+    Write-UnlockWarnDebug ("Add-Type FAILED: {0}" -f $_.Exception.Message)
+    [Console]::Error.WriteLine(("Unlock-quota UI init failed: {0}" -f $_.Exception.Message))
+    exit 2
+}
+
+Write-UnlockWarnDebug (
+    "building form; elapsedDisplay={0}; messageMode={1}" -f `
+        $elapsedHm, $(if ($BreakMessage) { 'break' } else { 'quota' }))
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'LoginTimeLogger'
@@ -141,15 +175,27 @@ $timer.Add_Tick({
     })
 
 $form.Add_Shown({
+        Write-UnlockWarnDebug ("form Shown; Handle={0}" -f $form.Handle)
         try { [void][User32.Native]::SetForegroundWindow($form.Handle) } catch { }
         $timer.Start()
+        Write-UnlockWarnDebug 'countdown timer started'
     })
 
 $form.Add_FormClosed({
+        Write-UnlockWarnDebug 'form FormClosed'
         if ($timer) { $timer.Stop(); $timer.Dispose() }
     })
 
-[void]$form.ShowDialog()
+Write-UnlockWarnDebug 'ShowDialog begin'
+try {
+    [void]$form.ShowDialog()
+    Write-UnlockWarnDebug 'ShowDialog returned'
+}
+catch {
+    Write-UnlockWarnDebug ("ShowDialog FAILED: {0}" -f $_.Exception.Message)
+    [Console]::Error.WriteLine(("Unlock-quota ShowDialog failed: {0}" -f $_.Exception.Message))
+    exit 3
+}
 
 # Brief pause so the dialog fully tears down before locking.
 Start-Sleep -Milliseconds 250
@@ -166,6 +212,7 @@ try {
 catch {
     $lockDetail = ('LockWorkStation threw: {0}' -f $_.Exception.Message)
 }
+Write-UnlockWarnDebug ("LockWorkStation ok={0}; detail={1}" -f $lockOk, $lockDetail)
 
 if (-not $lockOk) {
     try {
@@ -187,8 +234,10 @@ if (-not $lockOk) {
 }
 
 if (-not $lockOk) {
+    Write-UnlockWarnDebug ("exit 1; lock failed: {0}" -f $lockDetail)
     [Console]::Error.WriteLine(("Unlock-quota lock failed: {0}" -f $lockDetail))
     exit 1
 }
 
+Write-UnlockWarnDebug 'exit 0; dialog shown and lock OK'
 exit 0

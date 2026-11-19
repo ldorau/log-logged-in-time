@@ -2653,6 +2653,10 @@ function Invoke-ScpRemoteCommandsFile {
                 $result.WantBreak = $true
                 Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
                     'queue execute: break (deferred dialog + lock on next monitor poll)')
+                if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                    Write-DebugLog -Source 'Break' -Message (
+                        "commands.txt line {0}: verb=break queued (WantBreak=true)" -f $lineNo)
+                }
             }
             default {
                 Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
@@ -3142,8 +3146,13 @@ function Invoke-ScpCommandsFileExchange {
     # break: queue for the monitor poll loop (dialog + lock; after any resets).
     if ($null -ne $cmdResult.PSObject.Properties['WantBreak'] -and [bool]$cmdResult.WantBreak) {
         $script:PendingBreakRequested = $true
+        $script:PendingBreakAttempts = 0
         Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
             'execute: break queued for next monitor poll (dialog + lock)')
+        if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+            Write-DebugLog -Source 'Break' -Message (
+                'PendingBreakRequested=true (commands exchange); will Apply-PendingRemoteBreak on poll')
+        }
     }
 
     # When "update" will run, defer email until after the repo sync so the
