@@ -12,6 +12,8 @@ $script:LastBHistoryStateByLeaf = @{}
 # Remote commands.txt "reset [[+|-]TIME]" adjustments applied by the monitor poll loop.
 # Use ArrayList (not List[object]): @($list[object]) throws ArgumentException under PS 5.1 StrictMode.
 $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
+# Remote commands.txt "break" — show break dialog + lock on the next monitor poll.
+$script:PendingBreakRequested = $false
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
@@ -2382,10 +2384,10 @@ function Apply-PendingCumulativeResets {
 function Invoke-ScpRemoteCommandsFile {
     <#
       Read LogDirectory\commands\commands.txt line by line, interpret/execute
-      supported commands (update, restart, reset), write a set -x style transcript,
-      email the transcript, then delete the downloaded file.
-      Returns: WantUpdate / WantRestart / ResetSpecs (terminating actions deferred
-      until after remote empty-PUT and email).
+      supported commands (update, restart, reset, break), write a set -x style
+      transcript, email the transcript, then delete the downloaded file.
+      Returns: WantUpdate / WantRestart / WantBreak / ResetSpecs (terminating
+      actions deferred until after remote empty-PUT and email).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -2396,6 +2398,7 @@ function Invoke-ScpRemoteCommandsFile {
     $result = [pscustomobject]@{
         WantUpdate  = $false
         WantRestart = $false
+        WantBreak   = $false
         ResetSpecs  = New-Object System.Collections.ArrayList
         RanAny      = $false
     }
@@ -2486,6 +2489,16 @@ function Invoke-ScpRemoteCommandsFile {
                     Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
                         "interpret line {0}: reset rejected: {1}" -f $lineNo, $_.Exception.Message)
                 }
+            }
+            'break' {
+                if ($args.Count -gt 0) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: break ignores args (expected none)" -f $lineNo)
+                }
+                $result.RanAny = $true
+                $result.WantBreak = $true
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: break (deferred dialog + lock on next monitor poll)')
             }
             default {
                 Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
@@ -2615,7 +2628,7 @@ function Invoke-ScpCommandsFileExchange {
            (missing remote file is OK; any other SCP failure is FATAL)
         2) upload 0-byte LogDirectory\commands-empty\commands.txt to overwrite remote
            (SCP failure is FATAL) — immediately after download
-        3) read/interpret/execute lines (update, restart, reset); set -x style log
+        3) read/interpret/execute lines (update, restart, reset, break); set -x style log
         4) email the run log
         5) delete the downloaded commands.txt
         6) run deferred update and/or restart (may exit the process)
@@ -2801,6 +2814,7 @@ function Invoke-ScpCommandsFileExchange {
     $cmdResult = [pscustomobject]@{
         WantUpdate  = $false
         WantRestart = $false
+        WantBreak   = $false
         ResetSpecs  = New-Object System.Collections.ArrayList
         RanAny      = $false
     }
@@ -2838,6 +2852,11 @@ function Invoke-ScpCommandsFileExchange {
         ('RemoteMissing: {0}' -f $remoteMissing)
         ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
         ('WantRestart: {0}' -f $cmdResult.WantRestart)
+        ('WantBreak: {0}' -f $(
+            if ($null -ne $cmdResult.PSObject.Properties['WantBreak']) {
+                [bool]$cmdResult.WantBreak
+            }
+            else { $false }))
         ('ResetCount: {0}' -f $resetCount)
     ) -join [Environment]::NewLine
 
@@ -2880,6 +2899,13 @@ function Invoke-ScpCommandsFileExchange {
             Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
                 "execute reset queue failed: {0}" -f $_.Exception.Message)
         }
+    }
+
+    # break: queue for the monitor poll loop (dialog + lock; after any resets).
+    if ($null -ne $cmdResult.PSObject.Properties['WantBreak'] -and [bool]$cmdResult.WantBreak) {
+        $script:PendingBreakRequested = $true
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'execute: break queued for next monitor poll (dialog + lock)')
     }
 
     # When "update" will run, defer email until after the repo sync so the

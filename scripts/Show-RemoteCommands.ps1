@@ -46,6 +46,11 @@ $commands = @(
         Arguments   = '-TIME'
         Description = 'Subtract TIME from today''s cumulative unlocked time (floored at 0). TIME is HH:MM:SS or whole seconds (e.g. -00:10:00 or -600). Logs CUMULATIVE_DEC.'
     }
+    [pscustomobject]@{
+        Command     = 'break'
+        Arguments   = '(none)'
+        Description = 'Show a topmost countdown on the target user''s desktop (message "PRZERWA! - chodź do nas!", current cumulative unlocked time, 5s timer), then lock the screen — same flow as the unlock-quota warning, different message.'
+    }
 )
 
 Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
@@ -69,5 +74,6 @@ Write-Host '  reset'
 Write-Host '  reset 01:30:00'
 Write-Host '  reset +00:15:00'
 Write-Host '  reset -00:10:00'
+Write-Host '  break'
 Write-Host '  update'
 Write-Host '  reset 0'

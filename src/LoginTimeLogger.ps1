@@ -699,11 +699,16 @@ function Invoke-UnlockQuotaWarningAndLock {
       Shows a blocking countdown on the target user's desktop, then LockWorkStation
       inside that session via CreateProcessAsUser (SessionQuery.LaunchInUserSession).
       Waits for the child to exit successfully before the caller advances the quota bucket.
+      -BreakMessage / -UnlockedSeconds / -CountdownSeconds support the remote "break"
+      command (fixed Polish message, 5s countdown, show cumulative HH:MM:SS).
     #>
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$WarningScriptPath,
-        [Parameter(Mandatory)][int]$ElapsedMinutes
+        [Parameter(Mandatory)][int]$ElapsedMinutes,
+        [int]$CountdownSeconds = 0,
+        [switch]$BreakMessage,
+        [double]$UnlockedSeconds = -1
     )
 
     if (-not (Test-Path -LiteralPath $WarningScriptPath)) {
@@ -717,14 +722,23 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
-    if ($ElapsedMinutes -lt 1) {
+    if ($ElapsedMinutes -lt 1 -and $UnlockedSeconds -lt 0) {
         $ElapsedMinutes = [int]$Config.UnlockQuotaMinutes
     }
-    $seconds = [int]$Config.UnlockQuotaWarnSeconds
+    $seconds = [int]$CountdownSeconds
+    if ($seconds -lt 1) {
+        $seconds = [int]$Config.UnlockQuotaWarnSeconds
+    }
     if ($seconds -lt 1) { $seconds = 3 }
     # Hidden console; WinForms ShowDialog still appears on the interactive desktop.
     $arguments = '-NoProfile -NoLogo -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
         $WarningScriptPath, $ElapsedMinutes, $seconds
+    if ($BreakMessage) {
+        $arguments += ' -BreakMessage'
+    }
+    if ($UnlockedSeconds -ge 0) {
+        $arguments += (' -UnlockedSeconds {0}' -f ([int][Math]::Floor($UnlockedSeconds)))
+    }
 
     # Wait for countdown + LockWorkStation + script teardown, with grace.
     $waitMs = ($seconds * 1000) + 15000
@@ -760,9 +774,56 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
-    Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; session locked." -f `
-            $seconds, $ElapsedMinutes)
+    if ($BreakMessage) {
+        Write-LoggerEvent ("Remote break: showed {0}s warning; session locked." -f $seconds)
+    }
+    else {
+        Write-LoggerEvent ("Unlock-quota: showed {0}s warning for {1} unlocked minutes; session locked." -f `
+                $seconds, $ElapsedMinutes)
+    }
     return $true
+}
+
+function Apply-PendingRemoteBreak {
+    <#
+      After remote commands.txt "break": show the break dialog on the target
+      desktop (cumulative time + PRZERWA message, 5s countdown) then lock.
+      Does not change LastUnlockQuotaBucket.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$WarningScriptPath
+    )
+
+    if (-not [bool]$script:PendingBreakRequested) {
+        return $false
+    }
+    $script:PendingBreakRequested = $false
+
+    $unlockedSeconds = 0.0
+    try { $unlockedSeconds = [double]$State.UnlockedSecondsToday } catch { $unlockedSeconds = 0.0 }
+    if ($unlockedSeconds -lt 0) { $unlockedSeconds = 0.0 }
+
+    $elapsedMinutes = [int][Math]::Floor($unlockedSeconds / 60.0)
+    if ($elapsedMinutes -lt 1) { $elapsedMinutes = 1 }
+
+    $launched = $false
+    try {
+        $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
+                -Config $Config `
+                -WarningScriptPath $WarningScriptPath `
+                -ElapsedMinutes $elapsedMinutes `
+                -CountdownSeconds 5 `
+                -BreakMessage `
+                -UnlockedSeconds $unlockedSeconds)
+    }
+    catch {
+        $launched = $false
+        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+            'Remote break warning/lock launch failed')
+    }
+    return $launched
 }
 
 function Get-CurrentInstalledCommitSha {
@@ -1295,6 +1356,20 @@ while ($true) {
                 catch {
                     $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
                         'Apply-PendingCumulativeResets failed')
+                }
+            }
+            # Remote commands.txt "break" — dialog + lock (after any resets so cumulative is current).
+            if (Get-Command Apply-PendingRemoteBreak -ErrorAction SilentlyContinue) {
+                try {
+                    $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+                    $null = Apply-PendingRemoteBreak `
+                        -State $state `
+                        -Config $config `
+                        -WarningScriptPath $warnScript
+                }
+                catch {
+                    $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                        'Apply-PendingRemoteBreak failed')
                 }
             }
         }

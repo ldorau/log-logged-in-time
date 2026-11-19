@@ -10,7 +10,11 @@
 [CmdletBinding()]
 param(
     [int]$Minutes = 30,
-    [int]$CountdownSeconds = 3
+    [int]$CountdownSeconds = 3,
+    # When set, show the remote "break" message instead of the quota rest text.
+    [switch]$BreakMessage,
+    # When >= 0, display this cumulative unlocked time (seconds) as HH:MM:SS.
+    [double]$UnlockedSeconds = -1
 )
 
 Set-StrictMode -Version Latest
@@ -20,10 +24,21 @@ if ($Minutes -lt 1) { $Minutes = 30 }
 if ($CountdownSeconds -lt 1) { $CountdownSeconds = 3 }
 if ($CountdownSeconds -gt 60) { $CountdownSeconds = 60 }
 
-# Elapsed unlocked time as H:MM (e.g. 30 -> 0:30, 90 -> 1:30).
-$elapsedHours = [int][Math]::Floor($Minutes / 60)
-$elapsedMins = [int]($Minutes % 60)
-$elapsedHm = '{0}:{1:D2}' -f $elapsedHours, $elapsedMins
+# Prefer full cumulative seconds when provided; else H:MM from -Minutes.
+if ($UnlockedSeconds -ge 0) {
+    $totalSec = [int][Math]::Floor($UnlockedSeconds)
+    if ($totalSec -lt 0) { $totalSec = 0 }
+    $h = [int][Math]::Floor($totalSec / 3600)
+    $m = [int][Math]::Floor(($totalSec % 3600) / 60)
+    $s = [int]($totalSec % 60)
+    $elapsedHm = '{0:D2}:{1:D2}:{2:D2}' -f $h, $m, $s
+}
+else {
+    # Elapsed unlocked time as H:MM (e.g. 30 -> 0:30, 90 -> 1:30).
+    $elapsedHours = [int][Math]::Floor($Minutes / 60)
+    $elapsedMins = [int]($Minutes % 60)
+    $elapsedHm = '{0}:{1:D2}' -f $elapsedHours, $elapsedMins
+}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -51,9 +66,9 @@ $form.KeyPreview = $true
 $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
 
 # Layout (top -> bottom):
-#   1) "Unlocked time so far:"
-#   2) current unlocked time (H:MM)
-#   3) "Twoje OCZY muszą ODPOCZĄĆ !"
+#   1) "Unlocked time so far:" / "Cumulative unlocked time:"
+#   2) current unlocked time (H:MM or HH:MM:SS)
+#   3) rest/break message
 #   4) countdown footer ("Screen will lock in N s...")
 
 $title = New-Object System.Windows.Forms.Label
@@ -62,11 +77,11 @@ $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 $title.Dock = [System.Windows.Forms.DockStyle]::Top
 $title.Height = 48
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Regular)
-$title.Text = 'Unlocked time so far:'
+$title.Text = if ($BreakMessage) { 'Cumulative unlocked time:' } else { 'Unlocked time so far:' }
 $title.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $title.Padding = New-Object System.Windows.Forms.Padding(12, 12, 12, 0)
 
-# Large display: elapsed unlocked time as hours:minutes.
+# Large display: elapsed / cumulative unlocked time.
 $elapsedLabel = New-Object System.Windows.Forms.Label
 $elapsedLabel.AutoSize = $false
 $elapsedLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
@@ -83,8 +98,14 @@ $restMessage.Height = 56
 $restMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
 # Build with [char] code points so Windows PowerShell 5.1 (-File, no BOM)
 # does not mis-decode UTF-8 Polish letters as the system ANSI code page.
-$restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
-        [char]0x0105, [char]0x0104, [char]0x0106)  # ą Ą Ć
+if ($BreakMessage) {
+    # "PRZERWA! - chodź do nas!" (ź = U+017A)
+    $restMessage.Text = ('PRZERWA! - chod{0} do nas!' -f [char]0x017A)
+}
+else {
+    $restMessage.Text = ('Twoje OCZY musz{0} ODPOCZ{1}{2} !' -f `
+            [char]0x0105, [char]0x0104, [char]0x0106)  # ą Ą Ć
+}
 $restMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
 $restMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
 
