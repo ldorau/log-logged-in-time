@@ -226,6 +226,144 @@ function Get-ScpConfigObject {
     }
 }
 
+function Test-ScpCopyTcpEndpoint {
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = 5000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostName) -or $Port -le 0) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'Host/port empty' }
+    }
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            try { $client.Close() } catch { }
+            return [pscustomobject]@{
+                Ok     = $false
+                Detail = ("TCP connect timed out after {0}ms" -f $TimeoutMs)
+            }
+        }
+        $client.EndConnect($ar)
+        return [pscustomobject]@{ Ok = $true; Detail = 'TcpConnectSucceeded=True' }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok     = $false
+            Detail = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($null -ne $client) {
+            try { $client.Close() } catch { }
+            try { $client.Dispose() } catch { }
+        }
+    }
+}
+
+function Invoke-ScpOutboundFirewallReconcile {
+    param(
+        [Parameter(Mandatory)][string]$RemoteHost,
+        [Parameter(Mandatory)][int]$RemotePort
+    )
+
+    $candidates = @(
+        (Join-Path $scriptDir 'Allow-ScpOutboundFirewall.ps1')
+        (Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Allow-ScpOutboundFirewall.ps1')
+    )
+    $scriptPath = $null
+    foreach ($c in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) {
+            $scriptPath = $c
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        return [pscustomobject]@{
+            Ok     = $false
+            Detail = 'Allow-ScpOutboundFirewall.ps1 not found'
+        }
+    }
+
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $args = @(
+        '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
+        '-File', $scriptPath,
+        '-RemoteHost', $RemoteHost,
+        '-RemotePort', "$RemotePort"
+    )
+    try {
+        $p = Start-Process -FilePath $psExe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+        $code = if ($null -ne $p) { [int]$p.ExitCode } else { -1 }
+        return [pscustomobject]@{
+            Ok     = ($code -eq 0)
+            Detail = ("{0} exit={1}" -f $scriptPath, $code)
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok     = $false
+            Detail = $_.Exception.Message
+        }
+    }
+}
+
+function Get-ScpCopyFileBatches {
+    <#
+      Split manual uploads into small batches so a single OpenSSH connect
+      failure / command-line limit does not abort the entire set. Large raw
+      History DBs (no .csv / .log / .json) go one per batch.
+    #>
+    param([Parameter(Mandatory)][string[]]$Files)
+
+    $batches = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[string]
+    $currentBytes = [int64]0
+    $maxFiles = 8
+    $maxBytes = 32MB
+
+    foreach ($f in @($Files)) {
+        if ([string]::IsNullOrWhiteSpace([string]$f) -or -not (Test-Path -LiteralPath ([string]$f))) {
+            continue
+        }
+        $path = [string]$f
+        $leaf = Split-Path -Leaf $path
+        $ext = [System.IO.Path]::GetExtension($leaf)
+        $size = [int64]0
+        try { $size = [int64](Get-Item -LiteralPath $path -Force).Length } catch { }
+
+        $isRawHistory = ($leaf -like 'log-history-*') -and ($ext -ne '.csv')
+        if ($isRawHistory) {
+            if ($current.Count -gt 0) {
+                $batches.Add(@($current.ToArray()))
+                $current.Clear()
+                $currentBytes = [int64]0
+            }
+            $batches.Add(@($path))
+            continue
+        }
+
+        if ($current.Count -ge $maxFiles -or
+            ($current.Count -gt 0 -and ($currentBytes + $size) -gt $maxBytes)) {
+            if ($current.Count -gt 0) {
+                $batches.Add(@($current.ToArray()))
+                $current.Clear()
+                $currentBytes = [int64]0
+            }
+        }
+        $current.Add($path)
+        $currentBytes += $size
+    }
+    if ($current.Count -gt 0) {
+        $batches.Add(@($current.ToArray()))
+    }
+    return @($batches)
+}
+
 function Invoke-ScpCopyFiles {
     param(
         [Parameter(Mandatory)]$Config,
@@ -259,53 +397,155 @@ function Invoke-ScpCopyFiles {
         $identityForScp = $tempIdentity
     }
 
-    $argList = New-Object System.Collections.Generic.List[string]
-    Add-ScpCommonSshOptions -ArgumentList $argList `
-        -IdentityFile $identityForScp `
-        -Port ([int]$Config.ScpPort) `
-        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-        -VerboseSsh
-    foreach ($f in $Files) {
-        $argList.Add($f)
+    $batches = @(Get-ScpCopyFileBatches -Files $Files)
+    if ($batches.Count -eq 0) {
+        throw 'No existing files to copy.'
     }
-    $argList.Add($remoteTarget)
 
-    $argLine = ConvertTo-StartProcessArgumentString -Argument $argList.ToArray()
-    $timeoutSeconds = 300
-    Write-ScpCopyLine ("scp command (timeout {0}s): {1} {2}" -f $timeoutSeconds, $scpExe, $argLine) -ForegroundColor DarkGray
+    $allStdout = New-Object System.Collections.Generic.List[string]
+    $allStderr = New-Object System.Collections.Generic.List[string]
+    $allArgs = New-Object System.Collections.Generic.List[string]
+    $lastExit = 0
+    $anyTimedOut = $false
+    $maxAttempts = 3
 
-    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-copy-{0}.out' -f [guid]::NewGuid().ToString('N'))
-    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-copy-{0}.err' -f [guid]::NewGuid().ToString('N'))
     try {
-        $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
-            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $timeoutSeconds
-        $stdout = ''
-        $stderr = ''
-        if (Test-Path -LiteralPath $outFile) {
-            $stdout = [string](Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
+        $batchIndex = 0
+        foreach ($batch in $batches) {
+            $batchIndex++
+            $batchFiles = @($batch)
+            if ($batchFiles.Count -eq 0) { continue }
+
+            $totalBytes = [int64]0
+            foreach ($bf in $batchFiles) {
+                try { $totalBytes += [int64](Get-Item -LiteralPath $bf -Force).Length } catch { }
+            }
+            # Scale with payload (~50 KiB/s floor + 60s slack); clamp 120..900.
+            $timeoutSeconds = 60 + [int][Math]::Ceiling($totalBytes / 51200.0)
+            if ($timeoutSeconds -lt 120) { $timeoutSeconds = 120 }
+            if ($timeoutSeconds -gt 900) { $timeoutSeconds = 900 }
+
+            $attempt = 0
+            $batchOk = $false
+            $batchStdout = ''
+            $batchStderr = ''
+            $batchExit = -1
+            $batchTimedOut = $false
+            $batchArgLine = ''
+
+            while ($attempt -lt $maxAttempts -and -not $batchOk) {
+                $attempt++
+                $argList = New-Object System.Collections.Generic.List[string]
+                Add-ScpCommonSshOptions -ArgumentList $argList `
+                    -IdentityFile $identityForScp `
+                    -Port ([int]$Config.ScpPort) `
+                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                    -ConnectTimeoutSeconds 45 `
+                    -VerboseSsh
+                foreach ($f in $batchFiles) {
+                    $argList.Add($f)
+                }
+                $argList.Add($remoteTarget)
+
+                $batchArgLine = ConvertTo-StartProcessArgumentString -Argument $argList.ToArray()
+                Write-ScpCopyLine (
+                    "scp batch {0}/{1} attempt {2}/{3} ({4} file(s), timeout {5}s): {6} {7}" -f `
+                        $batchIndex, $batches.Count, $attempt, $maxAttempts,
+                    $batchFiles.Count, $timeoutSeconds, $scpExe, $batchArgLine) -ForegroundColor DarkGray
+
+                $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-copy-{0}.out' -f [guid]::NewGuid().ToString('N'))
+                $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-copy-{0}.err' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $batchArgLine `
+                        -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $timeoutSeconds
+                    $batchStdout = ''
+                    $batchStderr = ''
+                    if (Test-Path -LiteralPath $outFile) {
+                        $batchStdout = [string](Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
+                    }
+                    if (Test-Path -LiteralPath $errFile) {
+                        $batchStderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+                    }
+                    $batchTimedOut = [bool]$run.TimedOut
+                    if ($batchTimedOut) {
+                        $batchStderr = (("timed out after {0}s (process killed)`r`n{1}" -f `
+                                    $timeoutSeconds, $batchStderr)).Trim()
+                    }
+                    $batchExit = -1
+                    if ($null -ne $run.ExitCode) {
+                        $batchExit = [int]$run.ExitCode
+                    }
+
+                    $failed = Test-ScpCopyFailed -ExitCode $batchExit -StdErr $batchStderr -TimedOut $batchTimedOut
+                    if (-not $failed) {
+                        $batchOk = $true
+                        break
+                    }
+
+                    $connectFail = $false
+                    if (Get-Command Test-ScpConnectFailure -ErrorAction SilentlyContinue) {
+                        $connectFail = [bool](Test-ScpConnectFailure -StdErr $batchStderr)
+                    }
+                    else {
+                        $connectFail = ($batchStderr -match '(?i)Connection timed out')
+                    }
+
+                    if ($connectFail -and $attempt -lt $maxAttempts) {
+                        Write-ScpCopyLine (
+                            "scp batch {0}: connect failed (attempt {1}); retrying in 5s..." -f `
+                                $batchIndex, $attempt) -ForegroundColor Yellow
+                        Start-Sleep -Seconds 5
+                        continue
+                    }
+                    break
+                }
+                finally {
+                    Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($batchStdout)) { $allStdout.Add($batchStdout) }
+            if (-not [string]::IsNullOrWhiteSpace($batchStderr)) { $allStderr.Add($batchStderr) }
+            if (-not [string]::IsNullOrWhiteSpace($batchArgLine)) {
+                $allArgs.Add(("batch{0}: {1} {2}" -f $batchIndex, $scpExe, $batchArgLine))
+            }
+            if ($batchTimedOut) { $anyTimedOut = $true }
+            $lastExit = $batchExit
+
+            if (-not $batchOk) {
+                return [pscustomobject]@{
+                    ScpExe       = $scpExe
+                    RemoteTarget = $remoteTarget
+                    ExitCode     = $lastExit
+                    TimedOut     = $anyTimedOut
+                    StdOut       = ($allStdout -join "`r`n")
+                    StdErr       = @(
+                        ("scp batch {0}/{1} failed after {2} attempt(s)." -f `
+                                $batchIndex, $batches.Count, $attempt)
+                        ("files: {0}" -f ($batchFiles -join '; '))
+                        ''
+                        ($allStderr -join "`r`n")
+                    ) -join "`r`n"
+                    ArgPreview   = ($allArgs -join "`r`n")
+                }
+            }
+
+            Write-ScpCopyLine (
+                "scp batch {0}/{1} OK ({2} file(s))" -f `
+                    $batchIndex, $batches.Count, $batchFiles.Count) -ForegroundColor DarkGray
         }
-        if (Test-Path -LiteralPath $errFile) {
-            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-        }
-        if ($run.TimedOut) {
-            $stderr = (("timed out after {0}s (process killed)`r`n{1}" -f $timeoutSeconds, $stderr)).Trim()
-        }
-        $exitCode = -1
-        if ($null -ne $run.ExitCode) {
-            $exitCode = [int]$run.ExitCode
-        }
+
         return [pscustomobject]@{
             ScpExe       = $scpExe
             RemoteTarget = $remoteTarget
-            ExitCode     = $exitCode
-            TimedOut     = [bool]$run.TimedOut
-            StdOut       = $stdout
-            StdErr       = $stderr
-            ArgPreview   = ("{0} {1}" -f $scpExe, $argLine)
+            ExitCode     = 0
+            TimedOut     = $false
+            StdOut       = ($allStdout -join "`r`n")
+            StdErr       = ($allStderr -join "`r`n")
+            ArgPreview   = ($allArgs -join "`r`n")
         }
     }
     finally {
-        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
         if (-not [string]::IsNullOrWhiteSpace($tempIdentity) -and
             (Test-Path -LiteralPath $tempIdentity)) {
             Remove-Item -LiteralPath $tempIdentity -Force -ErrorAction SilentlyContinue
@@ -383,6 +623,46 @@ try {
         ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
         LogDirectory       = $cfg.LogDirectory
         TargetUsername     = $cfg.TargetUsername
+    }
+
+    Write-ScpCopyLine ''
+    Write-ScpCopyLine 'Step 1b: outbound SCP firewall + TCP reachability' -ForegroundColor Cyan
+    $fw = Invoke-ScpOutboundFirewallReconcile `
+        -RemoteHost ([string]$cfg.ScpHost) `
+        -RemotePort ([int]$cfg.ScpPort)
+    Write-Check -Name 'SCP-Allow firewall' -Ok $fw.Ok -Status $(if ($fw.Ok) { 'OK' } else { 'WARN' }) `
+        -Detail $fw.Detail
+
+    $tcpOk = $false
+    $tcpDetail = ''
+    for ($tcpTry = 1; $tcpTry -le 3; $tcpTry++) {
+        $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) -Port ([int]$cfg.ScpPort) -TimeoutMs 8000
+        $tcpDetail = $tcp.Detail
+        if ($tcp.Ok) {
+            $tcpOk = $true
+            break
+        }
+        Write-ScpCopyLine (
+            "TCP {0}:{1} not reachable (try {2}/3): {3}" -f `
+                $cfg.ScpHost, $cfg.ScpPort, $tcpTry, $tcp.Detail) -ForegroundColor Yellow
+        if ($tcpTry -lt 3) {
+            Start-Sleep -Seconds 5
+        }
+    }
+    Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $tcpOk -Detail $tcpDetail
+    if (-not $tcpOk) {
+        Write-ScpCopyLine ''
+        Write-ScpCopyLine 'RESULT: remote host:port not reachable; scp not attempted.' -ForegroundColor Red
+        Write-ScpCopyLine (
+            "Check that {0} is up on the LAN, SSH is listening on port {1}, and " +
+            "run .\scripts\Allow-ScpOutboundFirewall.ps1 elevated if outbound SSH is blocked." -f `
+                $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
+        Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
+        $failMsg = ("scp preflight failed: TCP {0}:{1} not reachable after 3 tries. {2}" -f `
+                $cfg.ScpHost, $cfg.ScpPort, $tcpDetail)
+        $null = Write-FatalError -Message $failMsg -Context 'Copy-LogsViaScp TCP preflight failed' `
+            -Source 'Copy-LogsViaScp' -NoThrow
+        exit 1
     }
 
     Write-ScpCopyLine ''
@@ -476,7 +756,22 @@ try {
     if (-not $ok) {
         Write-ScpCopyLine ''
         Write-ScpCopyLine 'RESULT: SCP copy failed.' -ForegroundColor Red
-        if (Test-ScpAuthFailure -StdErr ([string]$copyResult.StdErr)) {
+        $connectFail = $false
+        if (Get-Command Test-ScpConnectFailure -ErrorAction SilentlyContinue) {
+            $connectFail = [bool](Test-ScpConnectFailure -StdErr ([string]$copyResult.StdErr))
+        }
+        if ($connectFail) {
+            Write-ScpCopyLine ''
+            Write-ScpCopyLine (
+                "SSH connect to {0}:{1} failed (timeout/refused/unreachable)." -f `
+                    $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
+            Write-ScpCopyLine 'Confirm the remote is up on the LAN and SSH is listening.' -ForegroundColor Yellow
+            Write-ScpCopyLine 'If outbound SSH is blocked, run elevated:' -ForegroundColor Yellow
+            Write-ScpCopyLine (
+                "  .\scripts\Allow-ScpOutboundFirewall.ps1 -RemoteHost {0} -RemotePort {1}" -f `
+                    $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
+        }
+        elseif (Test-ScpAuthFailure -StdErr ([string]$copyResult.StdErr)) {
             $pub = Get-ScpPublicKeyText -IdentityPath $cfg.ScpIdentityFile
             Write-ScpCopyLine ''
             Write-ScpCopyLine 'Public key auth / private key load failed. If Load key Permission denied,' -ForegroundColor Yellow

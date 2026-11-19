@@ -14,6 +14,9 @@ $script:LastBHistoryStateByLeaf = @{}
 $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 # Remote commands.txt "break" — show break dialog + lock on the next monitor poll.
 $script:PendingBreakRequested = $false
+# Throttle connect-timeout noise (errors.log / email) when the remote is down.
+$script:LastScpConnectFailLogUtc = $null
+$script:LastScpAllowReconcileUtc = $null
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
@@ -422,6 +425,155 @@ function Test-ScpCopyFailed {
     }
 }
 
+function Test-ScpConnectFailure {
+    <#
+      True when stderr shows the TCP/SSH connect failed (timeout, refused,
+      unreachable). Distinct from auth failures and mid-transfer stalls.
+    #>
+    param([string]$StdErr = '')
+
+    if ([string]::IsNullOrWhiteSpace($StdErr)) {
+        return $false
+    }
+    $s = [string]$StdErr
+    return (
+        $s -match '(?i)Connection timed out' -or
+        $s -match '(?i)Connection refused' -or
+        $s -match '(?i)Network is unreachable' -or
+        $s -match '(?i)No route to host' -or
+        $s -match '(?i)Could not resolve hostname' -or
+        $s -match '(?i)connect to .+ port \d+: '
+    )
+}
+
+function Test-ScpHostPortReachable {
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = 5000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostName) -or $Port -le 0) {
+        return $false
+    }
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            try { $client.Close() } catch { }
+            return $false
+        }
+        $client.EndConnect($ar)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $client) {
+            try { $client.Close() } catch { }
+            try { $client.Dispose() } catch { }
+        }
+    }
+}
+
+function Write-ScpConnectFailureThrottled {
+    <#
+      Log connect failures at most once per ThrottleMinutes (default 15) so a
+      down remote does not flood errors.log every 1-minute SCP cycle.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [string]$Level = 'WARN',
+        [int]$ThrottleMinutes = 15
+    )
+
+    $now = [datetime]::UtcNow
+    $shouldLog = $true
+    if ($script:LastScpConnectFailLogUtc -is [datetime]) {
+        $shouldLog = (($now - $script:LastScpConnectFailLogUtc).TotalMinutes -ge $ThrottleMinutes)
+    }
+    if (-not $shouldLog) {
+        return $false
+    }
+    $script:LastScpConnectFailLogUtc = $now
+    Write-LoggerEvent -Level $Level -Message $Message
+    return $true
+}
+
+function Invoke-ScpOutboundAllowReconcile {
+    <#
+      Best-effort Allow-ScpOutboundFirewall.ps1 so outbound SSH is not blocked
+      by tighter LAN policies. Throttled to once per hour unless -Force.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [switch]$Force
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Config.ScpHost)) {
+        return $false
+    }
+    $now = [datetime]::UtcNow
+    if (-not $Force -and ($script:LastScpAllowReconcileUtc -is [datetime])) {
+        if (($now - $script:LastScpAllowReconcileUtc).TotalMinutes -lt 60) {
+            return $false
+        }
+    }
+
+    $port = 22
+    if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
+        $port = [int]$Config.ScpPort
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir)) {
+        $parent = Split-Path -Parent $script:ScpOnLockScriptDir
+        $candidates.Add((Join-Path $parent 'scripts\Allow-ScpOutboundFirewall.ps1'))
+    }
+    $candidates.Add((Join-Path $env:ProgramFiles 'LoginTimeLogger\scripts\Allow-ScpOutboundFirewall.ps1'))
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.UpdateClonePath)) {
+        $candidates.Add((Join-Path ([string]$Config.UpdateClonePath) 'scripts\Allow-ScpOutboundFirewall.ps1'))
+    }
+
+    $scriptPath = $null
+    foreach ($c in @($candidates)) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) {
+            $scriptPath = $c
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        return $false
+    }
+
+    $script:LastScpAllowReconcileUtc = $now
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = @(
+        '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
+        '-File', $scriptPath,
+        '-RemoteHost', ([string]$Config.ScpHost).Trim(),
+        '-RemotePort', "$port"
+    )
+    try {
+        $p = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru -WindowStyle Hidden
+        $code = if ($null -ne $p) { [int]$p.ExitCode } else { -1 }
+        if ($code -eq 0) {
+            Write-LoggerEvent ("SCP-Allow firewall reconcile OK ({0}:{1})" -f $Config.ScpHost, $port)
+            return $true
+        }
+        Write-LoggerEvent -Level WARN -Message (
+            "SCP-Allow firewall reconcile exit {0} ({1})" -f $code, $scriptPath)
+        return $false
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "SCP-Allow firewall reconcile failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
 function Add-ScpCommonSshOptions {
     <#
       Appends shared OpenSSH client options for LoginTimeLogger scp calls.
@@ -435,6 +587,8 @@ function Add-ScpCommonSshOptions {
         [Parameter(Mandatory)][string]$IdentityFile,
         [Parameter(Mandatory)][int]$Port,
         [string]$KnownHostsFile = '',
+        [ValidateRange(5, 120)]
+        [int]$ConnectTimeoutSeconds = 20,
         [switch]$VerboseSsh
     )
 
@@ -455,7 +609,7 @@ function Add-ScpCommonSshOptions {
         $ArgumentList.Add(('UserKnownHostsFile={0}' -f $KnownHostsFile.Trim()))
     }
     $ArgumentList.Add('-o')
-    $ArgumentList.Add('ConnectTimeout=20')
+    $ArgumentList.Add(('ConnectTimeout={0}' -f $ConnectTimeoutSeconds))
     # Detect dead peers after connect (ConnectTimeout does not cover transfer stalls).
     $ArgumentList.Add('-o')
     $ArgumentList.Add('ServerAliveInterval=10')
@@ -2666,51 +2820,81 @@ function Invoke-ScpCommandsFileExchange {
     $script:ScpCommandsDownloadedBytes = [int64]0
     $remoteMissing = $false
 
-    # --- GET remote commands.txt -> local inbox ---
-    $getArgs = New-Object System.Collections.Generic.List[string]
-    Add-ScpCommonSshOptions -ArgumentList $getArgs `
-        -IdentityFile ([string]$Config.ScpIdentityFile) `
-        -Port $port `
-        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-        -VerboseSsh
-    $getArgs.Add($remoteFile)
-    $getArgs.Add([string]$paths.InboxFile)
+    # --- GET remote commands.txt -> local inbox (retry connect timeouts) ---
+    $getOk = $false
+    $getAttempt = 0
+    $getMaxAttempts = 3
+    while ($getAttempt -lt $getMaxAttempts -and -not $getOk) {
+        $getAttempt++
+        $getArgs = New-Object System.Collections.Generic.List[string]
+        Add-ScpCommonSshOptions -ArgumentList $getArgs `
+            -IdentityFile ([string]$Config.ScpIdentityFile) `
+            -Port $port `
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+            -ConnectTimeoutSeconds 45 `
+            -VerboseSsh
+        $getArgs.Add($remoteFile)
+        $getArgs.Add([string]$paths.InboxFile)
 
-    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-        "scp get {0} {1}" -f $remoteFile, $paths.InboxFile)
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            "scp get attempt {0}/{1}: {2} {3}" -f $getAttempt, $getMaxAttempts, $remoteFile, $paths.InboxFile)
 
-    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.out' -f [guid]::NewGuid().ToString('N'))
-    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.err' -f [guid]::NewGuid().ToString('N'))
-    try {
-        $argLine = ConvertTo-ScpArgumentLine -Arguments $getArgs.ToArray()
-        $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
-            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 60
-        $stderr = ''
-        if (Test-Path -LiteralPath $errFile) {
-            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-        }
-
-        if ($run.TimedOut) {
-            $msg = ("SCP commands download timed out after 60s. remote={0}; stderr={1}" -f `
-                    $remoteFile, ("$stderr").Trim())
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
-            return
-        }
-        if (Test-ScpAuthFailure -StdErr "$stderr") {
-            $msg = ("SCP commands download auth failed. remote={0}; stderr={1}" -f `
-                    $remoteFile, ("$stderr").Trim())
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
-            return
-        }
-        if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
-            if (Test-ScpRemotePathMissing -StdErr "$stderr") {
-                $remoteMissing = $true
-                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                    "remote commands.txt not present (OK). remote={0}" -f $remoteFile)
+        $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.out' -f [guid]::NewGuid().ToString('N'))
+        $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-get-{0}.err' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $argLine = ConvertTo-ScpArgumentLine -Arguments $getArgs.ToArray()
+            $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 90
+            $stderr = ''
+            if (Test-Path -LiteralPath $errFile) {
+                $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
-            else {
+
+            if ($run.TimedOut) {
+                $msg = ("SCP commands download timed out after 90s. remote={0}; stderr={1}" -f `
+                        $remoteFile, ("$stderr").Trim())
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+                return
+            }
+            if (Test-ScpAuthFailure -StdErr "$stderr") {
+                $msg = ("SCP commands download auth failed. remote={0}; stderr={1}" -f `
+                        $remoteFile, ("$stderr").Trim())
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+                return
+            }
+            if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+                if (Test-ScpRemotePathMissing -StdErr "$stderr") {
+                    $remoteMissing = $true
+                    $getOk = $true
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                        "remote commands.txt not present (OK). remote={0}" -f $remoteFile)
+                    break
+                }
+                if ((Test-ScpConnectFailure -StdErr "$stderr") -and $getAttempt -lt $getMaxAttempts) {
+                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                        "scp get connect failed (attempt {0}); retrying in 5s" -f $getAttempt)
+                    Start-Sleep -Seconds 5
+                    continue
+                }
+                if (Test-ScpConnectFailure -StdErr "$stderr") {
+                    $reportedExit = $run.ExitCode
+                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                    $msg = ("SCP commands download connect failed (exit {0}). remote={1}; stderr={2}" -f `
+                            $reportedExit, $remoteFile, ("$stderr").Trim())
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+                        $null = Send-LoginTimeLoggerFailureAlert `
+                            -Subject 'SCP connect failed' `
+                            -Body $msg `
+                            -AlertKey 'scp-connect-failed' `
+                            -Config $Config
+                    }
+                    return
+                }
                 $reportedExit = $run.ExitCode
                 $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
                 if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
@@ -2720,8 +2904,8 @@ function Invoke-ScpCommandsFileExchange {
                 Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
                 return
             }
-        }
-        else {
+
+            $getOk = $true
             $downloaded = $true
             $downloadedBytes = [int64]0
             try {
@@ -2734,59 +2918,113 @@ function Invoke-ScpCommandsFileExchange {
                 "downloaded OK ({0} byte(s)) -> {1}" -f $downloadedBytes, $paths.InboxFile)
             $script:ScpCommandsDownloadedBytes = $downloadedBytes
         }
+        finally {
+            Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        }
     }
-    finally {
-        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    if (-not $getOk) {
+        $msg = ("SCP commands download failed after {0} attempt(s). remote={1}" -f `
+                $getMaxAttempts, $remoteFile)
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+            $null = Send-LoginTimeLoggerFailureAlert `
+                -Subject 'SCP connect failed' `
+                -Body $msg `
+                -AlertKey 'scp-connect-failed' `
+                -Config $Config
+        }
+        return
     }
 
     # --- PUT empty immediately after download (clear remote before local processing) ---
     Ensure-ScpCommandsLocalLayout -Paths $paths
-    $putArgs = New-Object System.Collections.Generic.List[string]
-    Add-ScpCommonSshOptions -ArgumentList $putArgs `
-        -IdentityFile ([string]$Config.ScpIdentityFile) `
-        -Port $port `
-        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-        -VerboseSsh
-    $putArgs.Add([string]$paths.EmptyFile)
-    $putArgs.Add($remoteFile)
+    $putOk = $false
+    $putAttempt = 0
+    $putMaxAttempts = 3
+    while ($putAttempt -lt $putMaxAttempts -and -not $putOk) {
+        $putAttempt++
+        $putArgs = New-Object System.Collections.Generic.List[string]
+        Add-ScpCommonSshOptions -ArgumentList $putArgs `
+            -IdentityFile ([string]$Config.ScpIdentityFile) `
+            -Port $port `
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+            -ConnectTimeoutSeconds 45 `
+            -VerboseSsh
+        $putArgs.Add([string]$paths.EmptyFile)
+        $putArgs.Add($remoteFile)
 
-    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-        "scp put empty {0} -> {1}" -f $paths.EmptyFile, $remoteFile)
-
-    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.out' -f [guid]::NewGuid().ToString('N'))
-    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.err' -f [guid]::NewGuid().ToString('N'))
-    try {
-        $argLine = ConvertTo-ScpArgumentLine -Arguments $putArgs.ToArray()
-        $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
-            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 60
-        $stderr = ''
-        if (Test-Path -LiteralPath $errFile) {
-            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-        }
-
-        if ($run.TimedOut) {
-            $msg = ("SCP commands empty upload timed out after 60s. remote={0}; stderr={1}" -f `
-                    $remoteFile, ("$stderr").Trim())
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
-            return
-        }
-        if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
-            $reportedExit = $run.ExitCode
-            $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
-            if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
-            $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
-                    $reportedExit, $remoteFile, ("$stderr").Trim())
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-            Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
-            return
-        }
         Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-            "remote commands.txt cleared (empty upload OK) -> {0}" -f $remoteFile)
+            "scp put empty attempt {0}/{1}: {2} -> {3}" -f `
+                $putAttempt, $putMaxAttempts, $paths.EmptyFile, $remoteFile)
+
+        $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.out' -f [guid]::NewGuid().ToString('N'))
+        $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-commands-put-{0}.err' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $argLine = ConvertTo-ScpArgumentLine -Arguments $putArgs.ToArray()
+            $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 90
+            $stderr = ''
+            if (Test-Path -LiteralPath $errFile) {
+                $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+            }
+
+            if ($run.TimedOut) {
+                $msg = ("SCP commands empty upload timed out after 90s. remote={0}; stderr={1}" -f `
+                        $remoteFile, ("$stderr").Trim())
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
+                return
+            }
+            if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+                if ((Test-ScpConnectFailure -StdErr "$stderr") -and $putAttempt -lt $putMaxAttempts) {
+                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                        "scp put connect failed (attempt {0}); retrying in 5s" -f $putAttempt)
+                    Start-Sleep -Seconds 5
+                    continue
+                }
+                $reportedExit = $run.ExitCode
+                $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
+                        $reportedExit, $remoteFile, ("$stderr").Trim())
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                if (Test-ScpConnectFailure -StdErr "$stderr") {
+                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+                        $null = Send-LoginTimeLoggerFailureAlert `
+                            -Subject 'SCP connect failed' `
+                            -Body $msg `
+                            -AlertKey 'scp-connect-failed' `
+                            -Config $Config
+                    }
+                }
+                else {
+                    Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
+                }
+                return
+            }
+            $putOk = $true
+        }
+        finally {
+            Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        }
     }
-    finally {
-        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+
+    if (-not $putOk) {
+        $msg = ("SCP commands empty upload failed after {0} attempt(s). remote={1}" -f `
+                $putMaxAttempts, $remoteFile)
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+            $null = Send-LoginTimeLoggerFailureAlert `
+                -Subject 'SCP connect failed' `
+                -Body $msg `
+                -AlertKey 'scp-connect-failed' `
+                -Config $Config
+        }
+        return
     }
+    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+        "remote commands.txt cleared (empty upload OK) -> {0}" -f $remoteFile)
 
     # Empty download: clear local inbox, never interpret or email.
     if ($downloaded -and $downloadedBytes -le 0) {
@@ -3118,7 +3356,28 @@ function Invoke-ScpBHistoryCopy {
             $port = [int]$Config.ScpPort
         }
 
-        if ($uploadFiles.Count -gt 0) {
+        # Keep outbound SSH allowed; retry once if the host looks unreachable.
+        $null = Invoke-ScpOutboundAllowReconcile -Config $Config
+        $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
+        if (-not $hostReachable) {
+            $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+            Start-Sleep -Seconds 2
+            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
+        }
+        if (-not $hostReachable) {
+            $skipMsg = ("SCP BHistory/daily skipped: {0}:{1} not reachable (connection timed out / refused)." -f `
+                    $scpHost, $port)
+            if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
+                $null = Send-LoginTimeLoggerFailureAlert `
+                    -Subject 'SCP connect failed' `
+                    -Body $skipMsg `
+                    -AlertKey 'scp-connect-failed' `
+                    -Config $Config
+            }
+            # Still attempt commands exchange below (with its own retries).
+        }
+
+        if ($uploadFiles.Count -gt 0 -and $hostReachable) {
             # Upload daily log first (small/fast), then BHistory CSVs separately.
             $dailyFiles = New-Object System.Collections.Generic.List[string]
             $historyFiles = New-Object System.Collections.Generic.List[string]
@@ -3133,7 +3392,7 @@ function Invoke-ScpBHistoryCopy {
             }
 
             $uploadBatches = @(
-                @{ Name = 'daily'; Files = @($dailyFiles); TimeoutSeconds = 60 }
+                @{ Name = 'daily'; Files = @($dailyFiles); TimeoutSeconds = 90 }
                 @{ Name = 'BHistory'; Files = @($historyFiles); TimeoutSeconds = 0 }
             )
 
@@ -3158,106 +3417,68 @@ function Invoke-ScpBHistoryCopy {
                     if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
                 }
 
-                $scpArgList = New-Object System.Collections.Generic.List[string]
-                Add-ScpCommonSshOptions -ArgumentList $scpArgList `
-                    -IdentityFile ([string]$Config.ScpIdentityFile) `
-                    -Port $port `
-                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                    -VerboseSsh
-                foreach ($f in $batchFiles) {
-                    $scpArgList.Add($f)
+                $maxAttempts = 3
+                $attempt = 0
+                $batchOk = $false
+                $stderr = ''
+                $runExit = -1
+                $runTimedOut = $false
+
+                while ($attempt -lt $maxAttempts -and -not $batchOk) {
+                    $attempt++
+                    $scpArgList = New-Object System.Collections.Generic.List[string]
+                    Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+                        -IdentityFile ([string]$Config.ScpIdentityFile) `
+                        -Port $port `
+                        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                        -ConnectTimeoutSeconds 45 `
+                        -VerboseSsh
+                    foreach ($f in $batchFiles) {
+                        $scpArgList.Add($f)
+                    }
+                    $scpArgList.Add($remoteTarget)
+
+                    Write-LoggerEvent ("SCP BHistory/daily ({0}): uploading {1} file(s) to {2} (timeout {3}s, attempt {4}/{5}): {6}" -f `
+                            $batch.Name, $batchFiles.Count, $remoteTarget, $scpTimeoutSeconds,
+                        $attempt, $maxAttempts, ($batchFiles -join '; '))
+
+                    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
+                    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
+                    try {
+                        $argLine = ConvertTo-ScpArgumentLine -Arguments $scpArgList.ToArray()
+                        $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
+                        $stderr = ''
+                        if (Test-Path -LiteralPath $errFile) {
+                            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+                        }
+                        $runTimedOut = [bool]$run.TimedOut
+                        $runExit = -1
+                        if ($null -ne $run.ExitCode) { $runExit = [int]$run.ExitCode }
+
+                        if ($runTimedOut) {
+                            break
+                        }
+                        if (-not (Test-ScpCopyFailed -ExitCode $runExit -StdErr "$stderr" -TimedOut $false)) {
+                            $batchOk = $true
+                            break
+                        }
+                        if ((Test-ScpConnectFailure -StdErr "$stderr") -and $attempt -lt $maxAttempts) {
+                            $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                            Write-LoggerEvent -Level WARN -Message (
+                                "SCP BHistory/daily ({0}) connect failed (attempt {1}); retrying in 5s." -f `
+                                    $batch.Name, $attempt)
+                            Start-Sleep -Seconds 5
+                            continue
+                        }
+                        break
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+                    }
                 }
-                $scpArgList.Add($remoteTarget)
 
-                Write-LoggerEvent ("SCP BHistory/daily ({0}): uploading {1} file(s) to {2} (timeout {3}s): {4}" -f `
-                        $batch.Name, $batchFiles.Count, $remoteTarget, $scpTimeoutSeconds, ($batchFiles -join '; '))
-
-                $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.out' -f [guid]::NewGuid().ToString('N'))
-                $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-bhist-{0}.err' -f [guid]::NewGuid().ToString('N'))
-                try {
-                    $argLine = ConvertTo-ScpArgumentLine -Arguments $scpArgList.ToArray()
-
-                    $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
-                        -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
-                    $stderr = ''
-                    if (Test-Path -LiteralPath $errFile) {
-                        $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-                    }
-
-                    if ($run.TimedOut) {
-                        $msg = ("SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
-                                $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
-                        Write-LoggerEvent -Level WARN -Message $msg
-                        if ($batch.Name -eq 'BHistory') {
-                            $script:LastBHistoryScpSucceeded = $false
-                            foreach ($bf in $batchFiles) {
-                                $leaf = Split-Path -Leaf $bf
-                                $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                                    WriteUtc  = $null
-                                    Succeeded = $false
-                                }
-                            }
-                        }
-                        $diagPath = Join-Path $env:TEMP (
-                            'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                        try {
-                            @(
-                                $msg
-                                ''
-                                '--- scp stderr ---'
-                                ("$stderr").Trim()
-                            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                            $null = Send-LoginTimeLoggerFailureAlert `
-                                -Subject 'SCP BHistory/daily failed' `
-                                -Body $msg `
-                                -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
-                                -Config $Config `
-                                -ExtraAttachment @($diagPath)
-                        }
-                        finally {
-                            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
-                        }
-                        continue
-                    }
-                    if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
-                        $reportedExit = $run.ExitCode
-                        $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
-                        if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
-                        $msg = ("SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
-                                $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
-                        Write-LoggerEvent -Level WARN -Message $msg
-                        if ($batch.Name -eq 'BHistory') {
-                            $script:LastBHistoryScpSucceeded = $false
-                            foreach ($bf in $batchFiles) {
-                                $leaf = Split-Path -Leaf $bf
-                                $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
-                                    WriteUtc  = $null
-                                    Succeeded = $false
-                                }
-                            }
-                        }
-                        $diagPath = Join-Path $env:TEMP (
-                            'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                        try {
-                            @(
-                                $msg
-                                ''
-                                '--- scp stderr ---'
-                                ("$stderr").Trim()
-                            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                            $null = Send-LoginTimeLoggerFailureAlert `
-                                -Subject 'SCP BHistory/daily failed' `
-                                -Body $msg `
-                                -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
-                                -Config $Config `
-                                -ExtraAttachment @($diagPath)
-                        }
-                        finally {
-                            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
-                        }
-                        continue
-                    }
-
+                if ($batchOk) {
                     if ($batch.Name -eq 'BHistory' -and $includeBHistory) {
                         $script:LastBHistoryScpSucceeded = $true
                         $nowUtc = [datetime]::UtcNow
@@ -3274,9 +3495,77 @@ function Invoke-ScpBHistoryCopy {
                     }
                     Write-LoggerEvent ("SCP BHistory/daily ({0}) succeeded ({1} file(s)) -> {2}: {3}" -f `
                             $batch.Name, $batchFiles.Count, $remoteTarget, ($batchFiles -join '; '))
+                    continue
                 }
-                finally {
-                    Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+
+                if ($batch.Name -eq 'BHistory') {
+                    $script:LastBHistoryScpSucceeded = $false
+                    foreach ($bf in $batchFiles) {
+                        $leaf = Split-Path -Leaf $bf
+                        $script:LastBHistoryStateByLeaf[$leaf] = [pscustomobject]@{
+                            WriteUtc  = $null
+                            Succeeded = $false
+                        }
+                    }
+                }
+
+                $reportedExit = $runExit
+                $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                if ($runTimedOut) {
+                    $msg = ("SCP BHistory/daily ({0}) timed out after {1}s. files={2}; stderr={3}" -f `
+                            $batch.Name, $scpTimeoutSeconds, ($batchFiles -join '; '), ("$stderr").Trim())
+                }
+                else {
+                    $msg = ("SCP BHistory/daily ({0}) failed (exit {1}). files={2}; stderr={3}" -f `
+                            $batch.Name, $reportedExit, ($batchFiles -join '; '), ("$stderr").Trim())
+                }
+
+                $isConnectFail = Test-ScpConnectFailure -StdErr "$stderr"
+                if ($isConnectFail) {
+                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
+                        $diagPath = Join-Path $env:TEMP (
+                            'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                        try {
+                            @(
+                                $msg
+                                ''
+                                '--- scp stderr ---'
+                                ("$stderr").Trim()
+                            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                            $null = Send-LoginTimeLoggerFailureAlert `
+                                -Subject 'SCP connect failed' `
+                                -Body $msg `
+                                -AlertKey 'scp-connect-failed' `
+                                -Config $Config `
+                                -ExtraAttachment @($diagPath)
+                        }
+                        finally {
+                            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+                else {
+                    Write-LoggerEvent -Level WARN -Message $msg
+                    $diagPath = Join-Path $env:TEMP (
+                        'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                    try {
+                        @(
+                            $msg
+                            ''
+                            '--- scp stderr ---'
+                            ("$stderr").Trim()
+                        ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                        $null = Send-LoginTimeLoggerFailureAlert `
+                            -Subject 'SCP BHistory/daily failed' `
+                            -Body $msg `
+                            -AlertKey ('scp-bhist-daily-failed-{0}' -f $batch.Name) `
+                            -Config $Config `
+                            -ExtraAttachment @($diagPath)
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
         }
