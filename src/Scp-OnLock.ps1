@@ -1969,17 +1969,28 @@ function Invoke-ScpLogCopyOnLock {
             $port = [int]$Config.ScpPort
         }
 
-        # Do not name this $args (PowerShell automatic variable).
-        $scpArgList = New-Object System.Collections.Generic.List[string]
-        Add-ScpCommonSshOptions -ArgumentList $scpArgList `
-            -IdentityFile ([string]$Config.ScpIdentityFile) `
-            -Port $port `
-            -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-            -VerboseSsh
-        foreach ($f in $files) {
-            $scpArgList.Add($f)
+        # Same preflight as BHistory/daily: keep outbound SSH allowed, skip when
+        # the host is down so lock handling is not blocked on ConnectTimeout.
+        $null = Invoke-ScpOutboundAllowReconcile -Config $Config
+        $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
+        if (-not $hostReachable) {
+            $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+            Start-Sleep -Seconds 2
+            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
         }
-        $scpArgList.Add($remoteTarget)
+        if (-not $hostReachable) {
+            $skipMsg = ("SCP on lock skipped: {0}:{1} not reachable (connection timed out / refused)." -f `
+                    $scpHost, $port)
+            if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
+                $null = Send-LoginTimeLoggerFailureAlert `
+                    -Subject 'SCP connect failed' `
+                    -Body $skipMsg `
+                    -AlertKey 'scp-connect-failed' `
+                    -Config $Config `
+                    -ErrorLogPath $ErrorLogPath
+            }
+            return
+        }
 
         # Hard cap: ConnectTimeout only covers TCP connect. A stalled transfer
         # previously blocked the monitor for hours (see Connection aborted after ~2.5h).
@@ -1996,116 +2007,172 @@ function Invoke-ScpLogCopyOnLock {
         if ($scpTimeoutSeconds -lt 90) { $scpTimeoutSeconds = 90 }
         if ($scpTimeoutSeconds -gt 600) { $scpTimeoutSeconds = 600 }
 
-        Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1} (timeout {2}s): {3}" -f `
-                $files.Count, $remoteTarget, $scpTimeoutSeconds, ($files -join '; '))
+        $maxAttempts = 3
+        $attempt = 0
+        $copyOk = $false
+        $stdout = ''
+        $stderr = ''
+        $exitCode = -1
+        $runTimedOut = $false
 
-        $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.out' -f [guid]::NewGuid().ToString('N'))
-        $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.err' -f [guid]::NewGuid().ToString('N'))
-        try {
-            $argLine = $null
-            if (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
-                $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
+        while ($attempt -lt $maxAttempts -and -not $copyOk) {
+            $attempt++
+            # Do not name this $args (PowerShell automatic variable).
+            $scpArgList = New-Object System.Collections.Generic.List[string]
+            Add-ScpCommonSshOptions -ArgumentList $scpArgList `
+                -IdentityFile ([string]$Config.ScpIdentityFile) `
+                -Port $port `
+                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                -ConnectTimeoutSeconds 45 `
+                -VerboseSsh
+            foreach ($f in $files) {
+                $scpArgList.Add($f)
             }
-            if ([string]::IsNullOrWhiteSpace($argLine)) {
-                # Fallback: still better than $args automatic-variable confusion.
-                $argLine = ($scpArgList | ForEach-Object {
-                        if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
-                    }) -join ' '
-            }
+            $scpArgList.Add($remoteTarget)
 
-            $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
-                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
-            $stdout = ''
-            $stderr = ''
-            if (Test-Path -LiteralPath $outFile) {
-                $stdout = (Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
-            }
-            if (Test-Path -LiteralPath $errFile) {
-                $stderr = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-            }
-            $exitCode = [int]$run.ExitCode
-            if ($run.TimedOut) {
-                $msg = ("SCP on lock timed out after {0}s (killed). target={1}; files={2}; stderr={3}; stdout={4}" -f `
-                        $scpTimeoutSeconds, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
-                Write-LoggerEvent -Level WARN -Message $msg
+            Write-LoggerEvent ("SCP on lock: copying {0} file(s) to {1} (timeout {2}s, attempt {3}/{4}): {5}" -f `
+                    $files.Count, $remoteTarget, $scpTimeoutSeconds, $attempt, $maxAttempts,
+                ($files -join '; '))
 
-                $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                try {
-                    @(
-                        $msg
-                        ''
-                        '--- scp stderr ---'
-                        ("$stderr").Trim()
-                        ''
-                        '--- scp stdout ---'
-                        ("$stdout").Trim()
-                    ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                    $null = Send-ScpOnLockFailureAlert -Body $msg -Config $Config `
-                        -ErrorLogPath $ErrorLogPath -ExtraAttachment @($diagPath)
+            $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.out' -f [guid]::NewGuid().ToString('N'))
+            $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-{0}.err' -f [guid]::NewGuid().ToString('N'))
+            try {
+                $argLine = $null
+                if (Get-Command ConvertTo-ScpArgumentLine -ErrorAction SilentlyContinue) {
+                    $argLine = ConvertTo-ScpArgumentLine -Arguments $scpArgList.ToArray()
                 }
-                finally {
-                    Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                elseif (Get-Command ConvertTo-StartProcessArgumentString -ErrorAction SilentlyContinue) {
+                    $argLine = ConvertTo-StartProcessArgumentString -Argument $scpArgList.ToArray()
                 }
-                return
-            }
-            # Prefer scp -v "Exit status N" when Start-Process ExitCode is -1/wrong.
-            $scpFailed = Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false
-            $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
-            if ($null -ne $verboseExit) {
-                $exitCode = $verboseExit
-            }
-            if ($scpFailed) {
-                $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `
-                        $exitCode, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
-                $badKeyAcl = '(?i)UNPROTECTED PRIVATE KEY|bad permissions|' +
-                    'Permissions for .+ are too open'
-                if ("$stderr" -match $badKeyAcl) {
-                    $msg = $msg + ("`r`nPrivate key ACL is too open for SYSTEM scp. " +
-                        "Re-run Install/Restart (Protect-ScpPrivateKeyFile) or: " +
-                        "icacls `"{0}`" /inheritance:r && " +
-                        "icacls `"{0}`" /grant:r SYSTEM:F" -f `
-                            ([string]$Config.ScpIdentityFile))
+                if ([string]::IsNullOrWhiteSpace($argLine)) {
+                    $argLine = ($scpArgList | ForEach-Object {
+                            if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+                        }) -join ' '
                 }
-                elseif (Test-ScpAuthFailure -StdErr "$stderr") {
-                    $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
-                    if (-not [string]::IsNullOrWhiteSpace($pub)) {
-                        $msg = $msg + (
-                            "`r`nRemote rejected public key auth. Append this line " +
-                            "to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
-                                $scpUser, $pub)
-                    }
-                    else {
-                        $msg = $msg + (
-                            "`r`nRemote rejected public key auth; ensure " +
-                            'ScpIdentityFile.pub is in remote authorized_keys.')
-                    }
-                }
-                # WARN: still records to errors.log / service.log, but avoids a second attachment-less SMTP from ERROR.
-                Write-LoggerEvent -Level WARN -Message $msg
 
-                $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-                try {
-                    @(
-                        $msg
-                        ''
-                        '--- scp stderr ---'
-                        ("$stderr").Trim()
-                        ''
-                        '--- scp stdout ---'
-                        ("$stdout").Trim()
-                    ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
-                    $null = Send-ScpOnLockFailureAlert -Body $msg -Config $Config `
-                        -ErrorLogPath $ErrorLogPath -ExtraAttachment @($diagPath)
+                $run = Invoke-ScpProcessWithTimeout -ScpExe $scpExe -ArgumentList $argLine `
+                    -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $scpTimeoutSeconds
+                $stdout = ''
+                $stderr = ''
+                if (Test-Path -LiteralPath $outFile) {
+                    $stdout = (Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
                 }
-                finally {
-                    Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $errFile) {
+                    $stderr = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
                 }
-                return
+                $exitCode = -1
+                if ($null -ne $run.ExitCode) { $exitCode = [int]$run.ExitCode }
+                $runTimedOut = [bool]$run.TimedOut
+
+                if ($runTimedOut) {
+                    break
+                }
+                if (-not (Test-ScpCopyFailed -ExitCode $exitCode -StdErr "$stderr" -TimedOut $false)) {
+                    $copyOk = $true
+                    break
+                }
+                if ((Test-ScpConnectFailure -StdErr "$stderr") -and $attempt -lt $maxAttempts) {
+                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                    Write-LoggerEvent -Level WARN -Message (
+                        "SCP on lock connect failed (attempt {0}); retrying in 5s." -f $attempt)
+                    Start-Sleep -Seconds 5
+                    continue
+                }
+                break
             }
+            finally {
+                Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if ($copyOk) {
             Write-LoggerEvent ("SCP on lock succeeded ({0} file(s)): {1}" -f $files.Count, ($files -join '; '))
+            return
+        }
+
+        $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+        if ($null -ne $verboseExit) {
+            $exitCode = $verboseExit
+        }
+        if ($runTimedOut) {
+            $msg = ("SCP on lock timed out after {0}s (killed). target={1}; files={2}; stderr={3}; stdout={4}" -f `
+                    $scpTimeoutSeconds, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
+        }
+        else {
+            $msg = ("SCP on lock failed (exit {0}). target={1}; files={2}; stderr={3}; stdout={4}" -f `
+                    $exitCode, $remoteTarget, ($files -join '; '), ("$stderr").Trim(), ("$stdout").Trim())
+            $badKeyAcl = '(?i)UNPROTECTED PRIVATE KEY|bad permissions|' +
+                'Permissions for .+ are too open'
+            if ("$stderr" -match $badKeyAcl) {
+                $msg = $msg + ("`r`nPrivate key ACL is too open for SYSTEM scp. " +
+                    "Re-run Install/Restart (Protect-ScpPrivateKeyFile) or: " +
+                    "icacls `"{0}`" /inheritance:r && " +
+                    "icacls `"{0}`" /grant:r SYSTEM:F" -f `
+                        ([string]$Config.ScpIdentityFile))
+            }
+            elseif (Test-ScpAuthFailure -StdErr "$stderr") {
+                $pub = Get-ScpPublicKeyText -IdentityPath $Config.ScpIdentityFile
+                if (-not [string]::IsNullOrWhiteSpace($pub)) {
+                    $msg = $msg + (
+                        "`r`nRemote rejected public key auth. Append this line " +
+                        "to {0}@host ~/.ssh/authorized_keys:`r`n{1}" -f `
+                            $scpUser, $pub)
+                }
+                else {
+                    $msg = $msg + (
+                        "`r`nRemote rejected public key auth; ensure " +
+                        'ScpIdentityFile.pub is in remote authorized_keys.')
+                }
+            }
+        }
+
+        $isConnectFail = Test-ScpConnectFailure -StdErr "$stderr"
+        if ($isConnectFail) {
+            if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
+                $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    @(
+                        $msg
+                        ''
+                        '--- scp stderr ---'
+                        ("$stderr").Trim()
+                        ''
+                        '--- scp stdout ---'
+                        ("$stdout").Trim()
+                    ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+                    $null = Send-LoginTimeLoggerFailureAlert `
+                        -Subject 'SCP connect failed' `
+                        -Body $msg `
+                        -AlertKey 'scp-connect-failed' `
+                        -Config $Config `
+                        -ErrorLogPath $ErrorLogPath `
+                        -ExtraAttachment @($diagPath)
+                }
+                finally {
+                    Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return
+        }
+
+        # Non-connect failures: always log + alert (auth, mid-transfer, etc.).
+        Write-LoggerEvent -Level WARN -Message $msg
+        $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+        try {
+            @(
+                $msg
+                ''
+                '--- scp stderr ---'
+                ("$stderr").Trim()
+                ''
+                '--- scp stdout ---'
+                ("$stdout").Trim()
+            ) | Set-Content -LiteralPath $diagPath -Encoding UTF8
+            $null = Send-ScpOnLockFailureAlert -Body $msg -Config $Config `
+                -ErrorLogPath $ErrorLogPath -ExtraAttachment @($diagPath)
         }
         finally {
-            Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
