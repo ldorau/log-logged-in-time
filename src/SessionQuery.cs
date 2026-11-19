@@ -1185,7 +1185,14 @@ public static class SessionQuery
                 }
                 if (exitCode != 0)
                 {
-                    error = "Child process exited with code " + exitCode + ".";
+                    // 0xFFFD0000 is commonly seen when powershell -File cannot load the
+                    // script in the user session (ACL Deny under Program Files, etc.).
+                    error = "Child process exited with code " + exitCode +
+                            " (0x" + exitCode.ToString("X8") + ").";
+                    if (exitCode == 0xFFFD0000u)
+                    {
+                        error += " Likely the -File script is not readable in the user session (ACL).";
+                    }
                     SetLastError(error);
                     return false;
                 }

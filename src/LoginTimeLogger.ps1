@@ -728,8 +728,10 @@ function Read-State {
 function Publish-UnlockQuotaWarningForUserLaunch {
     <#
       Program Files\LoginTimeLogger denies the target user (no read/execute).
-      CreateProcessAsUser runs the UI as that user, so stage a readable copy
-      under the target profile LocalAppData (preferred) or ProgramData\LoginTimeLogger\ui.
+      CreateProcessAsUser runs the UI as that user, so stage a readable copy.
+      Prefer Public (world-readable), then target LocalAppData, then
+      ProgramData\LoginTimeLogger\ui. Exit 0xFFFD0000 in ~200ms is the usual
+      symptom when -File points at a path the interactive user cannot read.
     #>
     param(
         [Parameter(Mandatory)][string]$SourceScriptPath,
@@ -742,6 +744,7 @@ function Publish-UnlockQuotaWarningForUserLaunch {
 
     $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
     $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $sidAuthenticated = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
     $adminSid = $null
     $targetSid = $null
     try {
@@ -756,6 +759,11 @@ function Publish-UnlockQuotaWarningForUserLaunch {
     catch { }
 
     $candidateDirs = New-Object System.Collections.Generic.List[string]
+    # Public first: no per-user profile dependency; readable by interactive users.
+    if (-not [string]::IsNullOrWhiteSpace($env:PUBLIC)) {
+        $candidateDirs.Add((Join-Path $env:PUBLIC 'LoginTimeLoggerUI'))
+    }
+    $candidateDirs.Add('C:\Users\Public\LoginTimeLoggerUI')
     if ($targetSid -and (Get-Command Get-ProfilePathForSid -ErrorAction SilentlyContinue)) {
         try {
             $profilePath = Get-ProfilePathForSid -Sid $targetSid
@@ -767,16 +775,27 @@ function Publish-UnlockQuotaWarningForUserLaunch {
     }
     $candidateDirs.Add((Join-Path $env:ProgramData 'LoginTimeLogger\ui'))
 
+    $seenDirs = @{}
     foreach ($uiDir in @($candidateDirs)) {
         if ([string]::IsNullOrWhiteSpace($uiDir)) { continue }
-        $dest = Join-Path $uiDir 'Show-UnlockQuotaWarning.ps1'
         try {
-            if (-not (Test-Path -LiteralPath $uiDir)) {
-                New-Item -ItemType Directory -Path $uiDir -Force | Out-Null
+            $uiDirFull = [System.IO.Path]::GetFullPath($uiDir)
+        }
+        catch {
+            $uiDirFull = $uiDir
+        }
+        $dirKey = $uiDirFull.ToLowerInvariant()
+        if ($seenDirs.ContainsKey($dirKey)) { continue }
+        $seenDirs[$dirKey] = $true
+
+        $dest = Join-Path $uiDirFull 'Show-UnlockQuotaWarning.ps1'
+        try {
+            if (-not (Test-Path -LiteralPath $uiDirFull)) {
+                New-Item -ItemType Directory -Path $uiDirFull -Force | Out-Null
             }
             Copy-Item -LiteralPath $SourceScriptPath -Destination $dest -Force
 
-            $acl = Get-Acl -LiteralPath $uiDir
+            $acl = Get-Acl -LiteralPath $uiDirFull
             $acl.SetAccessRuleProtection($true, $false)
             foreach ($rule in @($acl.Access)) {
                 $null = $acl.RemoveAccessRule($rule)
@@ -785,6 +804,8 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                         $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                         $sidUsers, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidAuthenticated, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             if ($adminSid) {
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                             $adminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
@@ -795,7 +816,7 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                             $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             }
-            Set-Acl -LiteralPath $uiDir -AclObject $acl
+            Set-Acl -LiteralPath $uiDirFull -AclObject $acl
 
             $fileAcl = Get-Acl -LiteralPath $dest
             $fileAcl.SetAccessRuleProtection($true, $false)
@@ -806,6 +827,8 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                         $sidSystem, 'FullControl', 'None', 'None', 'Allow')))
             $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                         $sidUsers, 'ReadAndExecute', 'None', 'None', 'Allow')))
+            $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidAuthenticated, 'ReadAndExecute', 'None', 'None', 'Allow')))
             if ($adminSid) {
                 $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                             $adminSid, 'FullControl', 'None', 'None', 'Allow')))
@@ -821,7 +844,7 @@ function Publish-UnlockQuotaWarningForUserLaunch {
         }
         catch {
             Write-DebugLog -Source 'UnlockWarn' -Message (
-                "stage UI script failed for '{0}': {1}" -f $uiDir, $_.Exception.Message)
+                "stage UI script failed for '{0}': {1}" -f $uiDirFull, $_.Exception.Message)
         }
     }
     return ''
@@ -858,6 +881,7 @@ function Invoke-UnlockQuotaWarningAndLock {
     }
 
     # Target cannot read Program Files\LoginTimeLogger (Deny ACE); stage a readable copy.
+    # Never launch the Program Files path in the user session (exit 0xFFFD0000).
     $launchScript = Publish-UnlockQuotaWarningForUserLaunch `
         -SourceScriptPath $WarningScriptPath `
         -Config $Config
@@ -865,6 +889,15 @@ function Invoke-UnlockQuotaWarningAndLock {
         Write-LoggerEvent -Level WARN -Message (
             "Unlock-quota: could not stage user-readable UI script from '{0}'." -f $WarningScriptPath)
         Write-DebugLog -Source 'UnlockWarn' -Message 'ABORT: staged UI script missing'
+        return $false
+    }
+    $pfRoot = [string]$env:ProgramFiles
+    if (-not [string]::IsNullOrWhiteSpace($pfRoot) -and
+        $launchScript.StartsWith($pfRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-LoggerEvent -Level WARN -Message (
+            "Unlock-quota: refusing to launch Program Files UI path as target user: {0}" -f $launchScript)
+        Write-DebugLog -Source 'UnlockWarn' -Message (
+            "ABORT: launch path still under Program Files: {0}" -f $launchScript)
         return $false
     }
     Write-DebugLog -Source 'UnlockWarn' -Message ("staged UI script for user launch: {0}" -f $launchScript)
@@ -940,6 +973,25 @@ function Invoke-UnlockQuotaWarningAndLock {
         "LaunchInUserSession ok={0}; error={1}; LastError={2}; uiDebug={3}" -f `
             $ok, $launchError, $(try { [SessionQuery]::LastError } catch { '(n/a)' }), $uiDebugLog)
     if (-not $ok) {
+        # Pull child UI traces into the monitor debug.log (child may have exited
+        # before writing, or only wrote under the staged dir).
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($uiDebugLog) -and (Test-Path -LiteralPath $uiDebugLog)) {
+                $uiTail = Get-Content -LiteralPath $uiDebugLog -Tail 40 -ErrorAction SilentlyContinue
+                if ($uiTail -and @($uiTail).Count -gt 0) {
+                    Write-DebugLog -Source 'UnlockWarn' -Message (
+                        "uiDebug tail ({0}):" -f $uiDebugLog)
+                    foreach ($ul in @($uiTail)) {
+                        Write-DebugLog -Source 'UnlockWarn' -Message ("  {0}" -f $ul)
+                    }
+                }
+                else {
+                    Write-DebugLog -Source 'UnlockWarn' -Message (
+                        "uiDebug empty (script likely never started; check ACL on {0})" -f $launchScript)
+                }
+            }
+        }
+        catch { }
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota launch failed: {0}" -f $launchError)
         return $false
     }
