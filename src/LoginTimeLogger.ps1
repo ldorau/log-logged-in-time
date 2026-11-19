@@ -725,6 +725,108 @@ function Read-State {
     }
 }
 
+function Publish-UnlockQuotaWarningForUserLaunch {
+    <#
+      Program Files\LoginTimeLogger denies the target user (no read/execute).
+      CreateProcessAsUser runs the UI as that user, so stage a readable copy
+      under the target profile LocalAppData (preferred) or ProgramData\LoginTimeLogger\ui.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceScriptPath,
+        [Parameter(Mandatory)]$Config
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceScriptPath)) {
+        return ''
+    }
+
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $adminSid = $null
+    $targetSid = $null
+    try {
+        $adminSid = Resolve-WindowsAccountSid -UserName ([string]$Config.AdminUsername) `
+            -ProfilePath ([string]$Config.AdministratorProfile)
+    }
+    catch { }
+    try {
+        $targetSid = Resolve-WindowsAccountSid -UserName ([string]$Config.TargetUsername) `
+            -ProfilePath ([string]$Config.AdministratorProfile)
+    }
+    catch { }
+
+    $candidateDirs = New-Object System.Collections.Generic.List[string]
+    if ($targetSid -and (Get-Command Get-ProfilePathForSid -ErrorAction SilentlyContinue)) {
+        try {
+            $profilePath = Get-ProfilePathForSid -Sid $targetSid
+            if (-not [string]::IsNullOrWhiteSpace($profilePath)) {
+                $candidateDirs.Add((Join-Path $profilePath 'AppData\Local\LoginTimeLoggerUI'))
+            }
+        }
+        catch { }
+    }
+    $candidateDirs.Add((Join-Path $env:ProgramData 'LoginTimeLogger\ui'))
+
+    foreach ($uiDir in @($candidateDirs)) {
+        if ([string]::IsNullOrWhiteSpace($uiDir)) { continue }
+        $dest = Join-Path $uiDir 'Show-UnlockQuotaWarning.ps1'
+        try {
+            if (-not (Test-Path -LiteralPath $uiDir)) {
+                New-Item -ItemType Directory -Path $uiDir -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $SourceScriptPath -Destination $dest -Force
+
+            $acl = Get-Acl -LiteralPath $uiDir
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($rule in @($acl.Access)) {
+                $null = $acl.RemoveAccessRule($rule)
+            }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidSystem, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidUsers, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            if ($adminSid) {
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            $adminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            }
+            if ($targetSid) {
+                # FullControl on the user's own LocalAppData staging dir so the
+                # interactive session can always read/execute the UI script.
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            }
+            Set-Acl -LiteralPath $uiDir -AclObject $acl
+
+            $fileAcl = Get-Acl -LiteralPath $dest
+            $fileAcl.SetAccessRuleProtection($true, $false)
+            foreach ($rule in @($fileAcl.Access)) {
+                $null = $fileAcl.RemoveAccessRule($rule)
+            }
+            $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidSystem, 'FullControl', 'None', 'None', 'Allow')))
+            $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sidUsers, 'ReadAndExecute', 'None', 'None', 'Allow')))
+            if ($adminSid) {
+                $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            $adminSid, 'FullControl', 'None', 'None', 'Allow')))
+            }
+            if ($targetSid) {
+                $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            $targetSid, 'ReadAndExecute', 'None', 'None', 'Allow')))
+            }
+            Set-Acl -LiteralPath $dest -AclObject $fileAcl
+
+            Write-DebugLog -Source 'UnlockWarn' -Message ("staged UI script -> {0}" -f $dest)
+            return $dest
+        }
+        catch {
+            Write-DebugLog -Source 'UnlockWarn' -Message (
+                "stage UI script failed for '{0}': {1}" -f $uiDir, $_.Exception.Message)
+        }
+    }
+    return ''
+}
+
 function Invoke-UnlockQuotaWarningAndLock {
     <#
       Shows a blocking countdown on the target user's desktop, then LockWorkStation
@@ -755,6 +857,18 @@ function Invoke-UnlockQuotaWarningAndLock {
         return $false
     }
 
+    # Target cannot read Program Files\LoginTimeLogger (Deny ACE); stage a readable copy.
+    $launchScript = Publish-UnlockQuotaWarningForUserLaunch `
+        -SourceScriptPath $WarningScriptPath `
+        -Config $Config
+    if ([string]::IsNullOrWhiteSpace($launchScript) -or -not (Test-Path -LiteralPath $launchScript)) {
+        Write-LoggerEvent -Level WARN -Message (
+            "Unlock-quota: could not stage user-readable UI script from '{0}'." -f $WarningScriptPath)
+        Write-DebugLog -Source 'UnlockWarn' -Message 'ABORT: staged UI script missing'
+        return $false
+    }
+    Write-DebugLog -Source 'UnlockWarn' -Message ("staged UI script for user launch: {0}" -f $launchScript)
+
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $psExe)) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota: powershell.exe not found at {0}" -f $psExe)
@@ -770,43 +884,70 @@ function Invoke-UnlockQuotaWarningAndLock {
         $seconds = [int]$Config.UnlockQuotaWarnSeconds
     }
     if ($seconds -lt 1) { $seconds = 3 }
-    # Hidden console; WinForms ShowDialog still appears on the interactive desktop.
-    $arguments = '-NoProfile -NoLogo -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
-        $WarningScriptPath, $ElapsedMinutes, $seconds
+
+    # UI debug log must be writable by the target user (LogDirectory is denied).
+    # Prefer same directory as the staged script (user LocalAppData or ProgramData\ui).
+    $uiDebugLog = Join-Path (Split-Path -Parent $launchScript) 'debug-ui.log'
+    try {
+        if (-not (Test-Path -LiteralPath $uiDebugLog)) {
+            Set-Content -LiteralPath $uiDebugLog -Value '' -Encoding UTF8
+        }
+        $dbgAcl = Get-Acl -LiteralPath $uiDebugLog
+        $sidUsersDbg = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $dbgAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sidUsersDbg, 'Modify', 'None', 'None', 'Allow')))
+        $dbgTargetSid = $null
+        try {
+            $dbgTargetSid = Resolve-WindowsAccountSid -UserName ([string]$Config.TargetUsername) `
+                -ProfilePath ([string]$Config.AdministratorProfile)
+        }
+        catch { }
+        if ($dbgTargetSid) {
+            $dbgAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $dbgTargetSid, 'Modify', 'None', 'None', 'Allow')))
+        }
+        Set-Acl -LiteralPath $uiDebugLog -AclObject $dbgAcl
+    }
+    catch {
+        Write-DebugLog -Source 'UnlockWarn' -Message (
+            "ui debug log ACL best-effort failed: {0}" -f $_.Exception.Message)
+    }
+
+    # Always show the interactive desktop UI: no -WindowStyle Hidden, and
+    # LaunchInUserSession(showWindow=true) so CREATE_NO_WINDOW is not set.
+    $arguments = '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
+        $launchScript, $ElapsedMinutes, $seconds
     if ($BreakMessage) {
         $arguments += ' -BreakMessage'
     }
     if ($UnlockedSeconds -ge 0) {
         $arguments += (' -UnlockedSeconds {0}' -f ([int][Math]::Floor($UnlockedSeconds)))
     }
-    if (-not [string]::IsNullOrWhiteSpace([string]$script:DebugLogPath)) {
-        $arguments += (' -DebugLogPath "{0}"' -f $script:DebugLogPath)
-    }
+    $arguments += (' -DebugLogPath "{0}"' -f $uiDebugLog)
 
     # Wait for countdown + LockWorkStation + script teardown, with grace.
-    $waitMs = ($seconds * 1000) + 15000
+    $waitMs = ($seconds * 1000) + 30000
     $sessionUnlocked = $null
     try { $sessionUnlocked = [SessionQuery]::IsUserUnlocked($Config.TargetUsername) } catch { $sessionUnlocked = "err:$($_.Exception.Message)" }
     Write-DebugLog -Source 'UnlockWarn' -Message (
-        "launch psExe={0}; waitMs={1}; sessionUnlocked={2}; args={3}" -f `
+        "launch psExe={0}; showWindow=True; waitMs={1}; sessionUnlocked={2}; args={3}" -f `
             $psExe, $waitMs, $sessionUnlocked, $arguments)
 
     $launchError = ''
     $ok = [SessionQuery]::LaunchInUserSession(
-        $Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $false, $waitMs)
+        $Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $true, $waitMs)
     Write-DebugLog -Source 'UnlockWarn' -Message (
-        "LaunchInUserSession ok={0}; error={1}; LastError={2}" -f `
-            $ok, $launchError, $(try { [SessionQuery]::LastError } catch { '(n/a)' }))
+        "LaunchInUserSession ok={0}; error={1}; LastError={2}; uiDebug={3}" -f `
+            $ok, $launchError, $(try { [SessionQuery]::LastError } catch { '(n/a)' }), $uiDebugLog)
     if (-not $ok) {
         Write-LoggerEvent -Level WARN -Message ("Unlock-quota launch failed: {0}" -f $launchError)
         return $false
     }
 
-    # Child exit 0 is not enough: older scripts always exited 0 even when
-    # LockWorkStation failed, which advanced the quota bucket while the
-    # desktop stayed unlocked. Confirm the session actually locked.
+    # Child exit 0 means ShowDialog completed and LockWorkStation reported success.
+    # Confirm the session locked; for break, trust the child if the probe lags.
     $stillUnlocked = $true
-    for ($i = 0; $i -lt 10; $i++) {
+    for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
         try {
             if (-not [SessionQuery]::IsUserUnlocked($Config.TargetUsername)) {
@@ -821,6 +962,13 @@ function Invoke-UnlockQuotaWarningAndLock {
     Write-DebugLog -Source 'UnlockWarn' -Message (
         "post-launch stillUnlocked={0} (probe after child exit 0)" -f $stillUnlocked)
     if ($stillUnlocked) {
+        if ($BreakMessage) {
+            Write-LoggerEvent -Level WARN -Message (
+                ("Remote break: child exited 0 but session still reports unlocked for {0}; " +
+                    "treating dialog as shown.") -f $Config.TargetUsername)
+            Write-DebugLog -Source 'UnlockWarn' -Message 'SUCCESS tag=break; trusting child exit 0 despite probe'
+            return $true
+        }
         Write-LoggerEvent -Level WARN -Message (
             ("Unlock-quota: warning ran but session still unlocked for {0} " +
                 "(lock may have failed); will retry without advancing bucket.") -f `

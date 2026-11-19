@@ -1130,8 +1130,15 @@ public static class SessionQuery
             si.dwFlags = (int)STARTF_USESHOWWINDOW;
             si.wShowWindow = showWindow ? SW_SHOWNORMAL : SW_HIDE;
 
-            // CREATE_NO_WINDOW avoids a visible PowerShell console; WinForms can still ShowDialog.
-            uint flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+            // CREATE_NO_WINDOW avoids a visible PowerShell console for background
+            // helpers. For interactive UI (showWindow=true, e.g. remote "break"),
+            // omit it — combined with SW_HIDE it can prevent WinForms ShowDialog
+            // from appearing on the user desktop on some hosts.
+            uint flags = CREATE_UNICODE_ENVIRONMENT;
+            if (!showWindow)
+            {
+                flags |= CREATE_NO_WINDOW;
+            }
             if (!CreateProcessAsUser(
                     primaryToken,
                     null,
