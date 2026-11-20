@@ -1640,6 +1640,7 @@ $script:LastPollErrorUtc = [datetime]::MinValue
 $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
 # BHistory SCP (fixed interval in Scp-OnLock.ps1).
 $script:LastBHistoryScpUtc = [datetime]::MinValue
+$script:LastScpCommandsUtc = [datetime]::MinValue
 $script:LastBHistorySourceWriteUtc = [datetime]::MinValue
 $script:LastBHistoryScpSucceeded = $false
 $script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
@@ -1801,6 +1802,31 @@ while ($true) {
             catch {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
                     'Unexpected SCP BHistory failure')
+            }
+        }
+
+        # Remote commands.txt: same OpenSSH scp path, own 1-minute timer (not
+        # blocked by BHistory uploads or the long connect backoff).
+        $commandsIntervalMin = [int]$script:ScpCommandsIntervalMinutes
+        if ($commandsIntervalMin -le 0) {
+            $commandsIntervalMin = 1
+        }
+        $dueCommands = ($nowUtc - $script:LastScpCommandsUtc).TotalMinutes -ge $commandsIntervalMin
+        if ($dueCommands) {
+            $script:LastScpCommandsUtc = $nowUtc
+            try {
+                if ((Get-Command Test-ScpEndpointConfigured -ErrorAction SilentlyContinue) -and
+                    (Get-Command Invoke-ScpCommandsFileExchange -ErrorAction SilentlyContinue) -and
+                    (Test-ScpEndpointConfigured -Config $config)) {
+                    $scpExeCmd = Find-ScpExecutable
+                    if (-not [string]::IsNullOrWhiteSpace($scpExeCmd)) {
+                        Invoke-ScpCommandsFileExchange -Config $config -ScpExe $scpExeCmd
+                    }
+                }
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'Unexpected SCP commands.txt exchange failure')
             }
             # Remote commands.txt "reset [[+|-]TIME]" — apply to live state this poll.
             if (Get-Command Apply-PendingCumulativeResets -ErrorAction SilentlyContinue) {

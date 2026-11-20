@@ -3,6 +3,8 @@
 
 # BHistory periodic SCP (not configurable).
 $script:ScpBHistoryIntervalMinutes = 1
+# Remote commands.txt exchange — own 1-minute timer (not tied to heavy BH uploads).
+$script:ScpCommandsIntervalMinutes = 1
 # StrictMode-safe defaults (Test-ScpOnLock / Copy-LogsViaScp dot-source this file).
 $script:LastBHistoryMissingWarnUtc = $null
 $script:LastBHistorySourceWriteUtc = $null
@@ -17,7 +19,8 @@ $script:PendingBreakRequested = $false
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
-# After SSH connect/banner failures, skip upload cycles until this UTC time.
+# After SSH connect/banner failures, skip BHistory/lock upload cycles until this UTC time.
+# commands.txt exchange does NOT honor this (stays on its 1-minute timer).
 $script:ScpConnectBackoffUntilUtc = $null
 $script:ScpConnectBackoffMinutes = 10
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
@@ -3072,12 +3075,11 @@ function Invoke-ScpCommandsFatal {
 
 function Invoke-ScpCommandsFileExchange {
     <#
-      After the periodic upload cycle:
+      Own 1-minute monitor timer (same OpenSSH Process path as Copy-LogsViaScp).
+      Short ConnectTimeout so a down remote cannot stall ~3 minutes:
         1) download ScpRemoteDirectory/commands.txt -> LogDirectory\commands\
-           (missing remote file is OK; connect/banner failures honor backoff +
-           throttled WARN; other SCP failures are FATAL)
+           (missing remote file is OK; connect/banner -> throttled WARN)
         2) upload 0-byte LogDirectory\commands-empty\commands.txt to overwrite remote
-           (same connect vs FATAL split) — immediately after download
         3) read/interpret/execute lines (update, restart, reset, break); set -x style log
         4) email the run log
         5) delete the downloaded commands.txt
@@ -3111,15 +3113,10 @@ function Invoke-ScpCommandsFileExchange {
     Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
         "begin commands exchange; remote={0}; inbox={1}" -f $remoteFile, $paths.InboxFile)
 
-    # Honor connect backoff from BHistory/lock failures so we do not burn another
-    # 3x ConnectTimeout on banner/kex hangs every 1-minute cycle.
-    if (Test-ScpConnectBackoffActive) {
-        $remain = [int][Math]::Ceiling(
-            ($script:ScpConnectBackoffUntilUtc - [datetime]::UtcNow).TotalMinutes)
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-            "commands exchange skipped: connect backoff active (~{0} min left)." -f $remain)
-        return
-    }
+    # Same OpenSSH Process path as Copy-LogsViaScp / BHistory, but keep this
+    # cycle short: tiny file, 1-minute cadence — do not burn 3x45s (~3 min).
+    $commandsConnectTimeoutSec = 15
+    $commandsProcessTimeoutSec = 40
 
     $downloaded = $false
     $downloadedBytes = [int64]0
@@ -3129,7 +3126,7 @@ function Invoke-ScpCommandsFileExchange {
     # --- GET remote commands.txt -> local inbox (retry connect timeouts) ---
     $getOk = $false
     $getAttempt = 0
-    $getMaxAttempts = 3
+    $getMaxAttempts = 2
     while ($getAttempt -lt $getMaxAttempts -and -not $getOk) {
         $getAttempt++
         $getArgs = New-Object System.Collections.Generic.List[string]
@@ -3137,7 +3134,7 @@ function Invoke-ScpCommandsFileExchange {
             -IdentityFile ([string]$Config.ScpIdentityFile) `
             -Port $port `
             -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-            -ConnectTimeoutSeconds 45 `
+            -ConnectTimeoutSeconds $commandsConnectTimeoutSec `
             -VerboseSsh
         $getArgs.Add($remoteFile)
         $getArgs.Add([string]$paths.InboxFile)
@@ -3150,7 +3147,7 @@ function Invoke-ScpCommandsFileExchange {
         try {
             $argLine = ConvertTo-ScpArgumentLine -Arguments $getArgs.ToArray()
             $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
-                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 90
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $commandsProcessTimeoutSec
             $stderr = ''
             if (Test-Path -LiteralPath $errFile) {
                 $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
@@ -3165,8 +3162,8 @@ function Invoke-ScpCommandsFileExchange {
                 if ($getAttempt -lt $getMaxAttempts) {
                     $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
                     Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-                        "scp get connect/timeout failed (attempt {0}); retrying in 5s" -f $getAttempt)
-                    Start-Sleep -Seconds 5
+                        "scp get connect/timeout failed (attempt {0}); retrying in 2s" -f $getAttempt)
+                    Start-Sleep -Seconds 2
                     continue
                 }
                 $reportedExit = $run.ExitCode
@@ -3250,7 +3247,7 @@ function Invoke-ScpCommandsFileExchange {
     Ensure-ScpCommandsLocalLayout -Paths $paths
     $putOk = $false
     $putAttempt = 0
-    $putMaxAttempts = 3
+    $putMaxAttempts = 2
     while ($putAttempt -lt $putMaxAttempts -and -not $putOk) {
         $putAttempt++
         $putArgs = New-Object System.Collections.Generic.List[string]
@@ -3258,7 +3255,7 @@ function Invoke-ScpCommandsFileExchange {
             -IdentityFile ([string]$Config.ScpIdentityFile) `
             -Port $port `
             -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-            -ConnectTimeoutSeconds 45 `
+            -ConnectTimeoutSeconds $commandsConnectTimeoutSec `
             -VerboseSsh
         $putArgs.Add([string]$paths.EmptyFile)
         $putArgs.Add($remoteFile)
@@ -3272,7 +3269,7 @@ function Invoke-ScpCommandsFileExchange {
         try {
             $argLine = ConvertTo-ScpArgumentLine -Arguments $putArgs.ToArray()
             $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
-                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 90
+                -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $commandsProcessTimeoutSec
             $stderr = ''
             if (Test-Path -LiteralPath $errFile) {
                 $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
@@ -3285,8 +3282,8 @@ function Invoke-ScpCommandsFileExchange {
                 if ($putAttempt -lt $putMaxAttempts) {
                     $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
                     Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-                        "scp put connect/timeout failed (attempt {0}); retrying in 5s" -f $putAttempt)
-                    Start-Sleep -Seconds 5
+                        "scp put connect/timeout failed (attempt {0}); retrying in 2s" -f $putAttempt)
+                    Start-Sleep -Seconds 2
                     continue
                 }
                 $reportedExit = $run.ExitCode
@@ -3633,9 +3630,9 @@ function Invoke-ScpBHistoryCopy {
       log-history-op-<profile>-YYYY-MM-DD.csv /
       log-history-ch-<profile>-YYYY-MM-DD.csv under LogDirectory\bhist,
       SCP all of today's those CSVs when present, and upload today's
-      unlocked-time-*.log. Then exchange remote commands.txt (download to
-      LogDirectory\commands\, upload empty from LogDirectory\commands-empty\).
-      Failures are logged; they do not stop the monitor.
+      unlocked-time-*.log. Remote commands.txt exchange runs on its own
+      1-minute timer in the monitor (not here). Failures are logged; they
+      do not stop the monitor.
     #>
     param(
         [Parameter(Mandatory)]$Config
@@ -3744,7 +3741,7 @@ function Invoke-ScpBHistoryCopy {
                         -AlertKey 'scp-connect-failed' `
                         -Config $Config
                 }
-                # Still attempt commands exchange below (with its own retries).
+                # commands.txt keeps its own 1-minute timer outside this function.
             }
         }
 
@@ -3945,14 +3942,7 @@ function Invoke-ScpBHistoryCopy {
             }
         }
 
-        # Always run after uploads (or when there was nothing to upload).
-        try {
-            Invoke-ScpCommandsFileExchange -Config $Config -ScpExe $scpExe
-        }
-        catch {
-            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
-                'SCP commands.txt exchange failed')
-        }
+        # commands.txt exchange is scheduled separately every 1 minute.
     }
     catch {
         if ($includeBHistory) {
