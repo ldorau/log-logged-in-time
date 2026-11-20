@@ -17,6 +17,9 @@ $script:PendingBreakRequested = $false
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
+# After SSH connect/banner failures, skip upload cycles until this UTC time.
+$script:ScpConnectBackoffUntilUtc = $null
+$script:ScpConnectBackoffMinutes = 10
 # Directory of this helper while it is being dot-sourced (src/ under install or repo).
 $script:ScpOnLockScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($script:ScpOnLockScriptDir) -and $MyInvocation -and $MyInvocation.MyCommand -and
@@ -91,6 +94,27 @@ function Find-ScpExecutable {
     )
     foreach ($c in $candidates) {
         if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+function Find-SshExecutable {
+    $cmd = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe')
+        (Join-Path $env:SystemRoot 'Sysnative\OpenSSH\ssh.exe')
+        (Join-Path ${env:ProgramFiles} 'OpenSSH\ssh.exe')
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    # Prefer sibling of scp.exe when PATH is incomplete under SYSTEM.
+    $scp = Find-ScpExecutable
+    if (-not [string]::IsNullOrWhiteSpace($scp)) {
+        $sibling = Join-Path (Split-Path -Parent $scp) 'ssh.exe'
+        if (Test-Path -LiteralPath $sibling) { return $sibling }
     }
     return $null
 }
@@ -427,8 +451,9 @@ function Test-ScpCopyFailed {
 
 function Test-ScpConnectFailure {
     <#
-      True when stderr shows the TCP/SSH connect failed (timeout, refused,
-      unreachable). Distinct from auth failures and mid-transfer stalls.
+      True when stderr shows the TCP/SSH connect or banner/kex handshake failed
+      (timeout, refused, unreachable, getpeername). Distinct from auth failures
+      and mid-transfer stalls. TCP can succeed while SSH banner exchange hangs.
     #>
     param([string]$StdErr = '')
 
@@ -442,8 +467,118 @@ function Test-ScpConnectFailure {
         $s -match '(?i)Network is unreachable' -or
         $s -match '(?i)No route to host' -or
         $s -match '(?i)Could not resolve hostname' -or
-        $s -match '(?i)connect to .+ port \d+: '
+        $s -match '(?i)connect to .+ port \d+: ' -or
+        $s -match '(?i)kex_exchange_identification' -or
+        $s -match '(?i)banner exchange' -or
+        $s -match '(?i)getpeername failed' -or
+        $s -match '(?i)Connection closed by remote host' -or
+        $s -match '(?i)Connection reset by peer'
     )
+}
+
+function Set-ScpConnectBackoff {
+    param([int]$Minutes = 0)
+
+    if ($Minutes -le 0) {
+        $Minutes = [int]$script:ScpConnectBackoffMinutes
+    }
+    if ($Minutes -lt 1) { $Minutes = 10 }
+    $script:ScpConnectBackoffUntilUtc = [datetime]::UtcNow.AddMinutes($Minutes)
+}
+
+function Clear-ScpConnectBackoff {
+    $script:ScpConnectBackoffUntilUtc = $null
+}
+
+function Test-ScpConnectBackoffActive {
+    if ($script:ScpConnectBackoffUntilUtc -isnot [datetime]) {
+        return $false
+    }
+    if ([datetime]::UtcNow -ge $script:ScpConnectBackoffUntilUtc) {
+        $script:ScpConnectBackoffUntilUtc = $null
+        return $false
+    }
+    return $true
+}
+
+function Test-ScpSshHandshake {
+    <#
+      TCP can succeed while SSH banner/kex hangs (seen as getpeername /
+      kex_exchange_identification / banner exchange timeouts). Probe with ssh
+      BatchMode; auth failure still counts as OK (handshake completed).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$IdentityFile,
+        [string]$KnownHostsFile = '',
+        [int]$ConnectTimeoutSeconds = 20
+    )
+
+    $sshExe = Find-SshExecutable
+    if ([string]::IsNullOrWhiteSpace($sshExe) -or -not (Test-Path -LiteralPath $sshExe)) {
+        # No ssh.exe: fall back to TCP-only reachability.
+        return (Test-ScpHostPortReachable -HostName $HostName -Port $Port -TimeoutMs 8000)
+    }
+    if (-not (Test-Path -LiteralPath $IdentityFile)) {
+        return $false
+    }
+
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-i')
+    $argList.Add($IdentityFile.Trim())
+    $argList.Add('-p')
+    $argList.Add("$Port")
+    $argList.Add('-o')
+    $argList.Add('BatchMode=yes')
+    $argList.Add('-o')
+    $argList.Add('IdentitiesOnly=yes')
+    $argList.Add('-o')
+    $argList.Add('PreferredAuthentications=publickey')
+    $argList.Add('-o')
+    $argList.Add('StrictHostKeyChecking=accept-new')
+    if (-not [string]::IsNullOrWhiteSpace($KnownHostsFile)) {
+        $argList.Add('-o')
+        $argList.Add(('UserKnownHostsFile={0}' -f $KnownHostsFile.Trim()))
+    }
+    $argList.Add('-o')
+    $argList.Add(('ConnectTimeout={0}' -f $ConnectTimeoutSeconds))
+    $argList.Add('-o')
+    $argList.Add('ServerAliveInterval=5')
+    $argList.Add('-o')
+    $argList.Add('ServerAliveCountMax=2')
+    $argList.Add('-v')
+    $argList.Add(('{0}@{1}' -f $UserName.Trim(), $HostName.Trim()))
+    $argList.Add('exit')
+
+    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-ssh-probe-{0}.out' -f [guid]::NewGuid().ToString('N'))
+    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-ssh-probe-{0}.err' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $argLine = ConvertTo-ScpArgumentLine -Arguments $argList.ToArray()
+        $timeoutSec = [Math]::Max(15, $ConnectTimeoutSeconds + 10)
+        $run = Invoke-ScpProcessWithTimeout -ScpExe $sshExe -ArgumentList $argLine `
+            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds $timeoutSec
+        $stderr = ''
+        if (Test-Path -LiteralPath $errFile) {
+            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        }
+        if ([bool]$run.TimedOut) {
+            return $false
+        }
+        if (Test-ScpConnectFailure -StdErr "$stderr") {
+            return $false
+        }
+        # Exit 0 = auth+command OK. Non-zero without connect patterns = handshake OK
+        # (e.g. auth denied still proves the SSH server answered).
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-ScpHostPortReachable {
@@ -1969,8 +2104,14 @@ function Invoke-ScpLogCopyOnLock {
             $port = [int]$Config.ScpPort
         }
 
-        # Same preflight as BHistory/daily: keep outbound SSH allowed, skip when
-        # the host is down so lock handling is not blocked on ConnectTimeout.
+        # Same preflight as BHistory/daily: TCP + SSH handshake; honor connect backoff.
+        if (Test-ScpConnectBackoffActive) {
+            $remain = [int][Math]::Ceiling(
+                ($script:ScpConnectBackoffUntilUtc - [datetime]::UtcNow).TotalMinutes)
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP on lock skipped: connect backoff active (~{0} min left)." -f $remain)
+            return
+        }
         $null = Invoke-ScpOutboundAllowReconcile -Config $Config
         $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
         if (-not $hostReachable) {
@@ -1978,9 +2119,31 @@ function Invoke-ScpLogCopyOnLock {
             Start-Sleep -Seconds 2
             $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
         }
+        if ($hostReachable) {
+            $hostReachable = Test-ScpSshHandshake `
+                -HostName $scpHost `
+                -Port $port `
+                -UserName $scpUser `
+                -IdentityFile ([string]$Config.ScpIdentityFile) `
+                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                -ConnectTimeoutSeconds 20
+            if (-not $hostReachable) {
+                $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                Start-Sleep -Seconds 2
+                $hostReachable = Test-ScpSshHandshake `
+                    -HostName $scpHost `
+                    -Port $port `
+                    -UserName $scpUser `
+                    -IdentityFile ([string]$Config.ScpIdentityFile) `
+                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                    -ConnectTimeoutSeconds 20
+            }
+        }
         if (-not $hostReachable) {
-            $skipMsg = ("SCP on lock skipped: {0}:{1} not reachable (connection timed out / refused)." -f `
-                    $scpHost, $port)
+            Set-ScpConnectBackoff
+            $skipMsg = ("SCP on lock skipped: {0}:{1} SSH handshake failed " +
+                "(TCP may work; banner/kex timed out). Backing off {2} min." -f `
+                    $scpHost, $port, [int]$script:ScpConnectBackoffMinutes)
             if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
                 $null = Send-LoginTimeLoggerFailureAlert `
                     -Subject 'SCP connect failed' `
@@ -2086,6 +2249,7 @@ function Invoke-ScpLogCopyOnLock {
         }
 
         if ($copyOk) {
+            Clear-ScpConnectBackoff
             Write-LoggerEvent ("SCP on lock succeeded ({0} file(s)): {1}" -f $files.Count, ($files -join '; '))
             return
         }
@@ -2128,6 +2292,7 @@ function Invoke-ScpLogCopyOnLock {
 
         $isConnectFail = Test-ScpConnectFailure -StdErr "$stderr"
         if ($isConnectFail) {
+            Set-ScpConnectBackoff
             if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
                 $diagPath = Join-Path $env:TEMP ('LoginTimeLogger-scp-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
                 try {
@@ -3445,25 +3610,60 @@ function Invoke-ScpBHistoryCopy {
             $port = [int]$Config.ScpPort
         }
 
-        # Keep outbound SSH allowed; retry once if the host looks unreachable.
-        $null = Invoke-ScpOutboundAllowReconcile -Config $Config
-        $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
-        if (-not $hostReachable) {
-            $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-            Start-Sleep -Seconds 2
-            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
+        # Backoff after recent SSH banner/kex failures so a flaky remote does not
+        # burn 3x ConnectTimeout every 1-minute cycle (and spam SMTP).
+        if (Test-ScpConnectBackoffActive) {
+            $remain = [int][Math]::Ceiling(
+                ($script:ScpConnectBackoffUntilUtc - [datetime]::UtcNow).TotalMinutes)
+            Write-LoggerEvent -Level WARN -Message (
+                "SCP BHistory/daily skipped: connect backoff active (~{0} min left after SSH handshake failures)." -f `
+                    $remain)
+            $hostReachable = $false
         }
-        if (-not $hostReachable) {
-            $skipMsg = ("SCP BHistory/daily skipped: {0}:{1} not reachable (connection timed out / refused)." -f `
-                    $scpHost, $port)
-            if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
-                $null = Send-LoginTimeLoggerFailureAlert `
-                    -Subject 'SCP connect failed' `
-                    -Body $skipMsg `
-                    -AlertKey 'scp-connect-failed' `
-                    -Config $Config
+        else {
+            # Keep outbound SSH allowed; TCP alone is not enough — banner/kex can
+            # hang after "Connection established" (getpeername / kex_exchange_*).
+            $null = Invoke-ScpOutboundAllowReconcile -Config $Config
+            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
+            if (-not $hostReachable) {
+                $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                Start-Sleep -Seconds 2
+                $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
             }
-            # Still attempt commands exchange below (with its own retries).
+            if ($hostReachable) {
+                $hostReachable = Test-ScpSshHandshake `
+                    -HostName $scpHost `
+                    -Port $port `
+                    -UserName $scpUser `
+                    -IdentityFile ([string]$Config.ScpIdentityFile) `
+                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                    -ConnectTimeoutSeconds 20
+                if (-not $hostReachable) {
+                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                    Start-Sleep -Seconds 2
+                    $hostReachable = Test-ScpSshHandshake `
+                        -HostName $scpHost `
+                        -Port $port `
+                        -UserName $scpUser `
+                        -IdentityFile ([string]$Config.ScpIdentityFile) `
+                        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                        -ConnectTimeoutSeconds 20
+                }
+            }
+            if (-not $hostReachable) {
+                Set-ScpConnectBackoff
+                $skipMsg = ("SCP BHistory/daily skipped: {0}:{1} SSH handshake failed " +
+                    "(TCP may work; banner/kex timed out). Backing off {2} min." -f `
+                        $scpHost, $port, [int]$script:ScpConnectBackoffMinutes)
+                if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
+                    $null = Send-LoginTimeLoggerFailureAlert `
+                        -Subject 'SCP connect failed' `
+                        -Body $skipMsg `
+                        -AlertKey 'scp-connect-failed' `
+                        -Config $Config
+                }
+                # Still attempt commands exchange below (with its own retries).
+            }
         }
 
         if ($uploadFiles.Count -gt 0 -and $hostReachable) {
@@ -3568,6 +3768,7 @@ function Invoke-ScpBHistoryCopy {
                 }
 
                 if ($batchOk) {
+                    Clear-ScpConnectBackoff
                     if ($batch.Name -eq 'BHistory' -and $includeBHistory) {
                         $script:LastBHistoryScpSucceeded = $true
                         $nowUtc = [datetime]::UtcNow
@@ -3612,6 +3813,7 @@ function Invoke-ScpBHistoryCopy {
 
                 $isConnectFail = Test-ScpConnectFailure -StdErr "$stderr"
                 if ($isConnectFail) {
+                    Set-ScpConnectBackoff
                     if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
                         $diagPath = Join-Path $env:TEMP (
                             'LoginTimeLogger-scp-bhist-fail-{0}.txt' -f [guid]::NewGuid().ToString('N'))
@@ -3633,6 +3835,8 @@ function Invoke-ScpBHistoryCopy {
                             Remove-Item -LiteralPath $diagPath -Force -ErrorAction SilentlyContinue
                         }
                     }
+                    # Do not burn another 3x ConnectTimeout on the next batch this cycle.
+                    break
                 }
                 else {
                     Write-LoggerEvent -Level WARN -Message $msg
