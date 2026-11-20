@@ -3412,7 +3412,7 @@ function Invoke-ScpCommandsFileExchange {
         if (-not $sessionUnlocked) {
             $breakSkippedLocked = $true
             Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                ("execute: break ignored — target '{0}' session already locked " +
+                ("execute: break ignored - target '{0}' session already locked " +
                     '(no dialog); email still sent') -f $Config.TargetUsername)
             if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
                 Write-DebugLog -Source 'Break' -Message (

@@ -49,7 +49,7 @@ $commands = @(
     [pscustomobject]@{
         Command     = 'break'
         Arguments   = '(none)'
-        Description = 'Show a topmost countdown on the target user''s desktop (message "PRZERWA! - chodź do nas!", current cumulative unlocked time, 5s timer), then lock the screen — same flow as the unlock-quota warning, different message. Ignored when the target session is already locked (commands-run email still sent).'
+        Description = 'Show a topmost countdown on the target user''s desktop (message "PRZERWA! - chodź do nas!", current cumulative unlocked time, 5s timer), then lock the screen - same flow as the unlock-quota warning, different message. Ignored when the target session is already locked (commands-run email still sent).'
     }
 )
 
