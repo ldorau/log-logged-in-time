@@ -693,7 +693,7 @@ try {
     }
 
     Write-ScpCopyLine ''
-    Write-ScpCopyLine 'Step 1b: outbound SCP firewall + TCP reachability' -ForegroundColor Cyan
+    Write-ScpCopyLine 'Step 1b: outbound SCP firewall + OpenSSH reachability' -ForegroundColor Cyan
     $fw = Invoke-ScpOutboundFirewallReconcile `
         -RemoteHost ([string]$cfg.ScpHost) `
         -RemotePort ([int]$cfg.ScpPort) `
@@ -703,50 +703,75 @@ try {
     # Give the filter engine a moment after rule reconcile before probing.
     Start-Sleep -Seconds 2
 
-    $tcpOk = $false
-    $tcpDetail = ''
-    $tcpTimeoutMs = 15000
-    $tcpMaxTries = 3
-    for ($tcpTry = 1; $tcpTry -le $tcpMaxTries; $tcpTry++) {
-        $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) `
-            -Port ([int]$cfg.ScpPort) -TimeoutMs $tcpTimeoutMs
-        $tcpDetail = $tcp.Detail
-        if ($tcp.Ok) {
-            $tcpOk = $true
-            break
+    # .NET TcpClient can time out while OpenSSH scp/ssh still works (per-app
+    # firewall / stack differences). Treat TCP as advisory; gate on ssh.exe.
+    $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) `
+        -Port ([int]$cfg.ScpPort) -TimeoutMs 8000
+    if ($tcp.Ok) {
+        Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $true -Detail $tcp.Detail
+    }
+    else {
+        Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $false `
+            -Status 'WARN' -Detail ("{0} (ignored; probing with OpenSSH)" -f $tcp.Detail)
+        $fw2 = Invoke-ScpOutboundFirewallReconcile `
+            -RemoteHost ([string]$cfg.ScpHost) `
+            -RemotePort ([int]$cfg.ScpPort) `
+            -ConfigPath ([string]$cfg.ConfigPath)
+        Write-ScpCopyLine ("  firewall re-check: {0}" -f $fw2.Detail) -ForegroundColor DarkGray
+    }
+
+    $probeIdentity = [string]$cfg.ScpIdentityFile
+    $probeTempIdentity = $null
+    $sshOk = $false
+    $sshDetail = ''
+    try {
+        if (-not (Test-ScpRunningAsLocalSystem)) {
+            $probeTempIdentity = New-ScpIdentityCopyForCurrentUser -IdentityPath $probeIdentity
+            if (-not [string]::IsNullOrWhiteSpace($probeTempIdentity)) {
+                $probeIdentity = $probeTempIdentity
+            }
         }
         Write-ScpCopyLine (
-            "TCP {0}:{1} not reachable (try {2}/{3}): {4}" -f `
-                $cfg.ScpHost, $cfg.ScpPort, $tcpTry, $tcpMaxTries, $tcp.Detail) -ForegroundColor Yellow
-        if ($tcpTry -eq 1) {
-            # One more firewall pass mid-retries (rule may have been missing).
-            $fw2 = Invoke-ScpOutboundFirewallReconcile `
-                -RemoteHost ([string]$cfg.ScpHost) `
-                -RemotePort ([int]$cfg.ScpPort) `
-                -ConfigPath ([string]$cfg.ConfigPath)
-            Write-ScpCopyLine ("  firewall re-check: {0}" -f $fw2.Detail) -ForegroundColor DarkGray
-            Start-Sleep -Seconds 2
+            "  OpenSSH probe: ssh {0}@{1}:{2} (BatchMode, ConnectTimeout=20s)..." -f `
+                $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor DarkGray
+        $sshOk = [bool](Test-ScpSshHandshake `
+                -HostName ([string]$cfg.ScpHost) `
+                -Port ([int]$cfg.ScpPort) `
+                -UserName ([string]$cfg.ScpUser) `
+                -IdentityFile $probeIdentity `
+                -KnownHostsFile ([string]$cfg.ScpKnownHostsFile) `
+                -ConnectTimeoutSeconds 20)
+        if ($sshOk) {
+            $sshDetail = 'SSH handshake OK (server answered; auth may still fail later)'
         }
-        elseif ($tcpTry -lt $tcpMaxTries) {
-            Start-Sleep -Seconds 5
+        else {
+            $sshDetail = 'SSH handshake failed (connect/banner/kex timeout or refused)'
         }
     }
-    Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $tcpOk -Detail $tcpDetail
-    if (-not $tcpOk) {
+    catch {
+        $sshOk = $false
+        $sshDetail = $_.Exception.Message
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($probeTempIdentity) -and
+            (Test-Path -LiteralPath $probeTempIdentity)) {
+            Remove-Item -LiteralPath $probeTempIdentity -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Check -Name ("SSH {0}@{1}:{2}" -f $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort) `
+        -Ok $sshOk -Detail $sshDetail
+    if (-not $sshOk) {
         Write-ScpCopyLine ''
-        Write-ScpCopyLine 'RESULT: remote host:port not reachable; scp not attempted.' -ForegroundColor Red
-        # Parenthesize the whole format string: -f binds only to the last operand
-        # of + otherwise, leaving literal "{0}" / "{1}" on screen.
+        Write-ScpCopyLine 'RESULT: remote SSH not reachable; scp not attempted.' -ForegroundColor Red
         Write-ScpCopyLine ((
                 "Check that {0} is up on the LAN, SSH is listening on port {1}, and " +
-                "run elevated .\scripts\Allow-ScpOutboundFirewall.ps1 if outbound SSH is blocked."
-            ) -f $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
+                "run elevated .\scripts\Allow-ScpOutboundFirewall.ps1 if outbound SSH is blocked. " +
+                "Manual test: scp.exe -P {1} -i <identity> <file> {2}@{0}:<remote-dir>/"
+            ) -f $cfg.ScpHost, $cfg.ScpPort, $cfg.ScpUser) -ForegroundColor Yellow
         Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
-        $failMsg = ("Copy-LogsViaScp TCP preflight failed`r`n" +
-            "scp preflight failed: TCP {0}:{1} not reachable after {2} tries. {3}" -f `
-                $cfg.ScpHost, $cfg.ScpPort, $tcpMaxTries, $tcpDetail)
-        # Host-down is an operator/network condition for a manual tool — log WARN
-        # (errors.log) but do not send a FATAL SMTP alert.
+        $failMsg = ("Copy-LogsViaScp SSH preflight failed`r`n" +
+            "scp preflight failed: SSH {0}@{1}:{2} not reachable. {3}" -f `
+                $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort, $sshDetail)
         if (Get-Command Write-ErrorMessage -ErrorAction SilentlyContinue) {
             $null = Write-ErrorMessage -Message $failMsg -Level WARN -Source 'Copy-LogsViaScp'
         }
