@@ -1062,6 +1062,27 @@ function Apply-PendingRemoteBreak {
         return $false
     }
 
+    # If the session locked after the command was queued, drop the pending
+    # break (no dialog on an already-locked desktop).
+    try {
+        if (('SessionQuery' -as [type]) -and
+            -not [string]::IsNullOrWhiteSpace([string]$Config.TargetUsername) -and
+            -not [bool][SessionQuery]::IsUserUnlocked([string]$Config.TargetUsername)) {
+            Write-DebugLog -Source 'Break' -Message (
+                "ABORT: session already locked for '{0}'; clearing PendingBreakRequested" -f `
+                    $Config.TargetUsername)
+            Write-LoggerEvent (
+                "Remote break ignored: target '{0}' session already locked." -f $Config.TargetUsername)
+            $script:PendingBreakRequested = $false
+            $script:PendingBreakAttempts = 0
+            return $false
+        }
+    }
+    catch {
+        Write-DebugLog -Source 'Break' -Message (
+            "lock-state probe failed; continuing with break: {0}" -f $_.Exception.Message)
+    }
+
     $maxAttempts = 5
     $script:PendingBreakAttempts = [int]$script:PendingBreakAttempts + 1
     if ($script:PendingBreakAttempts -gt $maxAttempts) {

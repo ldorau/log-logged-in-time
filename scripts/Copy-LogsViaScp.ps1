@@ -240,7 +240,14 @@ function Test-ScpCopyTcpEndpoint {
 
     $client = $null
     try {
-        $client = New-Object System.Net.Sockets.TcpClient
+        # Force IPv4 for dotted-quad hosts so DualStack / IPv6 AAAA delays do not
+        # burn the whole TimeoutMs before the IPv4 attempt starts.
+        if ($HostName -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            $client = New-Object System.Net.Sockets.TcpClient ([System.Net.Sockets.AddressFamily]::InterNetwork)
+        }
+        else {
+            $client = New-Object System.Net.Sockets.TcpClient
+        }
         $ar = $client.BeginConnect($HostName, $Port, $null, $null)
         if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
             try { $client.Close() } catch { }
@@ -693,20 +700,34 @@ try {
         -ConfigPath ([string]$cfg.ConfigPath)
     Write-Check -Name 'SCP-Allow firewall' -Ok $fw.Ok -Status $(if ($fw.Ok) { 'OK' } else { 'WARN' }) `
         -Detail $fw.Detail
+    # Give the filter engine a moment after rule reconcile before probing.
+    Start-Sleep -Seconds 2
 
     $tcpOk = $false
     $tcpDetail = ''
-    for ($tcpTry = 1; $tcpTry -le 3; $tcpTry++) {
-        $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) -Port ([int]$cfg.ScpPort) -TimeoutMs 8000
+    $tcpTimeoutMs = 15000
+    $tcpMaxTries = 3
+    for ($tcpTry = 1; $tcpTry -le $tcpMaxTries; $tcpTry++) {
+        $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) `
+            -Port ([int]$cfg.ScpPort) -TimeoutMs $tcpTimeoutMs
         $tcpDetail = $tcp.Detail
         if ($tcp.Ok) {
             $tcpOk = $true
             break
         }
         Write-ScpCopyLine (
-            "TCP {0}:{1} not reachable (try {2}/3): {3}" -f `
-                $cfg.ScpHost, $cfg.ScpPort, $tcpTry, $tcp.Detail) -ForegroundColor Yellow
-        if ($tcpTry -lt 3) {
+            "TCP {0}:{1} not reachable (try {2}/{3}): {4}" -f `
+                $cfg.ScpHost, $cfg.ScpPort, $tcpTry, $tcpMaxTries, $tcp.Detail) -ForegroundColor Yellow
+        if ($tcpTry -eq 1) {
+            # One more firewall pass mid-retries (rule may have been missing).
+            $fw2 = Invoke-ScpOutboundFirewallReconcile `
+                -RemoteHost ([string]$cfg.ScpHost) `
+                -RemotePort ([int]$cfg.ScpPort) `
+                -ConfigPath ([string]$cfg.ConfigPath)
+            Write-ScpCopyLine ("  firewall re-check: {0}" -f $fw2.Detail) -ForegroundColor DarkGray
+            Start-Sleep -Seconds 2
+        }
+        elseif ($tcpTry -lt $tcpMaxTries) {
             Start-Sleep -Seconds 5
         }
     }
@@ -714,15 +735,24 @@ try {
     if (-not $tcpOk) {
         Write-ScpCopyLine ''
         Write-ScpCopyLine 'RESULT: remote host:port not reachable; scp not attempted.' -ForegroundColor Red
-        Write-ScpCopyLine (
-            "Check that {0} is up on the LAN, SSH is listening on port {1}, and " +
-            "run .\scripts\Allow-ScpOutboundFirewall.ps1 elevated if outbound SSH is blocked." -f `
-                $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
+        # Parenthesize the whole format string: -f binds only to the last operand
+        # of + otherwise, leaving literal "{0}" / "{1}" on screen.
+        Write-ScpCopyLine ((
+                "Check that {0} is up on the LAN, SSH is listening on port {1}, and " +
+                "run elevated .\scripts\Allow-ScpOutboundFirewall.ps1 if outbound SSH is blocked."
+            ) -f $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor Yellow
         Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
-        $failMsg = ("scp preflight failed: TCP {0}:{1} not reachable after 3 tries. {2}" -f `
-                $cfg.ScpHost, $cfg.ScpPort, $tcpDetail)
-        $null = Write-FatalError -Message $failMsg -Context 'Copy-LogsViaScp TCP preflight failed' `
-            -Source 'Copy-LogsViaScp' -NoThrow
+        $failMsg = ("Copy-LogsViaScp TCP preflight failed`r`n" +
+            "scp preflight failed: TCP {0}:{1} not reachable after {2} tries. {3}" -f `
+                $cfg.ScpHost, $cfg.ScpPort, $tcpMaxTries, $tcpDetail)
+        # Host-down is an operator/network condition for a manual tool — log WARN
+        # (errors.log) but do not send a FATAL SMTP alert.
+        if (Get-Command Write-ErrorMessage -ErrorAction SilentlyContinue) {
+            $null = Write-ErrorMessage -Message $failMsg -Level WARN -Source 'Copy-LogsViaScp'
+        }
+        else {
+            Write-ScpCopyLine $failMsg -ForegroundColor Yellow
+        }
         exit 1
     }
 

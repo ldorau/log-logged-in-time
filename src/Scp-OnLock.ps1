@@ -3028,9 +3028,10 @@ function Invoke-ScpCommandsFileExchange {
     <#
       After the periodic upload cycle:
         1) download ScpRemoteDirectory/commands.txt -> LogDirectory\commands\
-           (missing remote file is OK; any other SCP failure is FATAL)
+           (missing remote file is OK; connect/banner failures honor backoff +
+           throttled WARN; other SCP failures are FATAL)
         2) upload 0-byte LogDirectory\commands-empty\commands.txt to overwrite remote
-           (SCP failure is FATAL) — immediately after download
+           (same connect vs FATAL split) — immediately after download
         3) read/interpret/execute lines (update, restart, reset, break); set -x style log
         4) email the run log
         5) delete the downloaded commands.txt
@@ -3063,6 +3064,16 @@ function Invoke-ScpCommandsFileExchange {
 
     Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
         "begin commands exchange; remote={0}; inbox={1}" -f $remoteFile, $paths.InboxFile)
+
+    # Honor connect backoff from BHistory/lock failures so we do not burn another
+    # 3x ConnectTimeout on banner/kex hangs every 1-minute cycle.
+    if (Test-ScpConnectBackoffActive) {
+        $remain = [int][Math]::Ceiling(
+            ($script:ScpConnectBackoffUntilUtc - [datetime]::UtcNow).TotalMinutes)
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+            "commands exchange skipped: connect backoff active (~{0} min left)." -f $remain)
+        return
+    }
 
     $downloaded = $false
     $downloadedBytes = [int64]0
@@ -3134,8 +3145,10 @@ function Invoke-ScpCommandsFileExchange {
                     if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
                     $msg = ("SCP commands download connect failed (exit {0}). remote={1}; stderr={2}" -f `
                             $reportedExit, $remoteFile, ("$stderr").Trim())
-                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+                    Set-ScpConnectBackoff
+                    # WARN: ERROR-level Write-LoggerEvent emails via Write-ErrorMessage.
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
                         $null = Send-LoginTimeLoggerFailureAlert `
                             -Subject 'SCP connect failed' `
                             -Body $msg `
@@ -3155,6 +3168,7 @@ function Invoke-ScpCommandsFileExchange {
             }
 
             $getOk = $true
+            Clear-ScpConnectBackoff
             $downloaded = $true
             $downloadedBytes = [int64]0
             try {
@@ -3174,8 +3188,9 @@ function Invoke-ScpCommandsFileExchange {
     if (-not $getOk) {
         $msg = ("SCP commands download failed after {0} attempt(s). remote={1}" -f `
                 $getMaxAttempts, $remoteFile)
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+        Set-ScpConnectBackoff
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
             $null = Send-LoginTimeLoggerFailureAlert `
                 -Subject 'SCP connect failed' `
                 -Body $msg `
@@ -3237,9 +3252,10 @@ function Invoke-ScpCommandsFileExchange {
                 if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
                 $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
                         $reportedExit, $remoteFile, ("$stderr").Trim())
-                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
                 if (Test-ScpConnectFailure -StdErr "$stderr") {
-                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+                    Set-ScpConnectBackoff
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
                         $null = Send-LoginTimeLoggerFailureAlert `
                             -Subject 'SCP connect failed' `
                             -Body $msg `
@@ -3248,11 +3264,13 @@ function Invoke-ScpCommandsFileExchange {
                     }
                 }
                 else {
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
                     Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
                 }
                 return
             }
             $putOk = $true
+            Clear-ScpConnectBackoff
         }
         finally {
             Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
@@ -3262,8 +3280,9 @@ function Invoke-ScpCommandsFileExchange {
     if (-not $putOk) {
         $msg = ("SCP commands empty upload failed after {0} attempt(s). remote={1}" -f `
                 $putMaxAttempts, $remoteFile)
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'ERROR') {
+        Set-ScpConnectBackoff
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+        if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
             $null = Send-LoginTimeLoggerFailureAlert `
                 -Subject 'SCP connect failed' `
                 -Body $msg `
@@ -3329,24 +3348,6 @@ function Invoke-ScpCommandsFileExchange {
     }
     catch { $resetCount = 0 }
 
-    $emailBody = @(
-        'LoginTimeLogger remote commands.txt was processed.'
-        ''
-        ('Remote: {0}' -f $remoteFile)
-        ('Inbox: {0}' -f $paths.InboxFile)
-        ('Trace: {0}' -f $traceLogPath)
-        ('Downloaded: {0}' -f $downloaded)
-        ('RemoteMissing: {0}' -f $remoteMissing)
-        ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
-        ('WantRestart: {0}' -f $cmdResult.WantRestart)
-        ('WantBreak: {0}' -f $(
-            if ($null -ne $cmdResult.PSObject.Properties['WantBreak']) {
-                [bool]$cmdResult.WantBreak
-            }
-            else { $false }))
-        ('ResetCount: {0}' -f $resetCount)
-    ) -join [Environment]::NewLine
-
     # Delete downloaded commands.txt (always when present) before deferred actions.
     if (Test-Path -LiteralPath $paths.InboxFile -PathType Leaf) {
         try {
@@ -3389,16 +3390,68 @@ function Invoke-ScpCommandsFileExchange {
     }
 
     # break: queue for the monitor poll loop (dialog + lock; after any resets).
+    # Skip when the target session is already locked — still record in the
+    # commands-run transcript so the run email reports the skip.
+    $breakQueued = $false
+    $breakSkippedLocked = $false
     if ($null -ne $cmdResult.PSObject.Properties['WantBreak'] -and [bool]$cmdResult.WantBreak) {
-        $script:PendingBreakRequested = $true
-        $script:PendingBreakAttempts = 0
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-            'execute: break queued for next monitor poll (dialog + lock)')
-        if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
-            Write-DebugLog -Source 'Break' -Message (
-                'PendingBreakRequested=true (commands exchange); will Apply-PendingRemoteBreak on poll')
+        $sessionUnlocked = $true
+        try {
+            if (('SessionQuery' -as [type]) -and
+                -not [string]::IsNullOrWhiteSpace([string]$Config.TargetUsername)) {
+                $sessionUnlocked = [bool][SessionQuery]::IsUserUnlocked([string]$Config.TargetUsername)
+            }
+        }
+        catch {
+            # Probe failed: keep legacy behavior (queue break).
+            $sessionUnlocked = $true
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                "break lock-state probe failed; queueing anyway: {0}" -f $_.Exception.Message)
+        }
+
+        if (-not $sessionUnlocked) {
+            $breakSkippedLocked = $true
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                ("execute: break ignored — target '{0}' session already locked " +
+                    '(no dialog); email still sent') -f $Config.TargetUsername)
+            if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                Write-DebugLog -Source 'Break' -Message (
+                    "break ignored: session already locked for '{0}'" -f $Config.TargetUsername)
+            }
+        }
+        else {
+            $script:PendingBreakRequested = $true
+            $script:PendingBreakAttempts = 0
+            $breakQueued = $true
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                'execute: break queued for next monitor poll (dialog + lock)')
+            if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                Write-DebugLog -Source 'Break' -Message (
+                    'PendingBreakRequested=true (commands exchange); will Apply-PendingRemoteBreak on poll')
+            }
         }
     }
+
+    # Refresh summary lines so the email body matches the queue/skip decision.
+    $emailBody = @(
+        'LoginTimeLogger remote commands.txt was processed.'
+        ''
+        ('Remote: {0}' -f $remoteFile)
+        ('Inbox: {0}' -f $paths.InboxFile)
+        ('Trace: {0}' -f $traceLogPath)
+        ('Downloaded: {0}' -f $downloaded)
+        ('RemoteMissing: {0}' -f $remoteMissing)
+        ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
+        ('WantRestart: {0}' -f $cmdResult.WantRestart)
+        ('WantBreak: {0}' -f $(
+            if ($null -ne $cmdResult.PSObject.Properties['WantBreak']) {
+                [bool]$cmdResult.WantBreak
+            }
+            else { $false }))
+        ('BreakQueued: {0}' -f $breakQueued)
+        ('BreakSkippedAlreadyLocked: {0}' -f $breakSkippedLocked)
+        ('ResetCount: {0}' -f $resetCount)
+    ) -join [Environment]::NewLine
 
     # When "update" will run, defer email until after the repo sync so the
     # inlined transcript includes `git log -1 --oneline` of the new HEAD.
