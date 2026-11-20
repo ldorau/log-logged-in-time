@@ -18,11 +18,19 @@ and on-lock paths).
 
 ## When files are produced / uploaded
 
-### 1-minute SCP cycle
+### 1-minute cycle
 
-When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor converts
-today’s History DBs and uploads every current-date CSV under `LogDirectory\bhist\`
-together with today’s unlocked-time log (then exchanges remote `commands.txt`).
+When `ScpHost` / `ScpUser` / `ScpRemoteDirectory` are set, the monitor (in order):
+
+1. Restarts `LoginTimeLoggerLockSignal` if the lock-signal file is stale/missing
+2. Writes a `HEARTBEAT` line to today’s unlocked-time log
+3. Uploads today’s `unlocked-time-yyyy-MM-dd.log`
+4. Exchanges remote `commands.txt`
+
+### 5-minute cycle
+
+Converts today’s History DBs and uploads every current-date CSV under
+`LogDirectory\bhist\` (not the unlocked-time log; that is on the 1-minute cycle).
 
 ### SCP on lock
 

@@ -1632,19 +1632,19 @@ catch {
 }
 
 $lastPollUtc = [datetime]::UtcNow
-$lastHeartbeatSlot = $null
 $script:LastPollErrorKey = $null
 $script:LastPollErrorUtc = [datetime]::MinValue
 # After a failed unlock-quota lock, wait before showing the dialog again
 # (otherwise a 5s poll would re-popup every cycle while the bucket stalls).
 $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
-# BHistory SCP (fixed interval in Scp-OnLock.ps1).
-$script:LastBHistoryScpUtc = [datetime]::MinValue
+# BHistory SCP every 5 min; daily unlocked-time + commands every 1 min.
+# Start BH clock at now so the first poll does not pile BH on top of 1-min SCPs.
+$script:LastBHistoryScpUtc = [datetime]::UtcNow
+$script:LastScpDailyLogUtc = [datetime]::MinValue
 $script:LastScpCommandsUtc = [datetime]::MinValue
 $script:LastBHistorySourceWriteUtc = [datetime]::MinValue
 $script:LastBHistoryScpSucceeded = $false
 $script:LastBHistoryMissingWarnUtc = [datetime]::MinValue
-$script:LastLockSignalStaleCheckUtc = [datetime]::MinValue
 
 while ($true) {
     try {
@@ -1659,24 +1659,6 @@ while ($true) {
         $nowLocal = Get-Date
         $nowUtc = [datetime]::UtcNow
         $today = $nowLocal.ToString('yyyy-MM-dd')
-
-        # Every ~5 minutes: restart LoginTimeLoggerLockSignal if signal is stale.
-        if (Get-Command Start-LockSignalTaskIfStale -ErrorAction SilentlyContinue) {
-            $dueStaleCheck = $true
-            if ($script:LastLockSignalStaleCheckUtc -is [datetime]) {
-                $dueStaleCheck = (($nowUtc - $script:LastLockSignalStaleCheckUtc).TotalMinutes -ge 5)
-            }
-            if ($dueStaleCheck) {
-                $script:LastLockSignalStaleCheckUtc = $nowUtc
-                try {
-                    if (Start-LockSignalTaskIfStale -SignalPath ([string]$config.LockSignalPath)) {
-                        Write-LoggerEvent -Level WARN -Message (
-                            'Restarted LoginTimeLoggerLockSignal (lock-signal.json was stale/missing).')
-                    }
-                }
-                catch { }
-            }
-        }
 
         # Re-wrap every poll so a polluted/partial $state cannot throw
         # PropertyNotFoundStrict on .Date under Set-StrictMode.
@@ -1779,34 +1761,38 @@ while ($true) {
             }
         }
 
-        # Periodic heartbeat once every 5 minutes.
-        $heartbeatSlot = '{0:yyyy-MM-dd HH}:{1:00}' -f $nowLocal, ([int]([Math]::Floor($nowLocal.Minute / 5) * 5))
-        if ($heartbeatSlot -ne $lastHeartbeatSlot) {
+        # --- Every 1 minute (lock-signal check first, then heartbeat + daily SCP) ---
+        $ranOneMinuteScp = $false
+        $dailyIntervalMin = [int]$script:ScpDailyLogIntervalMinutes
+        if ($dailyIntervalMin -le 0) { $dailyIntervalMin = 1 }
+        $dueDaily = ($nowUtc - $script:LastScpDailyLogUtc).TotalMinutes -ge $dailyIntervalMin
+        if ($dueDaily) {
+            $script:LastScpDailyLogUtc = $nowUtc
+            if (Get-Command Start-LockSignalTaskIfStale -ErrorAction SilentlyContinue) {
+                try {
+                    if (Start-LockSignalTaskIfStale -SignalPath ([string]$config.LockSignalPath)) {
+                        Write-LoggerEvent -Level WARN -Message (
+                            'Restarted LoginTimeLoggerLockSignal (lock-signal.json was stale/missing).')
+                    }
+                }
+                catch { }
+            }
             $hb = '{0:yyyy-MM-dd HH:mm:ss} | HEARTBEAT | cumulative_today={1} | unlocked={2}' -f `
                 $nowLocal, (Format-Duration $state.UnlockedSecondsToday), $unlocked
             Write-DailyLogLine -Path $dailyPath -Line $hb
-            $lastHeartbeatSlot = $heartbeatSlot
-        }
-
-        # Periodic BHistory CSV convert + today's unlocked-time log via SCP.
-        $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
-        if ($bHistoryIntervalMin -le 0) {
-            $bHistoryIntervalMin = 1
-        }
-        $dueBHistory = ($nowUtc - $script:LastBHistoryScpUtc).TotalMinutes -ge $bHistoryIntervalMin
-        if ($dueBHistory) {
-            $script:LastBHistoryScpUtc = $nowUtc
             try {
-                Invoke-ScpBHistoryCopy -Config $config
+                if (Get-Command Invoke-ScpDailyUnlockedTimeCopy -ErrorAction SilentlyContinue) {
+                    Invoke-ScpDailyUnlockedTimeCopy -Config $config
+                    $ranOneMinuteScp = $true
+                }
             }
             catch {
-                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
-                    'Unexpected SCP BHistory failure')
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpDaily' -Context (
+                    'Unexpected SCP daily unlocked-time failure')
             }
         }
 
-        # Remote commands.txt: same OpenSSH scp path, own 1-minute timer (not
-        # blocked by BHistory uploads or the long connect backoff).
+        # Remote commands.txt: same OpenSSH scp path, 1-minute timer.
         $commandsIntervalMin = [int]$script:ScpCommandsIntervalMinutes
         if ($commandsIntervalMin -le 0) {
             $commandsIntervalMin = 1
@@ -1814,6 +1800,10 @@ while ($true) {
         $dueCommands = ($nowUtc - $script:LastScpCommandsUtc).TotalMinutes -ge $commandsIntervalMin
         if ($dueCommands) {
             $script:LastScpCommandsUtc = $nowUtc
+            # Brief gap after daily SCP so sshd MaxStartups can cool down.
+            if ($ranOneMinuteScp) {
+                Start-Sleep -Seconds 3
+            }
             try {
                 if ((Get-Command Test-ScpEndpointConfigured -ErrorAction SilentlyContinue) -and
                     (Get-Command Invoke-ScpCommandsFileExchange -ErrorAction SilentlyContinue) -and
@@ -1821,6 +1811,7 @@ while ($true) {
                     $scpExeCmd = Find-ScpExecutable
                     if (-not [string]::IsNullOrWhiteSpace($scpExeCmd)) {
                         Invoke-ScpCommandsFileExchange -Config $config -ScpExe $scpExeCmd
+                        $ranOneMinuteScp = $true
                     }
                 }
             }
@@ -1839,6 +1830,27 @@ while ($true) {
                     $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
                         'Apply-PendingCumulativeResets failed')
                 }
+            }
+        }
+
+        # --- Every 5 minutes: BHistory CSV convert + SCP ---
+        $bHistoryIntervalMin = [int]$script:ScpBHistoryIntervalMinutes
+        if ($bHistoryIntervalMin -le 0) {
+            $bHistoryIntervalMin = 5
+        }
+        $dueBHistory = ($nowUtc - $script:LastBHistoryScpUtc).TotalMinutes -ge $bHistoryIntervalMin
+        if ($dueBHistory) {
+            $script:LastBHistoryScpUtc = $nowUtc
+            # Do not open another SSH session immediately after 1-minute SCPs.
+            if ($ranOneMinuteScp) {
+                Start-Sleep -Seconds 5
+            }
+            try {
+                Invoke-ScpBHistoryCopy -Config $config
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
+                    'Unexpected SCP BHistory failure')
             }
         }
 
