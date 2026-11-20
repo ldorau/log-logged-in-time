@@ -423,8 +423,10 @@ function Get-ScpVerboseExitStatus {
 
 function Test-ScpCopyFailed {
     <#
-      True when scp failed. Prefers verbose "Exit status N" from stderr when
-      Start-Process ExitCode is -1/null (common on Windows with redirects).
+      True when scp failed. Prefer a real process ExitCode (>=0, not the
+      Windows -1 quirk) over verbose "Exit status N" — aggregated multi-batch
+      stderr can contain an earlier "Exit status 0" and hide a later failure.
+      Fall back to verbose status only when ExitCode is null/-1.
     #>
     param(
         [AllowNull()]$ExitCode,
@@ -434,6 +436,17 @@ function Test-ScpCopyFailed {
 
     if ($TimedOut) { return $true }
     if (Test-ScpAuthFailure -StdErr $StdErr) { return $true }
+
+    if ($null -ne $ExitCode) {
+        try {
+            $code = [int]$ExitCode
+            # -1 = Start-Process / Process quirk (unknown); otherwise trust it.
+            if ($code -ne -1) {
+                return ($code -ne 0)
+            }
+        }
+        catch { }
+    }
 
     $verboseExit = Get-ScpVerboseExitStatus -StdErr $StdErr
     if ($null -ne $verboseExit) {

@@ -463,9 +463,12 @@ function Invoke-ScpCopyFiles {
     $allStdout = New-Object System.Collections.Generic.List[string]
     $allStderr = New-Object System.Collections.Generic.List[string]
     $allArgs = New-Object System.Collections.Generic.List[string]
+    $failedSummaries = New-Object System.Collections.Generic.List[string]
     $lastExit = 0
     $anyTimedOut = $false
-    $maxAttempts = 3
+    # Extra attempts: many sequential scp sessions trip MaxStartups / rate limits.
+    $maxAttempts = 5
+    $batchPauseSeconds = 3
 
     try {
         $batchIndex = 0
@@ -549,19 +552,21 @@ function Invoke-ScpCopyFiles {
                         break
                     }
 
-                    $connectFail = $false
-                    if (Get-Command Test-ScpConnectFailure -ErrorAction SilentlyContinue) {
+                    $connectFail = $batchTimedOut
+                    if (-not $connectFail -and (Get-Command Test-ScpConnectFailure -ErrorAction SilentlyContinue)) {
                         $connectFail = [bool](Test-ScpConnectFailure -StdErr $batchStderr)
                     }
-                    else {
+                    elseif (-not $connectFail) {
                         $connectFail = ($batchStderr -match '(?i)Connection timed out')
                     }
 
                     if ($connectFail -and $attempt -lt $maxAttempts) {
+                        # Exponential backoff: 5, 10, 20, 40s (cap 45) after burst connects.
+                        $delay = [int][Math]::Min(45, 5 * [Math]::Pow(2, $attempt - 1))
                         Write-ScpCopyLine (
-                            "scp batch {0}: connect failed (attempt {1}); retrying in 5s..." -f `
-                                $batchIndex, $attempt) -ForegroundColor Yellow
-                        Start-Sleep -Seconds 5
+                            "scp batch {0}: connect failed (attempt {1}); retrying in {2}s..." -f `
+                                $batchIndex, $attempt, $delay) -ForegroundColor Yellow
+                        Start-Sleep -Seconds $delay
                         continue
                     }
                     break
@@ -580,26 +585,45 @@ function Invoke-ScpCopyFiles {
             $lastExit = $batchExit
 
             if (-not $batchOk) {
-                return [pscustomobject]@{
-                    ScpExe       = $scpExe
-                    RemoteTarget = $remoteTarget
-                    ExitCode     = $lastExit
-                    TimedOut     = $anyTimedOut
-                    StdOut       = ($allStdout -join "`r`n")
-                    StdErr       = @(
-                        ("scp batch {0}/{1} failed after {2} attempt(s)." -f `
-                                $batchIndex, $batches.Count, $attempt)
-                        ("files: {0}" -f ($batchFiles -join '; '))
-                        ''
-                        ($allStderr -join "`r`n")
-                    ) -join "`r`n"
-                    ArgPreview   = ($allArgs -join "`r`n")
+                $summary = ("scp batch {0}/{1} failed after {2} attempt(s). files: {3}" -f `
+                        $batchIndex, $batches.Count, $attempt, ($batchFiles -join '; '))
+                $failedSummaries.Add($summary)
+                Write-ScpCopyLine $summary -ForegroundColor Red
+                # Continue remaining batches so one flaky connect does not skip the rest.
+                if ($batchIndex -lt $batches.Count) {
+                    Start-Sleep -Seconds $batchPauseSeconds
                 }
+                continue
             }
 
             Write-ScpCopyLine (
                 "scp batch {0}/{1} OK ({2} file(s))" -f `
                     $batchIndex, $batches.Count, $batchFiles.Count) -ForegroundColor DarkGray
+            # Pause between sessions so sshd MaxStartups / rate limits cool down.
+            if ($batchIndex -lt $batches.Count) {
+                Start-Sleep -Seconds $batchPauseSeconds
+            }
+        }
+
+        if ($failedSummaries.Count -gt 0) {
+            $failExit = $lastExit
+            if ($null -eq $failExit -or [int]$failExit -eq 0 -or [int]$failExit -eq -1) {
+                $failExit = 255
+            }
+            return [pscustomobject]@{
+                ScpExe       = $scpExe
+                RemoteTarget = $remoteTarget
+                ExitCode     = $failExit
+                TimedOut     = $anyTimedOut
+                StdOut       = ($allStdout -join "`r`n")
+                StdErr       = @(
+                    ($failedSummaries -join "`r`n")
+                    ''
+                    '--- last failing batch stderr (-v) ---'
+                    ($allStderr -join "`r`n")
+                ) -join "`r`n"
+                ArgPreview   = ($allArgs -join "`r`n")
+            }
         }
 
         return [pscustomobject]@{
