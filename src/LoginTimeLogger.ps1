@@ -794,7 +794,16 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                 New-Item -ItemType Directory -Path $uiDirFull -Force | Out-Null
             }
             Copy-Item -LiteralPath $SourceScriptPath -Destination $dest -Force
+        }
+        catch {
+            Write-DebugLog -Source 'UnlockWarn' -Message (
+                "stage UI copy failed for '{0}': {1}" -f $uiDirFull, $_.Exception.Message)
+            continue
+        }
 
+        # ACL is best-effort. Public/LocalAppData copies are usually already
+        # readable; do not discard a good copy when Set-Acl fails.
+        try {
             $acl = Get-Acl -LiteralPath $uiDirFull
             $acl.SetAccessRuleProtection($true, $false)
             foreach ($rule in @($acl.Access)) {
@@ -811,8 +820,6 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                             $adminSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             }
             if ($targetSid) {
-                # FullControl on the user's own LocalAppData staging dir so the
-                # interactive session can always read/execute the UI script.
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                             $targetSid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             }
@@ -838,16 +845,59 @@ function Publish-UnlockQuotaWarningForUserLaunch {
                             $targetSid, 'ReadAndExecute', 'None', 'None', 'Allow')))
             }
             Set-Acl -LiteralPath $dest -AclObject $fileAcl
-
-            Write-DebugLog -Source 'UnlockWarn' -Message ("staged UI script -> {0}" -f $dest)
-            return $dest
         }
         catch {
             Write-DebugLog -Source 'UnlockWarn' -Message (
-                "stage UI script failed for '{0}': {1}" -f $uiDirFull, $_.Exception.Message)
+                "stage UI ACL best-effort failed for '{0}': {1}" -f $uiDirFull, $_.Exception.Message)
+        }
+
+        if (Test-Path -LiteralPath $dest) {
+            Write-DebugLog -Source 'UnlockWarn' -Message ("staged UI script -> {0}" -f $dest)
+            return $dest
         }
     }
     return ''
+}
+
+function Get-UnlockQuotaWarningEncodedLaunchArgs {
+    <#
+      Embed Show-UnlockQuotaWarning.ps1 as -EncodedCommand so CreateProcessAsUser
+      does not need the target user to read Program Files (0xFFFD0000 on -File).
+      SYSTEM reads the source; the interactive session only needs powershell.exe.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SourceScriptPath,
+        [Parameter(Mandatory)][int]$Minutes,
+        [Parameter(Mandatory)][int]$CountdownSeconds,
+        [switch]$BreakMessage,
+        [double]$UnlockedSeconds = -1,
+        [string]$DebugLogPath = ''
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceScriptPath)) {
+        throw ("Encoded launch source missing: {0}" -f $SourceScriptPath)
+    }
+
+    $raw = [System.IO.File]::ReadAllText($SourceScriptPath)
+    $raw = [regex]::Replace($raw, '(?m)^\s*#Requires[^\r\n]*\r?\n?', '')
+    $raw = [regex]::Replace($raw, '(?s)^\s*<#.*?#>\s*', '')
+    $raw = [regex]::Replace($raw, '(?s)^\s*\[CmdletBinding\(\)\]\s*param\s*\(.*?\)\s*', '')
+
+    $dbgEsc = ([string]$DebugLogPath) -replace "'", "''"
+    $bmLit = if ($BreakMessage) { '$true' } else { '$false' }
+    $prelude = @(
+        'Set-StrictMode -Version Latest'
+        '$ErrorActionPreference = ''Stop'''
+        ('$Minutes = {0}' -f [int]$Minutes)
+        ('$CountdownSeconds = {0}' -f [int]$CountdownSeconds)
+        ('$BreakMessage = [bool]({0})' -f $bmLit)
+        ('$UnlockedSeconds = [double]{0}' -f ([double]$UnlockedSeconds))
+        ("`$DebugLogPath = '{0}'" -f $dbgEsc)
+    ) -join [Environment]::NewLine
+
+    $full = $prelude + [Environment]::NewLine + $raw
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
+    return ('-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -EncodedCommand {0}' -f $b64)
 }
 
 function Invoke-UnlockQuotaWarningAndLock {
@@ -972,6 +1022,38 @@ function Invoke-UnlockQuotaWarningAndLock {
     Write-DebugLog -Source 'UnlockWarn' -Message (
         "LaunchInUserSession ok={0}; error={1}; LastError={2}; uiDebug={3}" -f `
             $ok, $launchError, $(try { [SessionQuery]::LastError } catch { '(n/a)' }), $uiDebugLog)
+
+    # 0xFFFD0000 = -File not readable in the user session. Retry with the script
+    # body embedded as -EncodedCommand (SYSTEM reads Program Files; user does not).
+    $fileAclFail = (-not $ok) -and (
+        ([string]$launchError -match '(?i)0xFFFD0000|FFFD0000') -or
+        ([string]$launchError -match '4294770688') -or
+        ([string]$launchError -match '(?i)not readable in the user session')
+    )
+    if ($fileAclFail) {
+        Write-DebugLog -Source 'UnlockWarn' -Message (
+            'retrying with -EncodedCommand (bypass user -File ACL)')
+        try {
+            $encArgs = Get-UnlockQuotaWarningEncodedLaunchArgs `
+                -SourceScriptPath $WarningScriptPath `
+                -Minutes $ElapsedMinutes `
+                -CountdownSeconds $seconds `
+                -BreakMessage:$BreakMessage `
+                -UnlockedSeconds $UnlockedSeconds `
+                -DebugLogPath $uiDebugLog
+            $launchError2 = ''
+            $ok = [SessionQuery]::LaunchInUserSession(
+                $Config.TargetUsername, $psExe, $encArgs, [ref]$launchError2, $true, $waitMs)
+            $launchError = $launchError2
+            Write-DebugLog -Source 'UnlockWarn' -Message (
+                "EncodedCommand LaunchInUserSession ok={0}; error={1}" -f $ok, $launchError)
+        }
+        catch {
+            Write-DebugLog -Source 'UnlockWarn' -Message (
+                "EncodedCommand fallback failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
     if (-not $ok) {
         # Pull child UI traces into the monitor debug.log (child may have exited
         # before writing, or only wrote under the staged dir).
@@ -1517,6 +1599,26 @@ try {
             Write-LoggerEvent -Level WARN -Message (
                 "Lock-signal stale start skipped: {0}" -f $_.Exception.Message)
         }
+    }
+
+    # Pre-stage break/unlock UI under Public so the first remote "break" does not
+    # race CreateProcessAsUser against a missing user-readable copy.
+    try {
+        $warnSrc = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+        if (Test-Path -LiteralPath $warnSrc) {
+            $staged = Publish-UnlockQuotaWarningForUserLaunch -SourceScriptPath $warnSrc -Config $config
+            if (-not [string]::IsNullOrWhiteSpace($staged)) {
+                Write-LoggerEvent ("Staged unlock/break UI for user launch: {0}" -f $staged)
+            }
+            else {
+                Write-LoggerEvent -Level WARN -Message (
+                    "Could not pre-stage unlock/break UI from '{0}'." -f $warnSrc)
+            }
+        }
+    }
+    catch {
+        Write-LoggerEvent -Level WARN -Message (
+            "Unlock/break UI pre-stage skipped: {0}" -f $_.Exception.Message)
     }
 
     # Persist InstalledCommitSha into state.json on startup (and every later Write-State).

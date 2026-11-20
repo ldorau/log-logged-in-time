@@ -703,83 +703,12 @@ try {
     # Give the filter engine a moment after rule reconcile before probing.
     Start-Sleep -Seconds 2
 
-    # .NET TcpClient can time out while OpenSSH scp/ssh still works (per-app
-    # firewall / stack differences). Treat TCP as advisory; gate on ssh.exe.
-    $tcp = Test-ScpCopyTcpEndpoint -HostName ([string]$cfg.ScpHost) `
-        -Port ([int]$cfg.ScpPort) -TimeoutMs 8000
-    if ($tcp.Ok) {
-        Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $true -Detail $tcp.Detail
-    }
-    else {
-        Write-Check -Name ("TCP {0}:{1}" -f $cfg.ScpHost, $cfg.ScpPort) -Ok $false `
-            -Status 'WARN' -Detail ("{0} (ignored; probing with OpenSSH)" -f $tcp.Detail)
-        $fw2 = Invoke-ScpOutboundFirewallReconcile `
-            -RemoteHost ([string]$cfg.ScpHost) `
-            -RemotePort ([int]$cfg.ScpPort) `
-            -ConfigPath ([string]$cfg.ConfigPath)
-        Write-ScpCopyLine ("  firewall re-check: {0}" -f $fw2.Detail) -ForegroundColor DarkGray
-    }
-
-    $probeIdentity = [string]$cfg.ScpIdentityFile
-    $probeTempIdentity = $null
-    $sshOk = $false
-    $sshDetail = ''
-    try {
-        if (-not (Test-ScpRunningAsLocalSystem)) {
-            $probeTempIdentity = New-ScpIdentityCopyForCurrentUser -IdentityPath $probeIdentity
-            if (-not [string]::IsNullOrWhiteSpace($probeTempIdentity)) {
-                $probeIdentity = $probeTempIdentity
-            }
-        }
-        Write-ScpCopyLine (
-            "  OpenSSH probe: ssh {0}@{1}:{2} (BatchMode, ConnectTimeout=20s)..." -f `
-                $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort) -ForegroundColor DarkGray
-        $sshOk = [bool](Test-ScpSshHandshake `
-                -HostName ([string]$cfg.ScpHost) `
-                -Port ([int]$cfg.ScpPort) `
-                -UserName ([string]$cfg.ScpUser) `
-                -IdentityFile $probeIdentity `
-                -KnownHostsFile ([string]$cfg.ScpKnownHostsFile) `
-                -ConnectTimeoutSeconds 20)
-        if ($sshOk) {
-            $sshDetail = 'SSH handshake OK (server answered; auth may still fail later)'
-        }
-        else {
-            $sshDetail = 'SSH handshake failed (connect/banner/kex timeout or refused)'
-        }
-    }
-    catch {
-        $sshOk = $false
-        $sshDetail = $_.Exception.Message
-    }
-    finally {
-        if (-not [string]::IsNullOrWhiteSpace($probeTempIdentity) -and
-            (Test-Path -LiteralPath $probeTempIdentity)) {
-            Remove-Item -LiteralPath $probeTempIdentity -Force -ErrorAction SilentlyContinue
-        }
-    }
-    Write-Check -Name ("SSH {0}@{1}:{2}" -f $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort) `
-        -Ok $sshOk -Detail $sshDetail
-    if (-not $sshOk) {
-        Write-ScpCopyLine ''
-        Write-ScpCopyLine 'RESULT: remote SSH not reachable; scp not attempted.' -ForegroundColor Red
-        Write-ScpCopyLine ((
-                "Check that {0} is up on the LAN, SSH is listening on port {1}, and " +
-                "run elevated .\scripts\Allow-ScpOutboundFirewall.ps1 if outbound SSH is blocked. " +
-                "Manual test: scp.exe -P {1} -i <identity> <file> {2}@{0}:<remote-dir>/"
-            ) -f $cfg.ScpHost, $cfg.ScpPort, $cfg.ScpUser) -ForegroundColor Yellow
-        Write-ScpCopyLine ("Copy log saved: {0}" -f $script:CopyLogPath) -ForegroundColor Yellow
-        $failMsg = ("Copy-LogsViaScp SSH preflight failed`r`n" +
-            "scp preflight failed: SSH {0}@{1}:{2} not reachable. {3}" -f `
-                $cfg.ScpUser, $cfg.ScpHost, $cfg.ScpPort, $sshDetail)
-        if (Get-Command Write-ErrorMessage -ErrorAction SilentlyContinue) {
-            $null = Write-ErrorMessage -Message $failMsg -Level WARN -Source 'Copy-LogsViaScp'
-        }
-        else {
-            Write-ScpCopyLine $failMsg -ForegroundColor Yellow
-        }
-        exit 1
-    }
+    # Reachability probes are advisory only. On this LAN, .NET TcpClient and
+    # redirected ssh.exe probes can time out while interactive / real scp.exe
+    # still works — never abort before attempting the actual copy.
+    Write-ScpCopyLine (
+        '  Skipping hard TCP/SSH preflight gate; proceeding to scp ' +
+        '(manual scp working is the source of truth).') -ForegroundColor DarkGray
 
     Write-ScpCopyLine ''
     Write-ScpCopyLine 'Step 2: select files to copy' -ForegroundColor Cyan

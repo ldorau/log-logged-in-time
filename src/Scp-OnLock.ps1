@@ -548,6 +548,8 @@ function Test-ScpSshHandshake {
     $argList.Add('ServerAliveInterval=5')
     $argList.Add('-o')
     $argList.Add('ServerAliveCountMax=2')
+    # -n: stdin from NUL (avoids hang when parent redirects pipes).
+    $argList.Add('-n')
     $argList.Add('-v')
     $argList.Add(('{0}@{1}' -f $UserName.Trim(), $HostName.Trim()))
     $argList.Add('exit')
@@ -611,6 +613,50 @@ function Test-ScpHostPortReachable {
             try { $client.Dispose() } catch { }
         }
     }
+}
+
+function Test-ScpRemoteReady {
+    <#
+      Reachability for SCP uploads/commands. Do NOT gate on .NET TcpClient —
+      it can time out while OpenSSH scp/ssh still works (per-app firewall /
+      DualStack). Probe with ssh.exe BatchMode (same stack as scp).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$IdentityFile,
+        [string]$KnownHostsFile = '',
+        [int]$ConnectTimeoutSeconds = 20,
+        $Config = $null
+    )
+
+    if ($null -ne $Config) {
+        $null = Invoke-ScpOutboundAllowReconcile -Config $Config
+    }
+
+    $ok = Test-ScpSshHandshake `
+        -HostName $HostName `
+        -Port $Port `
+        -UserName $UserName `
+        -IdentityFile $IdentityFile `
+        -KnownHostsFile $KnownHostsFile `
+        -ConnectTimeoutSeconds $ConnectTimeoutSeconds
+    if ($ok) {
+        return $true
+    }
+
+    if ($null -ne $Config) {
+        $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+        Start-Sleep -Seconds 2
+    }
+    return [bool](Test-ScpSshHandshake `
+            -HostName $HostName `
+            -Port $Port `
+            -UserName $UserName `
+            -IdentityFile $IdentityFile `
+            -KnownHostsFile $KnownHostsFile `
+            -ConnectTimeoutSeconds $ConnectTimeoutSeconds)
 }
 
 function Write-ScpConnectFailureThrottled {
@@ -828,6 +874,9 @@ function Invoke-ScpProcessWithTimeout {
     $psi.Arguments = $ArgumentList
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    # OpenSSH for Windows can hang in banner/kex when stdin is not redirected
+    # (interactive console scp works; redirected-only stdout/stderr stalls).
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     if (-not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-Path -LiteralPath $env:TEMP)) {
@@ -849,6 +898,9 @@ function Invoke-ScpProcessWithTimeout {
                 Process  = $null
             }
         }
+
+        # No TTY prompts (BatchMode); close stdin so ssh/scp do not wait on input.
+        try { $proc.StandardInput.Close() } catch { }
 
         # Read streams async before WaitForExit to avoid pipe-buffer deadlocks.
         $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
@@ -2104,7 +2156,7 @@ function Invoke-ScpLogCopyOnLock {
             $port = [int]$Config.ScpPort
         }
 
-        # Same preflight as BHistory/daily: TCP + SSH handshake; honor connect backoff.
+        # OpenSSH handshake preflight (not .NET TcpClient); honor connect backoff.
         if (Test-ScpConnectBackoffActive) {
             $remain = [int][Math]::Ceiling(
                 ($script:ScpConnectBackoffUntilUtc - [datetime]::UtcNow).TotalMinutes)
@@ -2112,37 +2164,18 @@ function Invoke-ScpLogCopyOnLock {
                 "SCP on lock skipped: connect backoff active (~{0} min left)." -f $remain)
             return
         }
-        $null = Invoke-ScpOutboundAllowReconcile -Config $Config
-        $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
-        if (-not $hostReachable) {
-            $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-            Start-Sleep -Seconds 2
-            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
-        }
-        if ($hostReachable) {
-            $hostReachable = Test-ScpSshHandshake `
-                -HostName $scpHost `
-                -Port $port `
-                -UserName $scpUser `
-                -IdentityFile ([string]$Config.ScpIdentityFile) `
-                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                -ConnectTimeoutSeconds 20
-            if (-not $hostReachable) {
-                $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-                Start-Sleep -Seconds 2
-                $hostReachable = Test-ScpSshHandshake `
-                    -HostName $scpHost `
-                    -Port $port `
-                    -UserName $scpUser `
-                    -IdentityFile ([string]$Config.ScpIdentityFile) `
-                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                    -ConnectTimeoutSeconds 20
-            }
-        }
+        $hostReachable = Test-ScpRemoteReady `
+            -HostName $scpHost `
+            -Port $port `
+            -UserName $scpUser `
+            -IdentityFile ([string]$Config.ScpIdentityFile) `
+            -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+            -ConnectTimeoutSeconds 20 `
+            -Config $Config
         if (-not $hostReachable) {
             Set-ScpConnectBackoff
             $skipMsg = ("SCP on lock skipped: {0}:{1} SSH handshake failed " +
-                "(TCP may work; banner/kex timed out). Backing off {2} min." -f `
+                "(banner/kex timed out or refused). Backing off {2} min." -f `
                     $scpHost, $port, [int]$script:ScpConnectBackoffMinutes)
             if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
                 $null = Send-LoginTimeLoggerFailureAlert `
@@ -3110,52 +3143,52 @@ function Invoke-ScpCommandsFileExchange {
                 $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
 
-            if ($run.TimedOut) {
-                $msg = ("SCP commands download timed out after 90s. remote={0}; stderr={1}" -f `
-                        $remoteFile, ("$stderr").Trim())
-                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
+            $getFailed = [bool]$run.TimedOut -or
+                (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false)
+            # Banner/kex hangs: process timeout and/or connect patterns in -v stderr.
+            # WARN+backoff (not FATAL) so flaky LAN SSH does not email every minute.
+            if ($getFailed -and (
+                    [bool]$run.TimedOut -or (Test-ScpConnectFailure -StdErr "$stderr"))) {
+                if ($getAttempt -lt $getMaxAttempts) {
+                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                        "scp get connect/timeout failed (attempt {0}); retrying in 5s" -f $getAttempt)
+                    Start-Sleep -Seconds 5
+                    continue
+                }
+                $reportedExit = $run.ExitCode
+                if ($run.TimedOut) { $reportedExit = 'timeout' }
+                else {
+                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                }
+                $msg = ("SCP commands download connect failed (exit {0}). remote={1}; stderr={2}" -f `
+                        $reportedExit, $remoteFile, ("$stderr").Trim())
+                Set-ScpConnectBackoff
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+                if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
+                    $null = Send-LoginTimeLoggerFailureAlert `
+                        -Subject 'SCP connect failed' `
+                        -Body $msg `
+                        -AlertKey 'scp-connect-failed' `
+                        -Config $Config
+                }
                 return
             }
-            if (Test-ScpAuthFailure -StdErr "$stderr") {
+            if ($getFailed -and (Test-ScpAuthFailure -StdErr "$stderr")) {
                 $msg = ("SCP commands download auth failed. remote={0}; stderr={1}" -f `
                         $remoteFile, ("$stderr").Trim())
                 Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
                 Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands download'
                 return
             }
-            if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
+            if ($getFailed) {
                 if (Test-ScpRemotePathMissing -StdErr "$stderr") {
                     $remoteMissing = $true
                     $getOk = $true
                     Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
                         "remote commands.txt not present (OK). remote={0}" -f $remoteFile)
                     break
-                }
-                if ((Test-ScpConnectFailure -StdErr "$stderr") -and $getAttempt -lt $getMaxAttempts) {
-                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-                        "scp get connect failed (attempt {0}); retrying in 5s" -f $getAttempt)
-                    Start-Sleep -Seconds 5
-                    continue
-                }
-                if (Test-ScpConnectFailure -StdErr "$stderr") {
-                    $reportedExit = $run.ExitCode
-                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
-                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
-                    $msg = ("SCP commands download connect failed (exit {0}). remote={1}; stderr={2}" -f `
-                            $reportedExit, $remoteFile, ("$stderr").Trim())
-                    Set-ScpConnectBackoff
-                    # WARN: ERROR-level Write-LoggerEvent emails via Write-ErrorMessage.
-                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
-                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
-                        $null = Send-LoginTimeLoggerFailureAlert `
-                            -Subject 'SCP connect failed' `
-                            -Body $msg `
-                            -AlertKey 'scp-connect-failed' `
-                            -Config $Config
-                    }
-                    return
                 }
                 $reportedExit = $run.ExitCode
                 $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
@@ -3232,41 +3265,44 @@ function Invoke-ScpCommandsFileExchange {
                 $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
             }
 
-            if ($run.TimedOut) {
-                $msg = ("SCP commands empty upload timed out after 90s. remote={0}; stderr={1}" -f `
-                        $remoteFile, ("$stderr").Trim())
-                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
-                return
-            }
-            if (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false) {
-                if ((Test-ScpConnectFailure -StdErr "$stderr") -and $putAttempt -lt $putMaxAttempts) {
+            $putFailed = [bool]$run.TimedOut -or
+                (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false)
+            if ($putFailed -and (
+                    [bool]$run.TimedOut -or (Test-ScpConnectFailure -StdErr "$stderr"))) {
+                if ($putAttempt -lt $putMaxAttempts) {
                     $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
                     Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
-                        "scp put connect failed (attempt {0}); retrying in 5s" -f $putAttempt)
+                        "scp put connect/timeout failed (attempt {0}); retrying in 5s" -f $putAttempt)
                     Start-Sleep -Seconds 5
                     continue
                 }
+                $reportedExit = $run.ExitCode
+                if ($run.TimedOut) { $reportedExit = 'timeout' }
+                else {
+                    $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
+                    if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
+                }
+                $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
+                        $reportedExit, $remoteFile, ("$stderr").Trim())
+                Set-ScpConnectBackoff
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
+                if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
+                    $null = Send-LoginTimeLoggerFailureAlert `
+                        -Subject 'SCP connect failed' `
+                        -Body $msg `
+                        -AlertKey 'scp-connect-failed' `
+                        -Config $Config
+                }
+                return
+            }
+            if ($putFailed) {
                 $reportedExit = $run.ExitCode
                 $verboseExit = Get-ScpVerboseExitStatus -StdErr "$stderr"
                 if ($null -ne $verboseExit) { $reportedExit = $verboseExit }
                 $msg = ("SCP commands empty upload failed (exit {0}). remote={1}; stderr={2}" -f `
                         $reportedExit, $remoteFile, ("$stderr").Trim())
-                if (Test-ScpConnectFailure -StdErr "$stderr") {
-                    Set-ScpConnectBackoff
-                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message $msg
-                    if (Write-ScpConnectFailureThrottled -Message $msg -Level 'WARN') {
-                        $null = Send-LoginTimeLoggerFailureAlert `
-                            -Subject 'SCP connect failed' `
-                            -Body $msg `
-                            -AlertKey 'scp-connect-failed' `
-                            -Config $Config
-                    }
-                }
-                else {
-                    Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
-                    Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
-                }
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message $msg
+                Invoke-ScpCommandsFatal -Message $msg -Context 'SCP commands empty upload'
                 return
             }
             $putOk = $true
@@ -3674,39 +3710,19 @@ function Invoke-ScpBHistoryCopy {
             $hostReachable = $false
         }
         else {
-            # Keep outbound SSH allowed; TCP alone is not enough — banner/kex can
-            # hang after "Connection established" (getpeername / kex_exchange_*).
-            $null = Invoke-ScpOutboundAllowReconcile -Config $Config
-            $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
-            if (-not $hostReachable) {
-                $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-                Start-Sleep -Seconds 2
-                $hostReachable = Test-ScpHostPortReachable -HostName $scpHost -Port $port -TimeoutMs 8000
-            }
-            if ($hostReachable) {
-                $hostReachable = Test-ScpSshHandshake `
-                    -HostName $scpHost `
-                    -Port $port `
-                    -UserName $scpUser `
-                    -IdentityFile ([string]$Config.ScpIdentityFile) `
-                    -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                    -ConnectTimeoutSeconds 20
-                if (-not $hostReachable) {
-                    $null = Invoke-ScpOutboundAllowReconcile -Config $Config -Force
-                    Start-Sleep -Seconds 2
-                    $hostReachable = Test-ScpSshHandshake `
-                        -HostName $scpHost `
-                        -Port $port `
-                        -UserName $scpUser `
-                        -IdentityFile ([string]$Config.ScpIdentityFile) `
-                        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
-                        -ConnectTimeoutSeconds 20
-                }
-            }
+            # OpenSSH handshake only — .NET TcpClient can false-fail while scp works.
+            $hostReachable = Test-ScpRemoteReady `
+                -HostName $scpHost `
+                -Port $port `
+                -UserName $scpUser `
+                -IdentityFile ([string]$Config.ScpIdentityFile) `
+                -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+                -ConnectTimeoutSeconds 20 `
+                -Config $Config
             if (-not $hostReachable) {
                 Set-ScpConnectBackoff
                 $skipMsg = ("SCP BHistory/daily skipped: {0}:{1} SSH handshake failed " +
-                    "(TCP may work; banner/kex timed out). Backing off {2} min." -f `
+                    "(banner/kex timed out or refused). Backing off {2} min." -f `
                         $scpHost, $port, [int]$script:ScpConnectBackoffMinutes)
                 if (Write-ScpConnectFailureThrottled -Message $skipMsg -Level 'WARN') {
                     $null = Send-LoginTimeLoggerFailureAlert `
