@@ -21,6 +21,8 @@ $script:InstanceMutex = $null
 $script:InstallRoot = $null
 # Remote "break" launch retries (cleared only after success or max attempts).
 $script:PendingBreakAttempts = 0
+# Remote "disable-break" — applied on next poll to state (today only).
+$script:PendingDisableForcedBreak = $false
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -270,14 +272,14 @@ LogDirectory in file: $cfgLogHint
         $lockSignalPath = [string]$cfgLockSignal
     }
 
-    # Every N minutes of unlocked time: warn on the target desktop, then LockWorkStation.
-    # Missing key => disabled (opt-in for older runtime configs). New installs write true.
+    # Every N minutes of unlocked time: warn (Twoje oczy...) then LockWorkStation.
+    # Missing UnlockQuotaEnabled => disabled (opt-in for older runtime configs).
     $unlockQuotaEnabled = $false
     $cfgUnlockQuotaEnabled = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaEnabled'
     if ($null -ne $cfgUnlockQuotaEnabled) {
         $unlockQuotaEnabled = [bool]$cfgUnlockQuotaEnabled
     }
-    $unlockQuotaMinutes = 30
+    $unlockQuotaMinutes = 60
     $cfgUnlockQuotaMinutes = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinutes'
     if ($null -ne $cfgUnlockQuotaMinutes -and [int]$cfgUnlockQuotaMinutes -gt 0) {
         $unlockQuotaMinutes = [int]$cfgUnlockQuotaMinutes
@@ -286,6 +288,12 @@ LogDirectory in file: $cfgLogHint
     $cfgUnlockQuotaWarn = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaWarnSeconds'
     if ($null -ne $cfgUnlockQuotaWarn -and [int]$cfgUnlockQuotaWarn -gt 0) {
         $unlockQuotaWarnSeconds = [int]$cfgUnlockQuotaWarn
+    }
+    # After a forced lock, require this many minutes locked before unlocked time continues.
+    $unlockQuotaMinBreakMinutes = 5
+    $cfgMinBreak = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinBreakMinutes'
+    if ($null -ne $cfgMinBreak -and [int]$cfgMinBreak -gt 0) {
+        $unlockQuotaMinBreakMinutes = [int]$cfgMinBreak
     }
 
     [pscustomobject]@{
@@ -311,6 +319,7 @@ LogDirectory in file: $cfgLogHint
         UnlockQuotaEnabled      = $unlockQuotaEnabled
         UnlockQuotaMinutes      = $unlockQuotaMinutes
         UnlockQuotaWarnSeconds  = $unlockQuotaWarnSeconds
+        UnlockQuotaMinBreakMinutes = $unlockQuotaMinBreakMinutes
     }
 }
 
@@ -538,20 +547,29 @@ function New-LoggerStateObject {
         [bool]$LastUnlocked = $false,
         [AllowNull()]$LastTransitionUtc = $null,
         [int]$LastUnlockQuotaBucket = 0,
-        [string]$InstalledCommitSha = ''
+        [string]$InstalledCommitSha = '',
+        [string]$ForcedBreakDisabledDate = '',
+        [double]$ForcedBreakRemainingSeconds = 0
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
         $Date = (Get-Date).ToString('yyyy-MM-dd')
     }
+    if ($ForcedBreakRemainingSeconds -lt 0) {
+        $ForcedBreakRemainingSeconds = 0
+    }
 
     return [pscustomobject]@{
-        Date                  = [string]$Date
-        UnlockedSecondsToday  = [double]$UnlockedSecondsToday
-        LastUnlocked          = [bool]$LastUnlocked
-        LastTransitionUtc     = $(if ($LastTransitionUtc) { [string]$LastTransitionUtc } else { $null })
-        LastUnlockQuotaBucket = [int]$LastUnlockQuotaBucket
-        InstalledCommitSha    = [string]$InstalledCommitSha
+        Date                     = [string]$Date
+        UnlockedSecondsToday     = [double]$UnlockedSecondsToday
+        LastUnlocked             = [bool]$LastUnlocked
+        LastTransitionUtc        = $(if ($LastTransitionUtc) { [string]$LastTransitionUtc } else { $null })
+        LastUnlockQuotaBucket    = [int]$LastUnlockQuotaBucket
+        InstalledCommitSha       = [string]$InstalledCommitSha
+        # yyyy-MM-dd when remote "disable-break" disabled hourly forced rest for that day.
+        ForcedBreakDisabledDate  = [string]$ForcedBreakDisabledDate
+        # Seconds of actual locked time still required for the current min-break window.
+        ForcedBreakRemainingSeconds = [double]$ForcedBreakRemainingSeconds
     }
 }
 
@@ -562,11 +580,11 @@ function ConvertTo-LoggerStateObject {
     #>
     param(
         $State,
-        [int]$UnlockQuotaMinutes = 30
+        [int]$UnlockQuotaMinutes = 60
     )
 
     if ($UnlockQuotaMinutes -lt 1) {
-        $UnlockQuotaMinutes = 30
+        $UnlockQuotaMinutes = 60
     }
     $quotaSeconds = [double]($UnlockQuotaMinutes * 60)
 
@@ -609,6 +627,31 @@ function ConvertTo-LoggerStateObject {
     }
 
     $commitSha = [string](Get-OptionalPropertyValue -InputObject $State -Name 'InstalledCommitSha')
+    $disabledDate = [string](Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakDisabledDate')
+    # Auto-expire disable-break on a new calendar day (state.Date already rolled).
+    if (-not [string]::IsNullOrWhiteSpace($disabledDate) -and
+        -not [string]::IsNullOrWhiteSpace($date) -and
+        $disabledDate -ne $date) {
+        $disabledDate = ''
+    }
+    $breakRemain = 0.0
+    $breakRemainRaw = Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakRemainingSeconds'
+    if ($null -ne $breakRemainRaw) {
+        try { $breakRemain = [double]$breakRemainRaw } catch { $breakRemain = 0.0 }
+    }
+    elseif ($null -ne (Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakUntilUtc')) {
+        # Migrate older wall-clock deadline → remaining locked seconds (best effort).
+        $legacyUntil = [string](Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakUntilUtc')
+        if (-not [string]::IsNullOrWhiteSpace($legacyUntil)) {
+            try {
+                $untilUtc = [datetime]::Parse($legacyUntil, $null,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind)
+                $breakRemain = [Math]::Max(0.0, ($untilUtc - [datetime]::UtcNow).TotalSeconds)
+            }
+            catch { $breakRemain = 0.0 }
+        }
+    }
+    if ($breakRemain -lt 0) { $breakRemain = 0.0 }
 
     return (New-LoggerStateObject `
             -Date $date `
@@ -616,7 +659,9 @@ function ConvertTo-LoggerStateObject {
             -LastUnlocked $lastUnlocked `
             -LastTransitionUtc $lastTransition `
             -LastUnlockQuotaBucket $bucket `
-            -InstalledCommitSha $commitSha)
+            -InstalledCommitSha $commitSha `
+            -ForcedBreakDisabledDate $disabledDate `
+            -ForcedBreakRemainingSeconds $breakRemain)
 }
 
 function ConvertFrom-DurationText {
@@ -676,11 +721,11 @@ function Get-UnlockedSecondsFromDailyLog {
 function Read-State {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [int]$UnlockQuotaMinutes = 30
+        [int]$UnlockQuotaMinutes = 60
     )
 
     if ($UnlockQuotaMinutes -lt 1) {
-        $UnlockQuotaMinutes = 30
+        $UnlockQuotaMinutes = 60
     }
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -1118,6 +1163,80 @@ function Invoke-UnlockQuotaWarningAndLock {
     }
     Write-DebugLog -Source 'UnlockWarn' -Message ("SUCCESS tag={0}; session locked" -f $tag)
     return $true
+}
+
+function Test-ForcedBreakDisabledToday {
+    <#
+      True when remote "disable-break" disabled hourly forced rest for state.Date.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][string]$Today
+    )
+
+    $disabled = ''
+    try {
+        $disabled = [string](Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakDisabledDate')
+    }
+    catch { $disabled = '' }
+    return (-not [string]::IsNullOrWhiteSpace($disabled) -and $disabled -eq $Today)
+}
+
+function Get-ForcedBreakRemainingSeconds {
+    param([Parameter(Mandatory)]$State)
+
+    $raw = Get-OptionalPropertyValue -InputObject $State -Name 'ForcedBreakRemainingSeconds'
+    if ($null -eq $raw) {
+        return 0.0
+    }
+    try {
+        $v = [double]$raw
+        if ($v -lt 0) { return 0.0 }
+        return $v
+    }
+    catch {
+        return 0.0
+    }
+}
+
+function Apply-PendingDisableForcedBreak {
+    <#
+      Remote commands.txt "disable-break": skip hourly Twoje-oczy rest for today.
+      Cleared automatically on day rollover (ForcedBreakDisabledDate != Date).
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][string]$Today,
+        [Parameter(Mandatory)][string]$DailyLogPath
+    )
+
+    $pending = $false
+    try { $pending = [bool]$script:PendingDisableForcedBreak } catch { $pending = $false }
+    if (-not $pending) {
+        return $State
+    }
+    $script:PendingDisableForcedBreak = $false
+
+    $State = New-LoggerStateObject `
+        -Date $State.Date `
+        -UnlockedSecondsToday $State.UnlockedSecondsToday `
+        -LastUnlocked $State.LastUnlocked `
+        -LastTransitionUtc $State.LastTransitionUtc `
+        -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
+        -InstalledCommitSha $State.InstalledCommitSha `
+        -ForcedBreakDisabledDate $Today `
+        -ForcedBreakRemainingSeconds 0
+
+    $line = '{0:yyyy-MM-dd HH:mm:ss} | DISABLE_FORCED_BREAK | cumulative_today={1} | until_date={2}' -f `
+        (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $Today
+    try {
+        Write-DailyLogLine -Path $DailyLogPath -Line $line
+    }
+    catch { }
+    Write-LoggerEvent ("Forced hourly break disabled for {0} (remote disable-break)." -f $Today)
+    Write-DebugLog -Source 'UnlockQuota' -Message (
+        "disable-break applied; ForcedBreakDisabledDate={0}" -f $Today)
+    return $State
 }
 
 function Apply-PendingRemoteBreak {
@@ -1584,8 +1703,8 @@ try {
     }
     $script:InstallRoot = $installRoot
 
-    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s" -f `
-            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds)
+    Write-LoggerEvent ("LoginTimeLogger started. TargetUser={0}; LogDir={1}; Poll={2}s; Config={3}; ErrorLog={4}; UpdateEnabled={5}; ScpOnLock={6}; LockSignal={7}; UnlockQuota={8}/{9}m/{10}s/minBreak={11}m" -f `
+            $config.TargetUsername, $config.LogDirectory, $config.PollIntervalSeconds, $config.ConfigPath, (Get-ErrorLogPath), $config.UpdateEnabled, $config.ScpOnLockEnabled, $config.LockSignalPath, $config.UnlockQuotaEnabled, $config.UnlockQuotaMinutes, $config.UnlockQuotaWarnSeconds, $config.UnlockQuotaMinBreakMinutes)
 
     # If the interactive lock-signal watcher died (common after PF ACL Deny on the
     # old Program Files VBS path), ask Task Scheduler to start it again.
@@ -1672,14 +1791,15 @@ while ($true) {
             $state = New-LoggerStateObject -Date $today
         }
 
-        $elapsed = ($nowUtc - $lastPollUtc).TotalSeconds
+        $wallElapsed = ($nowUtc - $lastPollUtc).TotalSeconds
+        if ($wallElapsed -lt 0) {
+            $wallElapsed = 0
+        }
+        $elapsed = $wallElapsed
         # Cap delta so sleep/hibernate gaps are not counted as unlocked time.
         $maxCredit = [Math]::Max($config.PollIntervalSeconds * 2, 15)
         if ($elapsed -gt $maxCredit) {
             $elapsed = $config.PollIntervalSeconds
-        }
-        if ($elapsed -lt 0) {
-            $elapsed = 0
         }
 
         try {
@@ -1696,10 +1816,82 @@ while ($true) {
 
         $dailyPath = Get-DailyLogPath -LogDirectory $config.LogDirectory -Date $nowLocal
 
-        if ($unlocked) {
+        $forcedBreakDisabled = Test-ForcedBreakDisabledToday -State $state -Today $today
+        $breakRemain = Get-ForcedBreakRemainingSeconds -State $state
+        if ($forcedBreakDisabled -and $breakRemain -gt 0) {
+            $breakRemain = 0.0
+            $state = New-LoggerStateObject `
+                -Date $state.Date `
+                -UnlockedSecondsToday $state.UnlockedSecondsToday `
+                -LastUnlocked $state.LastUnlocked `
+                -LastTransitionUtc $state.LastTransitionUtc `
+                -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
+                -InstalledCommitSha $state.InstalledCommitSha `
+                -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
+                -ForcedBreakRemainingSeconds 0
+        }
+        $inMinBreak = (-not $forcedBreakDisabled -and $breakRemain -gt 0)
+
+        $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
+        $minBreakMinutes = 5
+        try {
+            if ($null -ne $config.UnlockQuotaMinBreakMinutes -and
+                [int]$config.UnlockQuotaMinBreakMinutes -gt 0) {
+                $minBreakMinutes = [int]$config.UnlockQuotaMinBreakMinutes
+            }
+        }
+        catch { $minBreakMinutes = 5 }
+
+        if ($inMinBreak) {
+            # Require actual locked time: countdown only while locked; re-lock if awake.
+            if ($unlocked) {
+                if ([datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
+                    $launched = $false
+                    try {
+                        $remainMin = [Math]::Max(1, [int][Math]::Ceiling($breakRemain / 60.0))
+                        $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
+                                -Config $config `
+                                -WarningScriptPath $warnScript `
+                                -ElapsedMinutes $remainMin `
+                                -UnlockedSeconds ([double]$state.UnlockedSecondsToday))
+                    }
+                    catch {
+                        $launched = $false
+                        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UnlockQuota' -Context (
+                            'Min-break re-lock launch failed')
+                    }
+                    if ($launched) {
+                        $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+                        Write-State -Path $statePath -State $state
+                    }
+                    else {
+                        $script:UnlockQuotaRetryAfterUtc = [datetime]::UtcNow.AddSeconds(60)
+                    }
+                }
+            }
+            else {
+                # Count real locked wall time (sleep/hibernate still counts as rest).
+                $breakRemain = [Math]::Max(0.0, $breakRemain - $wallElapsed)
+                $state = New-LoggerStateObject `
+                    -Date $state.Date `
+                    -UnlockedSecondsToday $state.UnlockedSecondsToday `
+                    -LastUnlocked $state.LastUnlocked `
+                    -LastTransitionUtc $state.LastTransitionUtc `
+                    -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
+                    -InstalledCommitSha $state.InstalledCommitSha `
+                    -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
+                    -ForcedBreakRemainingSeconds $breakRemain
+                if ($breakRemain -le 0) {
+                    Write-LoggerEvent (
+                        "Unlock-quota: min break satisfied ({0} min locked)." -f $minBreakMinutes)
+                }
+            }
+        }
+        elseif ($unlocked) {
             $state.UnlockedSecondsToday += $elapsed
 
-            if ($config.UnlockQuotaEnabled -and [int]$config.UnlockQuotaMinutes -gt 0) {
+            if ($config.UnlockQuotaEnabled -and [int]$config.UnlockQuotaMinutes -gt 0 -and
+                -not $forcedBreakDisabled) {
                 $quotaSeconds = [double]([int]$config.UnlockQuotaMinutes * 60)
                 $newBucket = [int][Math]::Floor($state.UnlockedSecondsToday / $quotaSeconds)
                 # At most one warning/lock per poll. Catch up the bucket only after a
@@ -1707,14 +1899,14 @@ while ($true) {
                 # retries when CreateProcessAsUser / LockWorkStation fails).
                 if ($newBucket -gt [int]$state.LastUnlockQuotaBucket -and
                     [datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
-                    $warnScript = Join-Path $scriptDir 'Show-UnlockQuotaWarning.ps1'
                     $elapsedMinutes = [int]($newBucket * [int]$config.UnlockQuotaMinutes)
                     $launched = $false
                     try {
                         $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
                                 -Config $config `
                                 -WarningScriptPath $warnScript `
-                                -ElapsedMinutes $elapsedMinutes)
+                                -ElapsedMinutes $elapsedMinutes `
+                                -UnlockedSeconds ([double]$state.UnlockedSecondsToday))
                     }
                     catch {
                         $launched = $false
@@ -1723,7 +1915,20 @@ while ($true) {
                     }
                     if ($launched) {
                         $state.LastUnlockQuotaBucket = $newBucket
+                        $breakRemain = [double]($minBreakMinutes * 60)
+                        $state = New-LoggerStateObject `
+                            -Date $state.Date `
+                            -UnlockedSecondsToday $state.UnlockedSecondsToday `
+                            -LastUnlocked $state.LastUnlocked `
+                            -LastTransitionUtc $state.LastTransitionUtc `
+                            -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
+                            -InstalledCommitSha $state.InstalledCommitSha `
+                            -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
+                            -ForcedBreakRemainingSeconds $breakRemain
                         $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+                        Write-LoggerEvent (
+                            "Unlock-quota: min locked break started ({0} min required)." -f `
+                                $minBreakMinutes)
                         Write-State -Path $statePath -State $state
                     }
                     else {
@@ -1830,6 +2035,23 @@ while ($true) {
                     $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
                         'Apply-PendingCumulativeResets failed')
                 }
+            }
+        }
+
+        # Remote commands.txt "disable-break" — every poll once queued.
+        $disableBreakPending = $false
+        try { $disableBreakPending = [bool]$script:PendingDisableForcedBreak } catch { $disableBreakPending = $false }
+        if ($disableBreakPending -and (Get-Command Apply-PendingDisableForcedBreak -ErrorAction SilentlyContinue)) {
+            try {
+                $state = Apply-PendingDisableForcedBreak `
+                    -State $state `
+                    -Today $today `
+                    -DailyLogPath $dailyPath
+                Write-State -Path $statePath -State $state
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'Apply-PendingDisableForcedBreak failed')
             }
         }
 

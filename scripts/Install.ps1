@@ -1217,7 +1217,7 @@ SystemDrive: $env:SystemDrive
     if ($null -ne $cfgUnlockQuotaEnabled) {
         $unlockQuotaEnabled = [bool]$cfgUnlockQuotaEnabled
     }
-    $unlockQuotaMinutes = 30
+    $unlockQuotaMinutes = 60
     $cfgUnlockQuotaMinutes = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinutes'
     if ($null -ne $cfgUnlockQuotaMinutes -and [int]$cfgUnlockQuotaMinutes -gt 0) {
         $unlockQuotaMinutes = [int]$cfgUnlockQuotaMinutes
@@ -1226,6 +1226,11 @@ SystemDrive: $env:SystemDrive
     $cfgUnlockQuotaWarn = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaWarnSeconds'
     if ($null -ne $cfgUnlockQuotaWarn -and [int]$cfgUnlockQuotaWarn -gt 0) {
         $unlockQuotaWarnSeconds = [int]$cfgUnlockQuotaWarn
+    }
+    $unlockQuotaMinBreakMinutes = 5
+    $cfgUnlockQuotaMinBreak = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockQuotaMinBreakMinutes'
+    if ($null -ne $cfgUnlockQuotaMinBreak -and [int]$cfgUnlockQuotaMinBreak -gt 0) {
+        $unlockQuotaMinBreakMinutes = [int]$cfgUnlockQuotaMinBreak
     }
 
     $config = [ordered]@{
@@ -1250,6 +1255,7 @@ SystemDrive: $env:SystemDrive
         UnlockQuotaEnabled     = $unlockQuotaEnabled
         UnlockQuotaMinutes     = $unlockQuotaMinutes
         UnlockQuotaWarnSeconds = $unlockQuotaWarnSeconds
+        UnlockQuotaMinBreakMinutes = $unlockQuotaMinBreakMinutes
     }
     $configJson = $config | ConvertTo-Json -Depth 4
 

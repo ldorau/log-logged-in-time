@@ -17,6 +17,7 @@
   "ScpIdentityFile": "",
   "ScpKnownHostsFile": "",
   "UnlockQuotaEnabled": true,
-  "UnlockQuotaMinutes": 30,
-  "UnlockQuotaWarnSeconds": 3
+  "UnlockQuotaMinutes": 60,
+  "UnlockQuotaWarnSeconds": 3,
+  "UnlockQuotaMinBreakMinutes": 5
 }

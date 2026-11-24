@@ -18,6 +18,8 @@ $script:LastBHistoryStateByLeaf = @{}
 $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 # Remote commands.txt "break" — show break dialog + lock on the next monitor poll.
 $script:PendingBreakRequested = $false
+# Remote commands.txt "disable-break" — disable hourly forced rest for today.
+$script:PendingDisableForcedBreak = $false
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
@@ -2834,10 +2836,11 @@ function Apply-PendingCumulativeResets {
 function Invoke-ScpRemoteCommandsFile {
     <#
       Read LogDirectory\commands\commands.txt line by line, interpret/execute
-      supported commands (update, restart, reset, break), write a set -x style
-      transcript, email the transcript, then delete the downloaded file.
-      Returns: WantUpdate / WantRestart / WantBreak / ResetSpecs (terminating
-      actions deferred until after remote empty-PUT and email).
+      supported commands (update, restart, reset, break, disable-break), write a
+      set -x style transcript, email the transcript, then delete the downloaded
+      file. Returns: WantUpdate / WantRestart / WantBreak /
+      WantDisableForcedBreak / ResetSpecs (terminating actions deferred until
+      after remote empty-PUT and email).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -2846,11 +2849,12 @@ function Invoke-ScpRemoteCommandsFile {
     )
 
     $result = [pscustomobject]@{
-        WantUpdate  = $false
-        WantRestart = $false
-        WantBreak   = $false
-        ResetSpecs  = New-Object System.Collections.ArrayList
-        RanAny      = $false
+        WantUpdate             = $false
+        WantRestart            = $false
+        WantBreak              = $false
+        WantDisableForcedBreak = $false
+        ResetSpecs             = New-Object System.Collections.ArrayList
+        RanAny                 = $false
     }
 
     if (-not (Test-Path -LiteralPath $InboxFile -PathType Leaf)) {
@@ -2952,6 +2956,20 @@ function Invoke-ScpRemoteCommandsFile {
                 if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
                     Write-DebugLog -Source 'Break' -Message (
                         "commands.txt line {0}: verb=break queued (WantBreak=true)" -f $lineNo)
+                }
+            }
+            'disable-break' {
+                if ($args.Count -gt 0) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: disable-break ignores args (expected none)" -f $lineNo)
+                }
+                $result.RanAny = $true
+                $result.WantDisableForcedBreak = $true
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: disable-break (skip hourly forced rest for today)')
+                if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                    Write-DebugLog -Source 'UnlockQuota' -Message (
+                        "commands.txt line {0}: verb=disable-break queued (WantDisableForcedBreak=true)" -f $lineNo)
                 }
             }
             default {
@@ -3366,11 +3384,12 @@ function Invoke-ScpCommandsFileExchange {
     }
 
     $cmdResult = [pscustomobject]@{
-        WantUpdate  = $false
-        WantRestart = $false
-        WantBreak   = $false
-        ResetSpecs  = New-Object System.Collections.ArrayList
-        RanAny      = $false
+        WantUpdate             = $false
+        WantRestart            = $false
+        WantBreak              = $false
+        WantDisableForcedBreak = $false
+        ResetSpecs             = New-Object System.Collections.ArrayList
+        RanAny                 = $false
     }
     if ($downloaded -and -not $remoteMissing -and $downloadedBytes -gt 0) {
         try {
@@ -3480,6 +3499,20 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
+    # disable-break: skip hourly Twoje-oczy forced rest for the current calendar day.
+    $disableBreakQueued = $false
+    if ($null -ne $cmdResult.PSObject.Properties['WantDisableForcedBreak'] -and
+        [bool]$cmdResult.WantDisableForcedBreak) {
+        $script:PendingDisableForcedBreak = $true
+        $disableBreakQueued = $true
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'execute: disable-break queued for next monitor poll (today only; auto re-enable next day)')
+        if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+            Write-DebugLog -Source 'UnlockQuota' -Message (
+                'PendingDisableForcedBreak=true (commands exchange); will Apply-PendingDisableForcedBreak on poll')
+        }
+    }
+
     # Refresh summary lines so the email body matches the queue/skip decision.
     $emailBody = @(
         'LoginTimeLogger remote commands.txt was processed.'
@@ -3498,6 +3531,12 @@ function Invoke-ScpCommandsFileExchange {
             else { $false }))
         ('BreakQueued: {0}' -f $breakQueued)
         ('BreakSkippedAlreadyLocked: {0}' -f $breakSkippedLocked)
+        ('WantDisableForcedBreak: {0}' -f $(
+            if ($null -ne $cmdResult.PSObject.Properties['WantDisableForcedBreak']) {
+                [bool]$cmdResult.WantDisableForcedBreak
+            }
+            else { $false }))
+        ('DisableBreakQueued: {0}' -f $disableBreakQueued)
         ('ResetCount: {0}' -f $resetCount)
     ) -join [Environment]::NewLine
 

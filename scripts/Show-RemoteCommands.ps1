@@ -51,6 +51,11 @@ $commands = @(
         Arguments   = '(none)'
         Description = 'Show a topmost countdown on the target user''s desktop (message "PRZERWA! - chodź do nas!", current cumulative unlocked time, 5s timer), then lock the screen - same flow as the unlock-quota warning, different message. Ignored when the target session is already locked (commands-run email still sent).'
     }
+    [pscustomobject]@{
+        Command     = 'disable-break'
+        Arguments   = '(none)'
+        Description = 'Disable the hourly forced rest (Twoje oczy unlock-quota + minimum 5 min of actual locked screen time) for the current calendar day only. Cleared automatically at midnight / next day rollover so forced breaks resume without another command. Cancels any in-progress minimum-break lock window.'
+    }
 )
 
 Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
@@ -75,5 +80,6 @@ Write-Host '  reset 01:30:00'
 Write-Host '  reset +00:15:00'
 Write-Host '  reset -00:10:00'
 Write-Host '  break'
+Write-Host '  disable-break'
 Write-Host '  update'
 Write-Host '  reset 0'
