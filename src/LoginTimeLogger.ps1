@@ -23,6 +23,8 @@ $script:InstallRoot = $null
 $script:PendingBreakAttempts = 0
 # Remote "disable-break" — applied on next poll to state (today only).
 $script:PendingDisableForcedBreak = $false
+# Remote "setUnlockQuotaEnabled [true|false]" — persist UnlockQuotaEnabled ($null = none).
+$script:PendingUnlockQuotaEnabled = $null
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -1239,6 +1241,91 @@ function Apply-PendingDisableForcedBreak {
     return $State
 }
 
+function Set-RuntimeUnlockQuotaEnabled {
+    <#
+      Persist UnlockQuotaEnabled into the installed runtime config.json (in place).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][bool]$Enabled
+    )
+
+    $configPath = ''
+    try { $configPath = [string]$Config.ConfigPath } catch { $configPath = '' }
+    if ([string]::IsNullOrWhiteSpace($configPath) -or -not (Test-Path -LiteralPath $configPath)) {
+        throw ("Runtime config.json missing: '{0}'" -f $configPath)
+    }
+
+    $rawText = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 -ErrorAction Stop
+    $obj = $rawText | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $obj) {
+        throw ("Runtime config.json is empty/invalid: '{0}'" -f $configPath)
+    }
+
+    if ($null -ne $obj.PSObject.Properties['UnlockQuotaEnabled']) {
+        $obj.UnlockQuotaEnabled = [bool]$Enabled
+    }
+    else {
+        $obj | Add-Member -NotePropertyName 'UnlockQuotaEnabled' -NotePropertyValue ([bool]$Enabled) -Force
+    }
+
+    $jsonText = $obj | ConvertTo-Json -Depth 12
+    if (Get-Command Write-JsonFilePreserveAcl -ErrorAction SilentlyContinue) {
+        Write-JsonFilePreserveAcl -DestPath $configPath -JsonText $jsonText
+    }
+    else {
+        Set-Content -LiteralPath $configPath -Value $jsonText -Encoding UTF8
+    }
+}
+
+function Apply-PendingUnlockQuotaEnabled {
+    <#
+      Remote commands.txt "setUnlockQuotaEnabled [true|false]":
+      update live config + persist UnlockQuotaEnabled (default true when arg omitted).
+      When disabling, clears any in-progress ForcedBreakRemainingSeconds window.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$DailyLogPath
+    )
+
+    if ($null -eq $script:PendingUnlockQuotaEnabled) {
+        return @{ State = $State; Config = $Config }
+    }
+
+    $enabled = [bool]$script:PendingUnlockQuotaEnabled
+
+    Set-RuntimeUnlockQuotaEnabled -Config $Config -Enabled $enabled
+    $Config.UnlockQuotaEnabled = $enabled
+    $script:PendingUnlockQuotaEnabled = $null
+
+    if (-not $enabled) {
+        $State = New-LoggerStateObject `
+            -Date $State.Date `
+            -UnlockedSecondsToday $State.UnlockedSecondsToday `
+            -LastUnlocked $State.LastUnlocked `
+            -LastTransitionUtc $State.LastTransitionUtc `
+            -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
+            -InstalledCommitSha $State.InstalledCommitSha `
+            -ForcedBreakDisabledDate $State.ForcedBreakDisabledDate `
+            -ForcedBreakRemainingSeconds 0
+    }
+
+    $line = '{0:yyyy-MM-dd HH:mm:ss} | SET_UNLOCK_QUOTA_ENABLED | enabled={1} | cumulative_today={2}' -f `
+        (Get-Date), $(if ($enabled) { 'true' } else { 'false' }), (Format-Duration $State.UnlockedSecondsToday)
+    try {
+        Write-DailyLogLine -Path $DailyLogPath -Line $line
+    }
+    catch { }
+    Write-LoggerEvent ("UnlockQuotaEnabled set to {0} (remote setUnlockQuotaEnabled)." -f `
+            $(if ($enabled) { 'true' } else { 'false' }))
+    Write-DebugLog -Source 'UnlockQuota' -Message (
+        "setUnlockQuotaEnabled applied; UnlockQuotaEnabled={0}" -f $(if ($enabled) { 'true' } else { 'false' }))
+
+    return @{ State = $State; Config = $Config }
+}
+
 function Apply-PendingRemoteBreak {
     <#
       After remote commands.txt "break": show the break dialog on the target
@@ -2054,6 +2141,24 @@ while ($true) {
             catch {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
                     'Apply-PendingDisableForcedBreak failed')
+            }
+        }
+
+        # Remote commands.txt "setUnlockQuotaEnabled [true|false]" — persist + live apply.
+        if ($null -ne $script:PendingUnlockQuotaEnabled -and
+            (Get-Command Apply-PendingUnlockQuotaEnabled -ErrorAction SilentlyContinue)) {
+            try {
+                $applied = Apply-PendingUnlockQuotaEnabled `
+                    -State $state `
+                    -Config $config `
+                    -DailyLogPath $dailyPath
+                $state = $applied.State
+                $config = $applied.Config
+                Write-State -Path $statePath -State $state
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'Apply-PendingUnlockQuotaEnabled failed')
             }
         }
 

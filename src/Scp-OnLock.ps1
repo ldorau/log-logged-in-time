@@ -20,6 +20,9 @@ $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 $script:PendingBreakRequested = $false
 # Remote commands.txt "disable-break" — disable hourly forced rest for today.
 $script:PendingDisableForcedBreak = $false
+# Remote commands.txt "setUnlockQuotaEnabled [true|false]" — persist UnlockQuotaEnabled.
+# $null = none pending; otherwise [bool] to apply on the next monitor poll.
+$script:PendingUnlockQuotaEnabled = $null
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
@@ -2836,10 +2839,11 @@ function Apply-PendingCumulativeResets {
 function Invoke-ScpRemoteCommandsFile {
     <#
       Read LogDirectory\commands\commands.txt line by line, interpret/execute
-      supported commands (update, restart, reset, break, disable-break), write a
-      set -x style transcript, email the transcript, then delete the downloaded
-      file. Returns: WantUpdate / WantRestart / WantBreak /
-      WantDisableForcedBreak / ResetSpecs (terminating actions deferred until
+      supported commands (update, restart, reset, break, disable-break,
+      setUnlockQuotaEnabled), write a set -x style transcript, email the
+      transcript, then delete the downloaded file. Returns: WantUpdate /
+      WantRestart / WantBreak / WantDisableForcedBreak /
+      UnlockQuotaEnabledValue / ResetSpecs (terminating actions deferred until
       after remote empty-PUT and email).
     #>
     param(
@@ -2853,6 +2857,7 @@ function Invoke-ScpRemoteCommandsFile {
         WantRestart            = $false
         WantBreak              = $false
         WantDisableForcedBreak = $false
+        UnlockQuotaEnabledValue = $null
         ResetSpecs             = New-Object System.Collections.ArrayList
         RanAny                 = $false
     }
@@ -2970,6 +2975,35 @@ function Invoke-ScpRemoteCommandsFile {
                 if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
                     Write-DebugLog -Source 'UnlockQuota' -Message (
                         "commands.txt line {0}: verb=disable-break queued (WantDisableForcedBreak=true)" -f $lineNo)
+                }
+            }
+            'setunlockquotaenabled' {
+                $enabled = $true
+                if ($args.Count -gt 1) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: setUnlockQuotaEnabled ignores extra args after true|false" -f $lineNo)
+                }
+                if ($args.Count -ge 1) {
+                    $argKey = ([string]$args[0]).Trim().ToLowerInvariant()
+                    switch ($argKey) {
+                        { $_ -in @('true', '1', 'yes', 'on') } { $enabled = $true }
+                        { $_ -in @('false', '0', 'no', 'off') } { $enabled = $false }
+                        default {
+                            Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                                "interpret line {0}: setUnlockQuotaEnabled rejected arg '{1}' (expected true|false)" -f `
+                                    $lineNo, $args[0])
+                            continue
+                        }
+                    }
+                }
+                $result.RanAny = $true
+                $result.UnlockQuotaEnabledValue = [bool]$enabled
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    "queue execute: setUnlockQuotaEnabled {0}" -f $(if ($enabled) { 'true' } else { 'false' }))
+                if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                    Write-DebugLog -Source 'UnlockQuota' -Message (
+                        "commands.txt line {0}: verb=setUnlockQuotaEnabled queued ({1})" -f `
+                            $lineNo, $(if ($enabled) { 'true' } else { 'false' }))
                 }
             }
             default {
@@ -3384,12 +3418,13 @@ function Invoke-ScpCommandsFileExchange {
     }
 
     $cmdResult = [pscustomobject]@{
-        WantUpdate             = $false
-        WantRestart            = $false
-        WantBreak              = $false
-        WantDisableForcedBreak = $false
-        ResetSpecs             = New-Object System.Collections.ArrayList
-        RanAny                 = $false
+        WantUpdate              = $false
+        WantRestart             = $false
+        WantBreak               = $false
+        WantDisableForcedBreak  = $false
+        UnlockQuotaEnabledValue = $null
+        ResetSpecs              = New-Object System.Collections.ArrayList
+        RanAny                  = $false
     }
     if ($downloaded -and -not $remoteMissing -and $downloadedBytes -gt 0) {
         try {
@@ -3513,6 +3548,24 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
+    # setUnlockQuotaEnabled: persist UnlockQuotaEnabled in runtime config (default true).
+    $setUnlockQuotaQueued = $false
+    $setUnlockQuotaValue = $null
+    if ($null -ne $cmdResult.PSObject.Properties['UnlockQuotaEnabledValue'] -and
+        $null -ne $cmdResult.UnlockQuotaEnabledValue) {
+        $script:PendingUnlockQuotaEnabled = [bool]$cmdResult.UnlockQuotaEnabledValue
+        $setUnlockQuotaQueued = $true
+        $setUnlockQuotaValue = [bool]$cmdResult.UnlockQuotaEnabledValue
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            "execute: setUnlockQuotaEnabled {0} queued for next monitor poll (persist to config.json)" -f `
+                $(if ($setUnlockQuotaValue) { 'true' } else { 'false' }))
+        if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+            Write-DebugLog -Source 'UnlockQuota' -Message (
+                "PendingUnlockQuotaEnabled={0} (commands exchange); will Apply-PendingUnlockQuotaEnabled on poll" -f `
+                    $(if ($setUnlockQuotaValue) { 'true' } else { 'false' }))
+        }
+    }
+
     # Refresh summary lines so the email body matches the queue/skip decision.
     $emailBody = @(
         'LoginTimeLogger remote commands.txt was processed.'
@@ -3537,6 +3590,11 @@ function Invoke-ScpCommandsFileExchange {
             }
             else { $false }))
         ('DisableBreakQueued: {0}' -f $disableBreakQueued)
+        ('SetUnlockQuotaEnabledQueued: {0}' -f $setUnlockQuotaQueued)
+        ('SetUnlockQuotaEnabledValue: {0}' -f $(
+            if ($null -eq $setUnlockQuotaValue) { '(none)' }
+            elseif ($setUnlockQuotaValue) { 'true' }
+            else { 'false' }))
         ('ResetCount: {0}' -f $resetCount)
     ) -join [Environment]::NewLine
 

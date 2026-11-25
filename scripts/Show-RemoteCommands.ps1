@@ -56,6 +56,11 @@ $commands = @(
         Arguments   = '(none)'
         Description = 'Disable the hourly forced rest (Twoje oczy unlock-quota + minimum 5 min of actual locked screen time) for the current calendar day only. Cleared automatically at midnight / next day rollover so forced breaks resume without another command. Cancels any in-progress minimum-break lock window.'
     }
+    [pscustomobject]@{
+        Command     = 'setUnlockQuotaEnabled'
+        Arguments   = '[true|false]'
+        Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to true. false turns off hourly Twoje-oczy forced locks until set true again (also cancels any in-progress minimum-break window). Unlike disable-break, this survives day rollover.'
+    }
 )
 
 Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
@@ -81,5 +86,8 @@ Write-Host '  reset +00:15:00'
 Write-Host '  reset -00:10:00'
 Write-Host '  break'
 Write-Host '  disable-break'
+Write-Host '  setUnlockQuotaEnabled'
+Write-Host '  setUnlockQuotaEnabled false'
+Write-Host '  setUnlockQuotaEnabled true'
 Write-Host '  update'
 Write-Host '  reset 0'
