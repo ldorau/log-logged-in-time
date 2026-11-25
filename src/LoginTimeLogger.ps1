@@ -21,8 +21,11 @@ $script:InstanceMutex = $null
 $script:InstallRoot = $null
 # Remote "break" launch retries (cleared only after success or max attempts).
 $script:PendingBreakAttempts = 0
-# Remote "disable-break" — applied on next poll to state (today only).
+# Remote "disable-break" — applied on next poll to live state (today only).
 $script:PendingDisableForcedBreak = $false
+# True when disable-break was already written to state.json during commands exchange
+# (so Apply-PendingDisableForcedBreak only syncs live $state and skips a second day-log line).
+$script:DisableForcedBreakDiskSaved = $false
 # Remote "setUnlockQuotaEnabled [t|f]" — persist UnlockQuotaEnabled ($null = none).
 $script:PendingUnlockQuotaEnabled = $null
 
@@ -1201,10 +1204,83 @@ function Get-ForcedBreakRemainingSeconds {
     }
 }
 
+function Save-DisableForcedBreakToStateFile {
+    <#
+      Persist remote "disable-break" into state.json immediately (before update/
+      restart can wipe in-memory PendingDisableForcedBreak). Sets
+      ForcedBreakDisabledDate=today and clears ForcedBreakRemainingSeconds.
+      Cleared automatically on the next calendar day (ConvertTo / day rollover).
+      Returns $true when state.json was written.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $logDir = ''
+    try { $logDir = [string]$Config.LogDirectory } catch { $logDir = '' }
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        throw 'LogDirectory missing; cannot persist disable-break to state.json.'
+    }
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    $statePath = Get-StatePath -LogDirectory $logDir
+    $quotaMinutes = 60
+    try {
+        if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
+            $quotaMinutes = [int]$Config.UnlockQuotaMinutes
+        }
+    }
+    catch { $quotaMinutes = 60 }
+
+    $state = New-LoggerStateObject
+    if (Get-Command Read-State -ErrorAction SilentlyContinue) {
+        $state = ConvertTo-LoggerStateObject `
+            -State (Read-State -Path $statePath -UnlockQuotaMinutes $quotaMinutes) `
+            -UnlockQuotaMinutes $quotaMinutes
+    }
+
+    $already = $false
+    try {
+        $already = (-not [string]::IsNullOrWhiteSpace([string]$state.ForcedBreakDisabledDate) -and
+            [string]$state.ForcedBreakDisabledDate -eq $today)
+    }
+    catch { $already = $false }
+
+    $state = New-LoggerStateObject `
+        -Date $(if ([string]::IsNullOrWhiteSpace([string]$state.Date)) { $today } else { [string]$state.Date }) `
+        -UnlockedSecondsToday $state.UnlockedSecondsToday `
+        -LastUnlocked $state.LastUnlocked `
+        -LastTransitionUtc $state.LastTransitionUtc `
+        -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
+        -InstalledCommitSha $state.InstalledCommitSha `
+        -ForcedBreakDisabledDate $today `
+        -ForcedBreakRemainingSeconds 0
+
+    Write-State -Path $statePath -State $state
+    $script:DisableForcedBreakDiskSaved = $true
+
+    if (-not $already) {
+        $dailyPath = Get-DailyLogPath -LogDirectory $logDir -Date (Get-Date)
+        $line = '{0:yyyy-MM-dd HH:mm:ss} | DISABLE_FORCED_BREAK | cumulative_today={1} | until_date={2}' -f `
+            (Get-Date), (Format-Duration $state.UnlockedSecondsToday), $today
+        try {
+            Write-DailyLogLine -Path $dailyPath -Line $line
+        }
+        catch { }
+        Write-LoggerEvent ("Forced hourly break disabled for {0} (remote disable-break; persisted to state.json)." -f $today)
+    }
+    else {
+        Write-LoggerEvent ("Forced hourly break already disabled for {0}; state.json refreshed." -f $today)
+    }
+    Write-DebugLog -Source 'UnlockQuota' -Message (
+        "disable-break persisted; ForcedBreakDisabledDate={0}; path={1}" -f $today, $statePath)
+    return $true
+}
+
 function Apply-PendingDisableForcedBreak {
     <#
-      Remote commands.txt "disable-break": skip hourly Twoje-oczy rest for today.
-      Cleared automatically on day rollover (ForcedBreakDisabledDate != Date).
+      Remote commands.txt "disable-break": sync live $state for today.
+      Prefer Save-DisableForcedBreakToStateFile during commands exchange (survives
+      update/restart). Cleared automatically on day rollover
+      (ForcedBreakDisabledDate != Date / fresh New-LoggerStateObject).
     #>
     param(
         [Parameter(Mandatory)]$State,
@@ -1219,6 +1295,10 @@ function Apply-PendingDisableForcedBreak {
     }
     $script:PendingDisableForcedBreak = $false
 
+    $diskSaved = $false
+    try { $diskSaved = [bool]$script:DisableForcedBreakDiskSaved } catch { $diskSaved = $false }
+    $script:DisableForcedBreakDiskSaved = $false
+
     $State = New-LoggerStateObject `
         -Date $State.Date `
         -UnlockedSecondsToday $State.UnlockedSecondsToday `
@@ -1229,15 +1309,19 @@ function Apply-PendingDisableForcedBreak {
         -ForcedBreakDisabledDate $Today `
         -ForcedBreakRemainingSeconds 0
 
-    $line = '{0:yyyy-MM-dd HH:mm:ss} | DISABLE_FORCED_BREAK | cumulative_today={1} | until_date={2}' -f `
-        (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $Today
-    try {
-        Write-DailyLogLine -Path $DailyLogPath -Line $line
+    if (-not $diskSaved) {
+        # Fallback when exchange could not persist (or pending-only path).
+        $line = '{0:yyyy-MM-dd HH:mm:ss} | DISABLE_FORCED_BREAK | cumulative_today={1} | until_date={2}' -f `
+            (Get-Date), (Format-Duration $State.UnlockedSecondsToday), $Today
+        try {
+            Write-DailyLogLine -Path $DailyLogPath -Line $line
+        }
+        catch { }
+        Write-LoggerEvent ("Forced hourly break disabled for {0} (remote disable-break)." -f $Today)
     }
-    catch { }
-    Write-LoggerEvent ("Forced hourly break disabled for {0} (remote disable-break)." -f $Today)
     Write-DebugLog -Source 'UnlockQuota' -Message (
-        "disable-break applied; ForcedBreakDisabledDate={0}" -f $Today)
+        "disable-break applied to live state; ForcedBreakDisabledDate={0}; diskSaved={1}" -f `
+            $Today, $diskSaved)
     return $State
 }
 

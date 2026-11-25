@@ -54,7 +54,7 @@ $commands = @(
     [pscustomobject]@{
         Command     = 'disable-break'
         Arguments   = '(none)'
-        Description = 'Disable the hourly forced rest (Twoje oczy unlock-quota + minimum 5 min of actual locked screen time) for the current calendar day only. Cleared automatically at midnight / next day rollover so forced breaks resume without another command. Cancels any in-progress minimum-break lock window.'
+        Description = 'Disable the hourly forced rest (Twoje oczy unlock-quota + minimum 5 min of actual locked screen time) for the current calendar day only. Persisted immediately to state.json (ForcedBreakDisabledDate) so it survives update/restart in the same commands.txt batch. Cleared automatically at midnight / next day rollover so forced breaks resume without another command. Cancels any in-progress minimum-break lock window.'
     }
     [pscustomobject]@{
         Command     = 'setUnlockQuotaEnabled'

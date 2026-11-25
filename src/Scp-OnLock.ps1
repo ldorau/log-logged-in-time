@@ -20,6 +20,8 @@ $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 $script:PendingBreakRequested = $false
 # Remote commands.txt "disable-break" — disable hourly forced rest for today.
 $script:PendingDisableForcedBreak = $false
+# Set when disable-break was written to state.json during commands exchange.
+$script:DisableForcedBreakDiskSaved = $false
 # Remote commands.txt "setUnlockQuotaEnabled [t|f]" — persist UnlockQuotaEnabled.
 # $null = none pending; otherwise [bool] to apply on the next monitor poll.
 $script:PendingUnlockQuotaEnabled = $null
@@ -3534,17 +3536,40 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
-    # disable-break: skip hourly Twoje-oczy forced rest for the current calendar day.
+    # disable-break: persist ForcedBreakDisabledDate to state.json NOW (before
+    # update/restart can wipe in-memory pending), then sync live $state on poll.
+    # Cleared automatically on the next calendar day.
     $disableBreakQueued = $false
+    $disableBreakPersisted = $false
     if ($null -ne $cmdResult.PSObject.Properties['WantDisableForcedBreak'] -and
         [bool]$cmdResult.WantDisableForcedBreak) {
         $script:PendingDisableForcedBreak = $true
         $disableBreakQueued = $true
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-            'execute: disable-break queued for next monitor poll (today only; auto re-enable next day)')
+        if (Get-Command Save-DisableForcedBreakToStateFile -ErrorAction SilentlyContinue) {
+            try {
+                $null = Save-DisableForcedBreakToStateFile -Config $Config
+                $disableBreakPersisted = $true
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    'execute: disable-break persisted to state.json (today only; cleared next day; survives update/restart)')
+                if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
+                    Write-DebugLog -Source 'UnlockQuota' -Message (
+                        'disable-break persisted to state.json during commands exchange')
+                }
+            }
+            catch {
+                $script:DisableForcedBreakDiskSaved = $false
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                    "execute: disable-break state.json persist failed; will retry on poll: {0}" -f `
+                        $_.Exception.Message)
+            }
+        }
+        else {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                'execute: disable-break queued for next monitor poll (Save-DisableForcedBreakToStateFile unavailable)')
+        }
         if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
             Write-DebugLog -Source 'UnlockQuota' -Message (
-                'PendingDisableForcedBreak=true (commands exchange); will Apply-PendingDisableForcedBreak on poll')
+                "PendingDisableForcedBreak=true; diskPersisted={0}" -f $disableBreakPersisted)
         }
     }
 
@@ -3590,6 +3615,7 @@ function Invoke-ScpCommandsFileExchange {
             }
             else { $false }))
         ('DisableBreakQueued: {0}' -f $disableBreakQueued)
+        ('DisableBreakPersistedToState: {0}' -f $disableBreakPersisted)
         ('SetUnlockQuotaEnabledQueued: {0}' -f $setUnlockQuotaQueued)
         ('SetUnlockQuotaEnabledValue: {0}' -f $(
             if ($null -eq $setUnlockQuotaValue) { '(none)' }
