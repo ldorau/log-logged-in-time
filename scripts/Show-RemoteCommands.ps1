@@ -58,8 +58,8 @@ $commands = @(
     }
     [pscustomobject]@{
         Command     = 'setUnlockQuotaEnabled'
-        Arguments   = '[true|false]'
-        Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to true. false turns off hourly Twoje-oczy forced locks until set true again (also cancels any in-progress minimum-break window). Unlike disable-break, this survives day rollover.'
+        Arguments   = '[t|f]'
+        Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to t (true). f turns off hourly Twoje-oczy forced locks until set to t again (also cancels any in-progress minimum-break window). Unlike disable-break, this survives day rollover.'
     }
 )
 
@@ -87,7 +87,7 @@ Write-Host '  reset -00:10:00'
 Write-Host '  break'
 Write-Host '  disable-break'
 Write-Host '  setUnlockQuotaEnabled'
-Write-Host '  setUnlockQuotaEnabled false'
-Write-Host '  setUnlockQuotaEnabled true'
+Write-Host '  setUnlockQuotaEnabled f'
+Write-Host '  setUnlockQuotaEnabled t'
 Write-Host '  update'
 Write-Host '  reset 0'

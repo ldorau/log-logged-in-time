@@ -23,7 +23,7 @@ $script:InstallRoot = $null
 $script:PendingBreakAttempts = 0
 # Remote "disable-break" — applied on next poll to state (today only).
 $script:PendingDisableForcedBreak = $false
-# Remote "setUnlockQuotaEnabled [true|false]" — persist UnlockQuotaEnabled ($null = none).
+# Remote "setUnlockQuotaEnabled [t|f]" — persist UnlockQuotaEnabled ($null = none).
 $script:PendingUnlockQuotaEnabled = $null
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -1280,8 +1280,8 @@ function Set-RuntimeUnlockQuotaEnabled {
 
 function Apply-PendingUnlockQuotaEnabled {
     <#
-      Remote commands.txt "setUnlockQuotaEnabled [true|false]":
-      update live config + persist UnlockQuotaEnabled (default true when arg omitted).
+      Remote commands.txt "setUnlockQuotaEnabled [t|f]":
+      update live config + persist UnlockQuotaEnabled (default t when arg omitted).
       When disabling, clears any in-progress ForcedBreakRemainingSeconds window.
     #>
     param(
@@ -2144,7 +2144,7 @@ while ($true) {
             }
         }
 
-        # Remote commands.txt "setUnlockQuotaEnabled [true|false]" — persist + live apply.
+        # Remote commands.txt "setUnlockQuotaEnabled [t|f]" — persist + live apply.
         if ($null -ne $script:PendingUnlockQuotaEnabled -and
             (Get-Command Apply-PendingUnlockQuotaEnabled -ErrorAction SilentlyContinue)) {
             try {
