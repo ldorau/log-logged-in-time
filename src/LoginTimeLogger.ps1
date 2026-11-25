@@ -943,6 +943,7 @@ function Get-UnlockQuotaWarningEncodedLaunchArgs {
         [Parameter(Mandatory)][int]$CountdownSeconds,
         [switch]$BreakMessage,
         [double]$UnlockedSeconds = -1,
+        [int]$MinBreakMinutes = 5,
         [string]$DebugLogPath = ''
     )
 
@@ -957,6 +958,7 @@ function Get-UnlockQuotaWarningEncodedLaunchArgs {
 
     $dbgEsc = ([string]$DebugLogPath) -replace "'", "''"
     $bmLit = if ($BreakMessage) { '$true' } else { '$false' }
+    if ($MinBreakMinutes -lt 1) { $MinBreakMinutes = 5 }
     $prelude = @(
         'Set-StrictMode -Version Latest'
         '$ErrorActionPreference = ''Stop'''
@@ -964,6 +966,7 @@ function Get-UnlockQuotaWarningEncodedLaunchArgs {
         ('$CountdownSeconds = {0}' -f [int]$CountdownSeconds)
         ('$BreakMessage = [bool]({0})' -f $bmLit)
         ('$UnlockedSeconds = [double]{0}' -f ([double]$UnlockedSeconds))
+        ('$MinBreakMinutes = {0}' -f [int]$MinBreakMinutes)
         ("`$DebugLogPath = '{0}'" -f $dbgEsc)
     ) -join [Environment]::NewLine
 
@@ -1039,6 +1042,14 @@ function Invoke-UnlockQuotaWarningAndLock {
         $seconds = [int]$Config.UnlockQuotaWarnSeconds
     }
     if ($seconds -lt 1) { $seconds = 3 }
+    $minBreakMinutes = 5
+    try {
+        if ($null -ne $Config.UnlockQuotaMinBreakMinutes -and
+            [int]$Config.UnlockQuotaMinBreakMinutes -gt 0) {
+            $minBreakMinutes = [int]$Config.UnlockQuotaMinBreakMinutes
+        }
+    }
+    catch { $minBreakMinutes = 5 }
 
     # UI debug log must be writable by the target user (LogDirectory is denied).
     # Prefer same directory as the staged script (user LocalAppData or ProgramData\ui).
@@ -1070,8 +1081,8 @@ function Invoke-UnlockQuotaWarningAndLock {
 
     # Always show the interactive desktop UI: no -WindowStyle Hidden, and
     # LaunchInUserSession(showWindow=true) so CREATE_NO_WINDOW is not set.
-    $arguments = '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2}' -f `
-        $launchScript, $ElapsedMinutes, $seconds
+    $arguments = '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -Minutes {1} -CountdownSeconds {2} -MinBreakMinutes {3}' -f `
+        $launchScript, $ElapsedMinutes, $seconds, $minBreakMinutes
     if ($BreakMessage) {
         $arguments += ' -BreakMessage'
     }
@@ -1112,6 +1123,7 @@ function Invoke-UnlockQuotaWarningAndLock {
                 -CountdownSeconds $seconds `
                 -BreakMessage:$BreakMessage `
                 -UnlockedSeconds $UnlockedSeconds `
+                -MinBreakMinutes $minBreakMinutes `
                 -DebugLogPath $uiDebugLog
             $launchError2 = ''
             $ok = [SessionQuery]::LaunchInUserSession(

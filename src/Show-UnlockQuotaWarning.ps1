@@ -15,6 +15,8 @@ param(
     [switch]$BreakMessage,
     # When >= 0, display this cumulative unlocked time (seconds) as HH:MM:SS.
     [double]$UnlockedSeconds = -1,
+    # Mandatory locked break length shown above "Twoje OCZY..." (quota mode).
+    [int]$MinBreakMinutes = 5,
     # Optional path for debug traces (LogDirectory\debug.log from the monitor).
     [string]$DebugLogPath = ''
 )
@@ -38,13 +40,14 @@ function Write-UnlockWarnDebug {
 }
 
 Write-UnlockWarnDebug (
-    "start; BreakMessage={0}; Minutes={1}; CountdownSeconds={2}; UnlockedSeconds={3}; User={4}; SessionId={5}" -f `
-        [bool]$BreakMessage, $Minutes, $CountdownSeconds, $UnlockedSeconds,
+    "start; BreakMessage={0}; Minutes={1}; CountdownSeconds={2}; UnlockedSeconds={3}; MinBreakMinutes={4}; User={5}; SessionId={6}" -f `
+        [bool]$BreakMessage, $Minutes, $CountdownSeconds, $UnlockedSeconds, $MinBreakMinutes,
     $env:USERNAME, $env:SESSIONNAME)
 
 if ($Minutes -lt 1) { $Minutes = 30 }
 if ($CountdownSeconds -lt 1) { $CountdownSeconds = 3 }
 if ($CountdownSeconds -gt 60) { $CountdownSeconds = 60 }
+if ($MinBreakMinutes -lt 1) { $MinBreakMinutes = 5 }
 
 # Prefer full cumulative seconds when provided; else H:MM from -Minutes.
 if ($UnlockedSeconds -ge 0) {
@@ -94,7 +97,7 @@ $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::FromArgb(32, 32, 36)
 $form.ForeColor = [System.Drawing.Color]::White
-$form.ClientSize = New-Object System.Drawing.Size(560, 300)
+$form.ClientSize = New-Object System.Drawing.Size(560, $(if ($BreakMessage) { 300 } else { 356 }))
 $form.KeyPreview = $true
 # Swallow keys so the dialog stays modal/blocking for the countdown.
 $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
@@ -102,8 +105,9 @@ $form.Add_KeyDown({ $_.SuppressKeyPress = $true })
 # Layout (top -> bottom):
 #   1) "Unlocked time so far:" / "Cumulative unlocked time:"
 #   2) current unlocked time (H:MM or HH:MM:SS)
-#   3) rest/break message
-#   4) countdown footer ("Screen will lock in N s...")
+#   3) "Przerwa N minut!" (quota mode only)
+#   4) rest/break message ("Twoje OCZY..." / "PRZERWA!")
+#   5) countdown footer ("Screen will lock in N s...")
 
 $title = New-Object System.Windows.Forms.Label
 $title.AutoSize = $false
@@ -123,6 +127,19 @@ $elapsedLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $elapsedLabel.Font = New-Object System.Drawing.Font('Segoe UI', 36, [System.Drawing.FontStyle]::Bold)
 $elapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 196, 0)
 $elapsedLabel.Text = $elapsedHm
+
+$przerwaMessage = $null
+if (-not $BreakMessage) {
+    $przerwaMessage = New-Object System.Windows.Forms.Label
+    $przerwaMessage.AutoSize = $false
+    $przerwaMessage.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $przerwaMessage.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $przerwaMessage.Height = 56
+    $przerwaMessage.Font = New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
+    $przerwaMessage.Text = ('Przerwa {0} minut!' -f $MinBreakMinutes)
+    $przerwaMessage.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
+    $przerwaMessage.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 0)
+}
 
 $restMessage = New-Object System.Windows.Forms.Label
 $restMessage.AutoSize = $false
@@ -153,9 +170,12 @@ $footer.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
 $footer.Text = ('Screen will lock in {0} s...' -f $CountdownSeconds)
 
 # WinForms docks in reverse z-order (last added = outermost edge).
-# Add Polish Bottom first, then countdown Bottom last so the timer sits
-# below "Twoje OCZY..."; Top last so title claims the top edge.
+# Quota: Przerwa Bottom, then Twoje OCZY Bottom, then countdown Bottom last
+# so the timer sits at the edge under "Twoje OCZY..."; Top last for title.
 $form.Controls.Add($elapsedLabel)
+if ($null -ne $przerwaMessage) {
+    $form.Controls.Add($przerwaMessage)
+}
 $form.Controls.Add($restMessage)
 $form.Controls.Add($footer)
 $form.Controls.Add($title)
