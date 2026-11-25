@@ -2778,7 +2778,7 @@ function Apply-PendingCumulativeResets {
     $pending = @($script:PendingCumulativeResets.ToArray())
     $script:PendingCumulativeResets = New-Object System.Collections.ArrayList
 
-    $quotaMinutes = 30
+    $quotaMinutes = 60
     try {
         if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
             $quotaMinutes = [int]$Config.UnlockQuotaMinutes
@@ -2997,6 +2997,14 @@ function Invoke-ScpRemoteCommandsFile {
                             continue
                         }
                     }
+                }
+                if ($null -ne $result.UnlockQuotaEnabledValue) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        ("interpret line {0}: multiple setUnlockQuotaEnabled lines; " +
+                            "overwriting previous queued value ({1}) with {2}") -f `
+                            $lineNo,
+                        $(if ([bool]$result.UnlockQuotaEnabledValue) { 't' } else { 'f' }),
+                        $(if ($enabled) { 't' } else { 'f' }))
                 }
                 $result.RanAny = $true
                 $result.UnlockQuotaEnabledValue = [bool]$enabled

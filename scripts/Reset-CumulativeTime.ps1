@@ -218,7 +218,7 @@ try {
     }
     catch { }
 
-    $unlockQuotaMinutes = 30
+    $unlockQuotaMinutes = 60
     $logDirectory = Join-Path $administratorProfile 'LoginTimeLogs'
     if (Test-Path -LiteralPath $resolvedConfigPath) {
         $raw = Get-Content -LiteralPath $resolvedConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -311,6 +311,11 @@ try {
     $installedCommitSha = ''
     $lastUnlocked = $false
     $lastTransitionUtc = $null
+    $forcedBreakDisabledDate = ''
+    $forcedBreakRemainingSeconds = 0.0
+    $pendingUnlockQuotaEnabled = $null
+    $currentLockStartUtc = $null
+    $lockIntervals = @()
     if (Test-Path -LiteralPath $statePath) {
         try {
             $existing = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -324,6 +329,32 @@ try {
                 try { $lastUnlocked = [bool]$lu } catch { $lastUnlocked = $false }
             }
             $lastTransitionUtc = Get-OptionalPropertyValue -InputObject $existing -Name 'LastTransitionUtc'
+            $forcedBreakDisabledDate = [string](Get-OptionalPropertyValue -InputObject $existing `
+                    -Name 'ForcedBreakDisabledDate')
+            if ($null -eq $forcedBreakDisabledDate) { $forcedBreakDisabledDate = '' }
+            $breakRemainRaw = Get-OptionalPropertyValue -InputObject $existing `
+                -Name 'ForcedBreakRemainingSeconds'
+            if ($null -ne $breakRemainRaw) {
+                try {
+                    $forcedBreakRemainingSeconds = [double]$breakRemainRaw
+                }
+                catch { $forcedBreakRemainingSeconds = 0.0 }
+            }
+            $pendingUqRaw = Get-OptionalPropertyValue -InputObject $existing `
+                -Name 'PendingUnlockQuotaEnabled'
+            if ($null -ne $pendingUqRaw) {
+                try { $pendingUnlockQuotaEnabled = [bool]$pendingUqRaw } catch {
+                    $pendingUnlockQuotaEnabled = $null
+                }
+            }
+            $lockStartRaw = Get-OptionalPropertyValue -InputObject $existing -Name 'CurrentLockStartUtc'
+            if ($null -ne $lockStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$lockStartRaw)) {
+                $currentLockStartUtc = [string]$lockStartRaw
+            }
+            $intervalsRaw = Get-OptionalPropertyValue -InputObject $existing -Name 'LockIntervals'
+            if ($null -ne $intervalsRaw) {
+                $lockIntervals = @($intervalsRaw)
+            }
         }
         catch {
             Write-Host ("WARNING: could not parse existing state.json; treating previous as 0. {0}" -f `
@@ -344,17 +375,27 @@ try {
     $quotaSeconds = [double]($unlockQuotaMinutes * 60)
     $newBucket = [int][Math]::Floor($newSeconds / $quotaSeconds)
 
+    # Only adjust cumulative + quota bucket; keep break/lock-tracking fields intact.
+    if ($lastUnlocked) {
+        $currentLockStartUtc = $null
+    }
+
     $newState = [pscustomobject]@{
-        Date                  = $today
-        UnlockedSecondsToday  = $newSeconds
-        LastUnlocked          = [bool]$lastUnlocked
-        LastTransitionUtc     = $(if ($null -ne $lastTransitionUtc -and
+        Date                        = $today
+        UnlockedSecondsToday        = $newSeconds
+        LastUnlocked                = [bool]$lastUnlocked
+        LastTransitionUtc           = $(if ($null -ne $lastTransitionUtc -and
                 -not [string]::IsNullOrWhiteSpace([string]$lastTransitionUtc)) {
                 [string]$lastTransitionUtc
             }
             else { $null })
-        LastUnlockQuotaBucket = $newBucket
-        InstalledCommitSha    = $(if ($null -eq $installedCommitSha) { '' } else { [string]$installedCommitSha })
+        LastUnlockQuotaBucket       = $newBucket
+        InstalledCommitSha          = $(if ($null -eq $installedCommitSha) { '' } else { [string]$installedCommitSha })
+        ForcedBreakDisabledDate     = [string]$forcedBreakDisabledDate
+        ForcedBreakRemainingSeconds = [double]$forcedBreakRemainingSeconds
+        PendingUnlockQuotaEnabled   = $pendingUnlockQuotaEnabled
+        CurrentLockStartUtc         = $currentLockStartUtc
+        LockIntervals               = @($lockIntervals)
     }
 
     Write-StateFileAtomic -Path $statePath -State $newState

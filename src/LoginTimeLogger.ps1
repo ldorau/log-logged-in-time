@@ -747,13 +747,19 @@ function ConvertTo-LoggerStateObject {
 
     $lockStartRaw = Get-OptionalPropertyValue -InputObject $State -Name 'CurrentLockStartUtc'
     $lockStart = $null
-    if ($null -ne $lockStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$lockStartRaw)) {
-        $lockStart = [string]$lockStartRaw
+    if ($lastUnlocked) {
+        # Unlocked: never keep a stale open-lock start (would inflate locked-window sums).
+        $lockStart = $null
     }
-    # If currently locked but CurrentLockStartUtc missing, seed from LastTransitionUtc.
-    if (-not $lastUnlocked -and [string]::IsNullOrWhiteSpace($lockStart) -and
-        -not [string]::IsNullOrWhiteSpace([string]$lastTransition)) {
-        $lockStart = [string]$lastTransition
+    else {
+        if ($null -ne $lockStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$lockStartRaw)) {
+            $lockStart = [string]$lockStartRaw
+        }
+        # If currently locked but CurrentLockStartUtc missing, seed from LastTransitionUtc.
+        if ([string]::IsNullOrWhiteSpace($lockStart) -and
+            -not [string]::IsNullOrWhiteSpace([string]$lastTransition)) {
+            $lockStart = [string]$lastTransition
+        }
     }
     $lockIntervals = Normalize-LockIntervals `
         -Raw (Get-OptionalPropertyValue -InputObject $State -Name 'LockIntervals')
@@ -802,9 +808,14 @@ function Get-LockedSecondsInWindow {
         }
     }
 
+    $isUnlocked = $true
+    try { $isUnlocked = [bool]$State.LastUnlocked } catch { $isUnlocked = $true }
     $curStartRaw = $null
     try { $curStartRaw = $State.CurrentLockStartUtc } catch { $curStartRaw = $null }
-    if ($null -ne $curStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$curStartRaw)) {
+    # Only count an open lock interval while currently locked.
+    if (-not $isUnlocked -and
+        $null -ne $curStartRaw -and
+        -not [string]::IsNullOrWhiteSpace([string]$curStartRaw)) {
         try {
             $s = [datetime]::Parse([string]$curStartRaw, $null,
                 [System.Globalization.DateTimeStyles]::RoundtripKind)
@@ -2269,18 +2280,17 @@ while ($true) {
             if ($state.UnlockedSecondsToday -gt 0 -or $state.LastUnlocked) {
                 Write-DayRollover -Config $config -State $state -EndedDate $state.Date
             }
-            # Preserve pending config write + recent lock intervals across day rollover.
+            # Reset day counters; keep session/lock tracking and in-progress min-break.
+            # ForcedBreakDisabledDate is day-scoped (cleared). LastUnlocked stays so we
+            # do not invent a lock->unlock transition at midnight.
             $pendingUqRoll = $null
             try { $pendingUqRoll = $state.PendingUnlockQuotaEnabled } catch { $pendingUqRoll = $null }
             $state = New-LoggerStateFrom -State $state -Set @{
-                Date                        = $today
-                UnlockedSecondsToday        = 0
-                LastUnlocked                = $false
-                LastTransitionUtc           = $null
-                LastUnlockQuotaBucket       = 0
-                ForcedBreakDisabledDate     = ''
-                ForcedBreakRemainingSeconds = 0
-                PendingUnlockQuotaEnabled   = $pendingUqRoll
+                Date                      = $today
+                UnlockedSecondsToday      = 0
+                LastUnlockQuotaBucket     = 0
+                ForcedBreakDisabledDate   = ''
+                PendingUnlockQuotaEnabled = $pendingUqRoll
             }
         }
 

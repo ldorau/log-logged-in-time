@@ -275,9 +275,12 @@ function Install-WindowsPython3 {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
 
+        # Prefer all-users install when elevated/SYSTEM so the monitor can find Python;
+        # per-user install is invisible to NT AUTHORITY\SYSTEM.
+        $installAllUsers = if (Test-RunningAsLocalSystemOrAdmin) { '1' } else { '0' }
         $installArgs = @(
             '/quiet',
-            'InstallAllUsers=0',
+            ("InstallAllUsers={0}" -f $installAllUsers),
             'PrependPath=1',
             'Include_test=0',
             'Include_launcher=1',
