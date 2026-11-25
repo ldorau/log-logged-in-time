@@ -554,7 +554,9 @@ function New-LoggerStateObject {
         [int]$LastUnlockQuotaBucket = 0,
         [string]$InstalledCommitSha = '',
         [string]$ForcedBreakDisabledDate = '',
-        [double]$ForcedBreakRemainingSeconds = 0
+        [double]$ForcedBreakRemainingSeconds = 0,
+        # $null = none; $true/$false = remote setUnlockQuotaEnabled pending config write.
+        [AllowNull()]$PendingUnlockQuotaEnabled = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
@@ -562,6 +564,10 @@ function New-LoggerStateObject {
     }
     if ($ForcedBreakRemainingSeconds -lt 0) {
         $ForcedBreakRemainingSeconds = 0
+    }
+    $pendingUq = $null
+    if ($null -ne $PendingUnlockQuotaEnabled) {
+        try { $pendingUq = [bool]$PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
     }
 
     return [pscustomobject]@{
@@ -575,6 +581,8 @@ function New-LoggerStateObject {
         ForcedBreakDisabledDate  = [string]$ForcedBreakDisabledDate
         # Seconds of actual locked time still required for the current min-break window.
         ForcedBreakRemainingSeconds = [double]$ForcedBreakRemainingSeconds
+        # Pending setUnlockQuotaEnabled value until config.json is written; then cleared.
+        PendingUnlockQuotaEnabled = $pendingUq
     }
 }
 
@@ -658,6 +666,19 @@ function ConvertTo-LoggerStateObject {
     }
     if ($breakRemain -lt 0) { $breakRemain = 0.0 }
 
+    $pendingUq = $null
+    $pendingUqRaw = Get-OptionalPropertyValue -InputObject $State -Name 'PendingUnlockQuotaEnabled'
+    if ($null -ne $pendingUqRaw) {
+        if ($pendingUqRaw -is [bool]) {
+            $pendingUq = [bool]$pendingUqRaw
+        }
+        else {
+            $s = ([string]$pendingUqRaw).Trim().ToLowerInvariant()
+            if ($s -in @('true', 't', '1')) { $pendingUq = $true }
+            elseif ($s -in @('false', 'f', '0')) { $pendingUq = $false }
+        }
+    }
+
     return (New-LoggerStateObject `
             -Date $date `
             -UnlockedSecondsToday $seconds `
@@ -666,7 +687,8 @@ function ConvertTo-LoggerStateObject {
             -LastUnlockQuotaBucket $bucket `
             -InstalledCommitSha $commitSha `
             -ForcedBreakDisabledDate $disabledDate `
-            -ForcedBreakRemainingSeconds $breakRemain)
+            -ForcedBreakRemainingSeconds $breakRemain `
+            -PendingUnlockQuotaEnabled $pendingUq)
 }
 
 function ConvertFrom-DurationText {
@@ -1244,6 +1266,9 @@ function Save-DisableForcedBreakToStateFile {
     }
     catch { $already = $false }
 
+    $pendingUq = $null
+    try { $pendingUq = $state.PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
+
     $state = New-LoggerStateObject `
         -Date $(if ([string]::IsNullOrWhiteSpace([string]$state.Date)) { $today } else { [string]$state.Date }) `
         -UnlockedSecondsToday $state.UnlockedSecondsToday `
@@ -1252,7 +1277,8 @@ function Save-DisableForcedBreakToStateFile {
         -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
         -InstalledCommitSha $state.InstalledCommitSha `
         -ForcedBreakDisabledDate $today `
-        -ForcedBreakRemainingSeconds 0
+        -ForcedBreakRemainingSeconds 0 `
+        -PendingUnlockQuotaEnabled $pendingUq
 
     Write-State -Path $statePath -State $state
     $script:DisableForcedBreakDiskSaved = $true
@@ -1299,6 +1325,9 @@ function Apply-PendingDisableForcedBreak {
     try { $diskSaved = [bool]$script:DisableForcedBreakDiskSaved } catch { $diskSaved = $false }
     $script:DisableForcedBreakDiskSaved = $false
 
+    $pendingUq = $null
+    try { $pendingUq = $State.PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
+
     $State = New-LoggerStateObject `
         -Date $State.Date `
         -UnlockedSecondsToday $State.UnlockedSecondsToday `
@@ -1307,7 +1336,8 @@ function Apply-PendingDisableForcedBreak {
         -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
         -InstalledCommitSha $State.InstalledCommitSha `
         -ForcedBreakDisabledDate $Today `
-        -ForcedBreakRemainingSeconds 0
+        -ForcedBreakRemainingSeconds 0 `
+        -PendingUnlockQuotaEnabled $pendingUq
 
     if (-not $diskSaved) {
         # Fallback when exchange could not persist (or pending-only path).
@@ -1323,6 +1353,58 @@ function Apply-PendingDisableForcedBreak {
         "disable-break applied to live state; ForcedBreakDisabledDate={0}; diskSaved={1}" -f `
             $Today, $diskSaved)
     return $State
+}
+
+function Save-UnlockQuotaEnabledPendingToStateFile {
+    <#
+      Persist remote setUnlockQuotaEnabled into state.json immediately (before
+      update/restart). Cleared after UnlockQuotaEnabled is written to config.json.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][bool]$Enabled
+    )
+
+    $logDir = ''
+    try { $logDir = [string]$Config.LogDirectory } catch { $logDir = '' }
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        throw 'LogDirectory missing; cannot persist setUnlockQuotaEnabled to state.json.'
+    }
+
+    $statePath = Get-StatePath -LogDirectory $logDir
+    $quotaMinutes = 60
+    try {
+        if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
+            $quotaMinutes = [int]$Config.UnlockQuotaMinutes
+        }
+    }
+    catch { $quotaMinutes = 60 }
+
+    $state = New-LoggerStateObject
+    if (Get-Command Read-State -ErrorAction SilentlyContinue) {
+        $state = ConvertTo-LoggerStateObject `
+            -State (Read-State -Path $statePath -UnlockQuotaMinutes $quotaMinutes) `
+            -UnlockQuotaMinutes $quotaMinutes
+    }
+
+    $state = New-LoggerStateObject `
+        -Date $state.Date `
+        -UnlockedSecondsToday $state.UnlockedSecondsToday `
+        -LastUnlocked $state.LastUnlocked `
+        -LastTransitionUtc $state.LastTransitionUtc `
+        -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
+        -InstalledCommitSha $state.InstalledCommitSha `
+        -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
+        -ForcedBreakRemainingSeconds $state.ForcedBreakRemainingSeconds `
+        -PendingUnlockQuotaEnabled ([bool]$Enabled)
+
+    Write-State -Path $statePath -State $state
+    Write-LoggerEvent ("setUnlockQuotaEnabled {0} persisted to state.json (pending config.json write)." -f `
+            $(if ($Enabled) { 't' } else { 'f' }))
+    Write-DebugLog -Source 'UnlockQuota' -Message (
+        "setUnlockQuotaEnabled pending saved; PendingUnlockQuotaEnabled={0}; path={1}" -f `
+            $(if ($Enabled) { 'true' } else { 'false' }), $statePath)
+    return $true
 }
 
 function Set-RuntimeUnlockQuotaEnabled {
@@ -1365,8 +1447,10 @@ function Set-RuntimeUnlockQuotaEnabled {
 function Apply-PendingUnlockQuotaEnabled {
     <#
       Remote commands.txt "setUnlockQuotaEnabled [t|f]":
-      update live config + persist UnlockQuotaEnabled (default t when arg omitted).
-      When disabling, clears any in-progress ForcedBreakRemainingSeconds window.
+      write UnlockQuotaEnabled to config.json, apply live, then clear
+      PendingUnlockQuotaEnabled from state.json (and in-memory pending).
+      Source of pending: $script:PendingUnlockQuotaEnabled, else state.json.
+      When disabling, also clears ForcedBreakRemainingSeconds.
     #>
     param(
         [Parameter(Mandatory)]$State,
@@ -1374,27 +1458,42 @@ function Apply-PendingUnlockQuotaEnabled {
         [Parameter(Mandatory)][string]$DailyLogPath
     )
 
-    if ($null -eq $script:PendingUnlockQuotaEnabled) {
+    $enabled = $null
+    if ($null -ne $script:PendingUnlockQuotaEnabled) {
+        $enabled = [bool]$script:PendingUnlockQuotaEnabled
+    }
+    else {
+        try {
+            if ($null -ne $State.PendingUnlockQuotaEnabled) {
+                $enabled = [bool]$State.PendingUnlockQuotaEnabled
+            }
+        }
+        catch { $enabled = $null }
+    }
+    if ($null -eq $enabled) {
         return @{ State = $State; Config = $Config }
     }
 
-    $enabled = [bool]$script:PendingUnlockQuotaEnabled
-
-    Set-RuntimeUnlockQuotaEnabled -Config $Config -Enabled $enabled
-    $Config.UnlockQuotaEnabled = $enabled
+    Set-RuntimeUnlockQuotaEnabled -Config $Config -Enabled ([bool]$enabled)
+    $Config.UnlockQuotaEnabled = [bool]$enabled
     $script:PendingUnlockQuotaEnabled = $null
 
-    if (-not $enabled) {
-        $State = New-LoggerStateObject `
-            -Date $State.Date `
-            -UnlockedSecondsToday $State.UnlockedSecondsToday `
-            -LastUnlocked $State.LastUnlocked `
-            -LastTransitionUtc $State.LastTransitionUtc `
-            -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
-            -InstalledCommitSha $State.InstalledCommitSha `
-            -ForcedBreakDisabledDate $State.ForcedBreakDisabledDate `
-            -ForcedBreakRemainingSeconds 0
+    $breakRemain = 0.0
+    if ([bool]$enabled) {
+        try { $breakRemain = [double]$State.ForcedBreakRemainingSeconds } catch { $breakRemain = 0.0 }
     }
+
+    # Clear pending from state.json after config.json write succeeded.
+    $State = New-LoggerStateObject `
+        -Date $State.Date `
+        -UnlockedSecondsToday $State.UnlockedSecondsToday `
+        -LastUnlocked $State.LastUnlocked `
+        -LastTransitionUtc $State.LastTransitionUtc `
+        -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
+        -InstalledCommitSha $State.InstalledCommitSha `
+        -ForcedBreakDisabledDate $State.ForcedBreakDisabledDate `
+        -ForcedBreakRemainingSeconds $breakRemain `
+        -PendingUnlockQuotaEnabled $null
 
     $line = '{0:yyyy-MM-dd HH:mm:ss} | SET_UNLOCK_QUOTA_ENABLED | enabled={1} | cumulative_today={2}' -f `
         (Get-Date), $(if ($enabled) { 'true' } else { 'false' }), (Format-Duration $State.UnlockedSecondsToday)
@@ -1402,10 +1501,11 @@ function Apply-PendingUnlockQuotaEnabled {
         Write-DailyLogLine -Path $DailyLogPath -Line $line
     }
     catch { }
-    Write-LoggerEvent ("UnlockQuotaEnabled set to {0} (remote setUnlockQuotaEnabled)." -f `
+    Write-LoggerEvent ("UnlockQuotaEnabled set to {0} (remote setUnlockQuotaEnabled; cleared state pending)." -f `
             $(if ($enabled) { 'true' } else { 'false' }))
     Write-DebugLog -Source 'UnlockQuota' -Message (
-        "setUnlockQuotaEnabled applied; UnlockQuotaEnabled={0}" -f $(if ($enabled) { 'true' } else { 'false' }))
+        "setUnlockQuotaEnabled applied; UnlockQuotaEnabled={0}; state pending cleared" -f `
+            $(if ($enabled) { 'true' } else { 'false' }))
 
     return @{ State = $State; Config = $Config }
 }
@@ -1913,6 +2013,27 @@ try {
             "Unlock/break UI pre-stage skipped: {0}" -f $_.Exception.Message)
     }
 
+    # Replay setUnlockQuotaEnabled pending from state.json (survives update/restart).
+    if ($null -ne $state.PendingUnlockQuotaEnabled -and
+        (Get-Command Apply-PendingUnlockQuotaEnabled -ErrorAction SilentlyContinue)) {
+        try {
+            $startupDaily = Get-DailyLogPath -LogDirectory $config.LogDirectory -Date (Get-Date)
+            $appliedStartup = Apply-PendingUnlockQuotaEnabled `
+                -State $state `
+                -Config $config `
+                -DailyLogPath $startupDaily
+            $state = $appliedStartup.State
+            $config = $appliedStartup.Config
+            Write-LoggerEvent (
+                "Applied PendingUnlockQuotaEnabled from state.json on startup (UnlockQuotaEnabled={0})." -f `
+                    $(if ($config.UnlockQuotaEnabled) { 'true' } else { 'false' }))
+        }
+        catch {
+            Write-LoggerEvent -Level WARN -Message (
+                "Startup PendingUnlockQuotaEnabled apply failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
     # Persist InstalledCommitSha into state.json on startup (and every later Write-State).
     Write-State -Path $statePath -State $state
     $state = ConvertTo-LoggerStateObject `
@@ -1961,7 +2082,10 @@ while ($true) {
             if ($state.UnlockedSecondsToday -gt 0 -or $state.LastUnlocked) {
                 Write-DayRollover -Config $config -State $state -EndedDate $state.Date
             }
-            $state = New-LoggerStateObject -Date $today
+            # Preserve setUnlockQuotaEnabled pending across day rollover until config.json write.
+            $pendingUqRoll = $null
+            try { $pendingUqRoll = $state.PendingUnlockQuotaEnabled } catch { $pendingUqRoll = $null }
+            $state = New-LoggerStateObject -Date $today -PendingUnlockQuotaEnabled $pendingUqRoll
         }
 
         $wallElapsed = ($nowUtc - $lastPollUtc).TotalSeconds
@@ -2001,7 +2125,8 @@ while ($true) {
                 -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
                 -InstalledCommitSha $state.InstalledCommitSha `
                 -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                -ForcedBreakRemainingSeconds 0
+                -ForcedBreakRemainingSeconds 0 `
+                -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
         }
         $inMinBreak = (-not $forcedBreakDisabled -and $breakRemain -gt 0)
 
@@ -2053,7 +2178,8 @@ while ($true) {
                     -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
                     -InstalledCommitSha $state.InstalledCommitSha `
                     -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                    -ForcedBreakRemainingSeconds $breakRemain
+                    -ForcedBreakRemainingSeconds $breakRemain `
+                    -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
                 if ($breakRemain -le 0) {
                     Write-LoggerEvent (
                         "Unlock-quota: min break satisfied ({0} min locked)." -f $minBreakMinutes)
@@ -2097,7 +2223,8 @@ while ($true) {
                             -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
                             -InstalledCommitSha $state.InstalledCommitSha `
                             -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                            -ForcedBreakRemainingSeconds $breakRemain
+                            -ForcedBreakRemainingSeconds $breakRemain `
+                            -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
                         $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
                         Write-LoggerEvent (
                             "Unlock-quota: min locked break started ({0} min required)." -f `
@@ -2228,9 +2355,12 @@ while ($true) {
             }
         }
 
-        # Remote commands.txt "setUnlockQuotaEnabled [t|f]" — persist + live apply.
-        if ($null -ne $script:PendingUnlockQuotaEnabled -and
-            (Get-Command Apply-PendingUnlockQuotaEnabled -ErrorAction SilentlyContinue)) {
+        # Remote commands.txt "setUnlockQuotaEnabled [t|f]" — config.json write + clear state pending.
+        $uqPending = ($null -ne $script:PendingUnlockQuotaEnabled)
+        if (-not $uqPending) {
+            try { $uqPending = ($null -ne $state.PendingUnlockQuotaEnabled) } catch { $uqPending = $false }
+        }
+        if ($uqPending -and (Get-Command Apply-PendingUnlockQuotaEnabled -ErrorAction SilentlyContinue)) {
             try {
                 $applied = Apply-PendingUnlockQuotaEnabled `
                     -State $state `

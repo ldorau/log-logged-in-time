@@ -3573,21 +3573,41 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
-    # setUnlockQuotaEnabled: persist UnlockQuotaEnabled in runtime config (default t).
+    # setUnlockQuotaEnabled: persist pending to state.json NOW (before update/restart),
+    # then write config.json + clear pending on poll/startup.
     $setUnlockQuotaQueued = $false
     $setUnlockQuotaValue = $null
+    $setUnlockQuotaPersisted = $false
     if ($null -ne $cmdResult.PSObject.Properties['UnlockQuotaEnabledValue'] -and
         $null -ne $cmdResult.UnlockQuotaEnabledValue) {
         $script:PendingUnlockQuotaEnabled = [bool]$cmdResult.UnlockQuotaEnabledValue
         $setUnlockQuotaQueued = $true
         $setUnlockQuotaValue = [bool]$cmdResult.UnlockQuotaEnabledValue
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-            "execute: setUnlockQuotaEnabled {0} queued for next monitor poll (persist to config.json)" -f `
-                $(if ($setUnlockQuotaValue) { 't' } else { 'f' }))
+        if (Get-Command Save-UnlockQuotaEnabledPendingToStateFile -ErrorAction SilentlyContinue) {
+            try {
+                $null = Save-UnlockQuotaEnabledPendingToStateFile `
+                    -Config $Config `
+                    -Enabled ([bool]$setUnlockQuotaValue)
+                $setUnlockQuotaPersisted = $true
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    "execute: setUnlockQuotaEnabled {0} persisted to state.json (pending config.json; survives update/restart)" -f `
+                        $(if ($setUnlockQuotaValue) { 't' } else { 'f' }))
+            }
+            catch {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                    "execute: setUnlockQuotaEnabled state.json persist failed; will retry on poll: {0}" -f `
+                        $_.Exception.Message)
+            }
+        }
+        else {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "execute: setUnlockQuotaEnabled {0} queued for next monitor poll (Save-UnlockQuotaEnabledPendingToStateFile unavailable)" -f `
+                    $(if ($setUnlockQuotaValue) { 't' } else { 'f' }))
+        }
         if (Get-Command Write-DebugLog -ErrorAction SilentlyContinue) {
             Write-DebugLog -Source 'UnlockQuota' -Message (
-                "PendingUnlockQuotaEnabled={0} (commands exchange); will Apply-PendingUnlockQuotaEnabled on poll" -f `
-                    $(if ($setUnlockQuotaValue) { 't' } else { 'f' }))
+                "PendingUnlockQuotaEnabled={0}; diskPersisted={1}" -f `
+                    $(if ($setUnlockQuotaValue) { 't' } else { 'f' }), $setUnlockQuotaPersisted)
         }
     }
 
@@ -3617,6 +3637,7 @@ function Invoke-ScpCommandsFileExchange {
         ('DisableBreakQueued: {0}' -f $disableBreakQueued)
         ('DisableBreakPersistedToState: {0}' -f $disableBreakPersisted)
         ('SetUnlockQuotaEnabledQueued: {0}' -f $setUnlockQuotaQueued)
+        ('SetUnlockQuotaEnabledPersistedToState: {0}' -f $setUnlockQuotaPersisted)
         ('SetUnlockQuotaEnabledValue: {0}' -f $(
             if ($null -eq $setUnlockQuotaValue) { '(none)' }
             elseif ($setUnlockQuotaValue) { 't' }

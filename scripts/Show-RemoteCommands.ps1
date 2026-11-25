@@ -59,7 +59,7 @@ $commands = @(
     [pscustomobject]@{
         Command     = 'setUnlockQuotaEnabled'
         Arguments   = '[t|f]'
-        Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to t (true). f turns off hourly Twoje-oczy forced locks until set to t again (also cancels any in-progress minimum-break window). Unlike disable-break, this survives day rollover.'
+        Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to t (true). f turns off hourly Twoje-oczy forced locks until set to t again (also cancels any in-progress minimum-break window). Pending value is written to state.json immediately so update/restart in the same commands.txt batch cannot drop it; cleared from state.json after config.json is updated. Unlike disable-break, the config setting itself survives day rollover.'
     }
 )
 
