@@ -10,8 +10,9 @@
       New: ... | HEARTBEAT | cumulative_today=HH:MM:SS | unlocked=True|False
 
     Summary (unlocked-time-summary.csv)
-      UnlockedHours rewritten from UnlockedSeconds as HH:MM:SS
-      (also repairs locale-broken rows where a comma split UnlockedHours).
+      Semicolon-separated columns; UnlockedHours rewritten from
+      UnlockedSeconds as HH:MM:SS (also migrates legacy comma CSV and
+      repairs locale-broken rows where a comma split UnlockedHours).
 
   Already-converted lines/files are left unchanged (idempotent).
 .PARAMETER Path
@@ -84,7 +85,7 @@ function Convert-UnlockedTimeSummaryText {
     param([Parameter(Mandatory)][string]$Text)
 
     $normalized = $Text -replace "`r`n", "`n" -replace "`r", "`n"
-    $header = 'Date,UnlockedSeconds,UnlockedHours,TargetUsername'
+    $header = 'Date;UnlockedSeconds;UnlockedHours;TargetUsername'
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $out = New-Object System.Collections.Generic.List[string]
     $out.Add($header)
@@ -96,14 +97,15 @@ function Convert-UnlockedTimeSummaryText {
             continue
         }
         $trim = $line.Trim().TrimStart([char]0xFEFF)
-        if ($trim -match '^\s*Date\s*,') {
+        if ($trim -match '^\s*Date\s*[;,]') {
             if (-not [string]::Equals($trim, $header, [System.StringComparison]::Ordinal)) {
                 $changed = $true
             }
             continue
         }
 
-        $parts = @($trim.Split(','))
+        $sep = if ($trim.IndexOf(';') -ge 0) { ';' } else { ',' }
+        $parts = @($trim.Split([char]$sep))
         $date = ''
         $seconds = $null
         $user = ''
@@ -141,7 +143,7 @@ function Convert-UnlockedTimeSummaryText {
         $seenDate[$date] = $true
 
         $hoursText = Format-UnlockedDuration -Seconds ([double]$seconds)
-        $row = [string]::Format($inv, '{0},{1:F0},{2},{3}', $date, $seconds, $hoursText, $user)
+        $row = [string]::Format($inv, '{0};{1:F0};{2};{3}', $date, $seconds, $hoursText, $user)
         if (-not [string]::Equals($trim, $row, [System.StringComparison]::Ordinal)) {
             $changed = $true
         }

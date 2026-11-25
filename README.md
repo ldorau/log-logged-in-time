@@ -160,7 +160,7 @@ That is `LogDirectory` from config, or `<AdministratorProfile>\LoginTimeLogs` wh
 | File | Contents |
 |------|----------|
 | `unlocked-time-YYYY-MM-DD.log` | Lock/unlock transitions, heartbeats, day total, manual cumulative tags |
-| `unlocked-time-summary.csv` | One row per completed day |
+| `unlocked-time-summary.csv` | One row per completed day (`Date;UnlockedSeconds;UnlockedHours;TargetUsername`) |
 | `state.json` | Running total for the current day |
 | `service.log` | Monitor diagnostics |
 | `debug.log` | Verbose traces (e.g. remote `break` dialog/launch) |

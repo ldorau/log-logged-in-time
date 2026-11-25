@@ -1404,9 +1404,10 @@ function Write-State {
 
 function Repair-UnlockedTimeSummaryCsv {
     <#
-      Rewrites locale-broken summary rows where UnlockedHours used ',' as the
-      decimal separator (e.g. "2026-11-02,4230,1,1751,piter" -> five fields).
-      UnlockedHours is always recomputed from UnlockedSeconds as HH:MM:SS.
+      Rewrites summary CSV to semicolon separators. Also repairs locale-broken
+      legacy comma rows where UnlockedHours used ',' as the decimal separator
+      (e.g. "2026-11-02,4230,1,1751,piter" -> five fields). UnlockedHours is
+      always recomputed from UnlockedSeconds as HH:MM:SS.
       Returns $true when the file was rewritten.
     #>
     param([Parameter(Mandatory)][string]$Path)
@@ -1422,7 +1423,7 @@ function Repair-UnlockedTimeSummaryCsv {
         return $false
     }
 
-    $header = 'Date,UnlockedSeconds,UnlockedHours,TargetUsername'
+    $header = 'Date;UnlockedSeconds;UnlockedHours;TargetUsername'
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $out = New-Object System.Collections.Generic.List[string]
     $out.Add($header)
@@ -1433,15 +1434,16 @@ function Repair-UnlockedTimeSummaryCsv {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
         }
-        $trim = $line.Trim()
-        if ($trim -match '^\s*Date\s*,') {
+        $trim = $line.Trim().TrimStart([char]0xFEFF)
+        if ($trim -match '^\s*Date\s*[;,]') {
             if (-not [string]::Equals($trim, $header, [System.StringComparison]::Ordinal)) {
                 $changed = $true
             }
             continue
         }
 
-        $parts = @($trim.Split(','))
+        $sep = if ($trim.IndexOf(';') -ge 0) { ';' } else { ',' }
+        $parts = @($trim.Split([char]$sep))
         $date = ''
         $seconds = $null
         $user = ''
@@ -1488,7 +1490,7 @@ function Repair-UnlockedTimeSummaryCsv {
         $hoursText = Format-Duration -Seconds ([double]$seconds)
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2},{3}',
+            '{0};{1:F0};{2};{3}',
             $date,
             $seconds,
             $hoursText,
@@ -1516,7 +1518,7 @@ function Ensure-SummaryHeader {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         try {
-            Set-Content -LiteralPath $Path -Value 'Date,UnlockedSeconds,UnlockedHours,TargetUsername' -Encoding UTF8
+            Set-Content -LiteralPath $Path -Value 'Date;UnlockedSeconds;UnlockedHours;TargetUsername' -Encoding UTF8
         }
         catch {
             $details = Format-ErrorDetails -ErrorRecord $_ -Context ("Ensure-SummaryHeader failed for '{0}'" -f $Path)
@@ -1563,11 +1565,11 @@ function Write-DayRollover {
         Ensure-SummaryHeader -Path $summaryPath
 
         $durationText = Format-Duration -Seconds $State.UnlockedSecondsToday
-        # InvariantCulture for UnlockedSeconds so locale decimals cannot break CSV.
+        # InvariantCulture for UnlockedSeconds; ';' separator (Excel / EU locales).
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $row = [string]::Format(
             $inv,
-            '{0},{1:F0},{2},{3}',
+            '{0};{1:F0};{2};{3}',
             $EndedDate,
             $State.UnlockedSecondsToday,
             $durationText,
