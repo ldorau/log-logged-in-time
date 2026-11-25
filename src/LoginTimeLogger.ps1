@@ -540,6 +540,31 @@ function Get-SummaryPath {
     Join-Path $LogDirectory 'unlocked-time-summary.csv'
 }
 
+function Normalize-LockIntervals {
+    <#
+      Coerce LockIntervals JSON/array into @{ StartUtc; EndUtc } objects.
+    #>
+    param($Raw)
+
+    $out = New-Object System.Collections.ArrayList
+    if ($null -eq $Raw) {
+        return @()
+    }
+    foreach ($item in @($Raw)) {
+        if ($null -eq $item) { continue }
+        $start = [string](Get-OptionalPropertyValue -InputObject $item -Name 'StartUtc')
+        $end = [string](Get-OptionalPropertyValue -InputObject $item -Name 'EndUtc')
+        if ([string]::IsNullOrWhiteSpace($start) -or [string]::IsNullOrWhiteSpace($end)) {
+            continue
+        }
+        [void]$out.Add([pscustomobject]@{
+                StartUtc = $start
+                EndUtc   = $end
+            })
+    }
+    return @($out)
+}
+
 function New-LoggerStateObject {
     <#
       Always materialize every NoteProperty so StrictMode never throws on
@@ -556,7 +581,11 @@ function New-LoggerStateObject {
         [string]$ForcedBreakDisabledDate = '',
         [double]$ForcedBreakRemainingSeconds = 0,
         # $null = none; $true/$false = remote setUnlockQuotaEnabled pending config write.
-        [AllowNull()]$PendingUnlockQuotaEnabled = $null
+        [AllowNull()]$PendingUnlockQuotaEnabled = $null,
+        # ISO UTC when the current locked period began (null while unlocked).
+        [AllowNull()]$CurrentLockStartUtc = $null,
+        # Completed lock intervals @{ StartUtc; EndUtc } for rolling locked-time window.
+        [AllowNull()]$LockIntervals = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
@@ -569,6 +598,11 @@ function New-LoggerStateObject {
     if ($null -ne $PendingUnlockQuotaEnabled) {
         try { $pendingUq = [bool]$PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
     }
+    $lockStart = $null
+    if ($null -ne $CurrentLockStartUtc -and -not [string]::IsNullOrWhiteSpace([string]$CurrentLockStartUtc)) {
+        $lockStart = [string]$CurrentLockStartUtc
+    }
+    $intervals = @(Normalize-LockIntervals -Raw $LockIntervals)
 
     return [pscustomobject]@{
         Date                     = [string]$Date
@@ -583,7 +617,39 @@ function New-LoggerStateObject {
         ForcedBreakRemainingSeconds = [double]$ForcedBreakRemainingSeconds
         # Pending setUnlockQuotaEnabled value until config.json is written; then cleared.
         PendingUnlockQuotaEnabled = $pendingUq
+        CurrentLockStartUtc      = $lockStart
+        LockIntervals            = $intervals
     }
+}
+
+function New-LoggerStateFrom {
+    <#
+      Rebuild state from an existing object, overriding selected fields.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [hashtable]$Set = $null
+    )
+
+    $p = @{
+        Date                        = $State.Date
+        UnlockedSecondsToday        = $State.UnlockedSecondsToday
+        LastUnlocked                = $State.LastUnlocked
+        LastTransitionUtc           = $State.LastTransitionUtc
+        LastUnlockQuotaBucket       = $State.LastUnlockQuotaBucket
+        InstalledCommitSha          = $State.InstalledCommitSha
+        ForcedBreakDisabledDate     = $State.ForcedBreakDisabledDate
+        ForcedBreakRemainingSeconds = $State.ForcedBreakRemainingSeconds
+        PendingUnlockQuotaEnabled   = $State.PendingUnlockQuotaEnabled
+        CurrentLockStartUtc         = $State.CurrentLockStartUtc
+        LockIntervals               = $State.LockIntervals
+    }
+    if ($null -ne $Set) {
+        foreach ($k in $Set.Keys) {
+            $p[$k] = $Set[$k]
+        }
+    }
+    return (New-LoggerStateObject @p)
 }
 
 function ConvertTo-LoggerStateObject {
@@ -679,6 +745,19 @@ function ConvertTo-LoggerStateObject {
         }
     }
 
+    $lockStartRaw = Get-OptionalPropertyValue -InputObject $State -Name 'CurrentLockStartUtc'
+    $lockStart = $null
+    if ($null -ne $lockStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$lockStartRaw)) {
+        $lockStart = [string]$lockStartRaw
+    }
+    # If currently locked but CurrentLockStartUtc missing, seed from LastTransitionUtc.
+    if (-not $lastUnlocked -and [string]::IsNullOrWhiteSpace($lockStart) -and
+        -not [string]::IsNullOrWhiteSpace([string]$lastTransition)) {
+        $lockStart = [string]$lastTransition
+    }
+    $lockIntervals = Normalize-LockIntervals `
+        -Raw (Get-OptionalPropertyValue -InputObject $State -Name 'LockIntervals')
+
     return (New-LoggerStateObject `
             -Date $date `
             -UnlockedSecondsToday $seconds `
@@ -688,7 +767,133 @@ function ConvertTo-LoggerStateObject {
             -InstalledCommitSha $commitSha `
             -ForcedBreakDisabledDate $disabledDate `
             -ForcedBreakRemainingSeconds $breakRemain `
-            -PendingUnlockQuotaEnabled $pendingUq)
+            -PendingUnlockQuotaEnabled $pendingUq `
+            -CurrentLockStartUtc $lockStart `
+            -LockIntervals $lockIntervals)
+}
+
+function Get-LockedSecondsInWindow {
+    <#
+      Sum locked (inactive) wall time overlapping [NowUtc - WindowSeconds, NowUtc].
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][datetime]$NowUtc,
+        [double]$WindowSeconds = 3600
+    )
+
+    if ($WindowSeconds -lt 1) { $WindowSeconds = 3600 }
+    $windowStart = $NowUtc.AddSeconds(-$WindowSeconds)
+    $total = 0.0
+
+    foreach ($iv in @(Normalize-LockIntervals -Raw $State.LockIntervals)) {
+        try {
+            $s = [datetime]::Parse([string]$iv.StartUtc, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+            $e = [datetime]::Parse([string]$iv.EndUtc, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+        }
+        catch { continue }
+        if ($e -le $windowStart -or $s -ge $NowUtc) { continue }
+        if ($s -lt $windowStart) { $s = $windowStart }
+        if ($e -gt $NowUtc) { $e = $NowUtc }
+        if ($e -gt $s) {
+            $total += ($e - $s).TotalSeconds
+        }
+    }
+
+    $curStartRaw = $null
+    try { $curStartRaw = $State.CurrentLockStartUtc } catch { $curStartRaw = $null }
+    if ($null -ne $curStartRaw -and -not [string]::IsNullOrWhiteSpace([string]$curStartRaw)) {
+        try {
+            $s = [datetime]::Parse([string]$curStartRaw, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+            if ($s -lt $windowStart) { $s = $windowStart }
+            if ($NowUtc -gt $s) {
+                $total += ($NowUtc - $s).TotalSeconds
+            }
+        }
+        catch { }
+    }
+
+    if ($total -lt 0) { $total = 0.0 }
+    return [double]$total
+}
+
+function Update-StateLockTracking {
+    <#
+      On lock/unlock transition: open or close CurrentLockStartUtc and append
+      LockIntervals. Prunes intervals that ended before NowUtc - RetainSeconds
+      (default 2h; callers should pass at least UnlockQuotaMinutes).
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][bool]$Unlocked,
+        [Parameter(Mandatory)][datetime]$NowUtc,
+        [double]$RetainSeconds = 7200
+    )
+
+    if ($RetainSeconds -lt 7200) { $RetainSeconds = 7200 }
+
+    $intervals = New-Object System.Collections.ArrayList
+    foreach ($iv in @(Normalize-LockIntervals -Raw $State.LockIntervals)) {
+        [void]$intervals.Add($iv)
+    }
+
+    $prevUnlocked = $true
+    try { $prevUnlocked = [bool]$State.LastUnlocked } catch { $prevUnlocked = $true }
+
+    if ($prevUnlocked -and -not $Unlocked) {
+        # Became locked.
+        return (New-LoggerStateFrom -State $State -Set @{
+                CurrentLockStartUtc = $NowUtc.ToString('o')
+                LockIntervals       = @($intervals)
+            })
+    }
+
+    if ((-not $prevUnlocked) -and $Unlocked) {
+        # Became unlocked: close open lock interval.
+        $startRaw = $null
+        try { $startRaw = $State.CurrentLockStartUtc } catch { $startRaw = $null }
+        if ([string]::IsNullOrWhiteSpace([string]$startRaw)) {
+            try { $startRaw = $State.LastTransitionUtc } catch { $startRaw = $null }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$startRaw)) {
+            [void]$intervals.Add([pscustomobject]@{
+                    StartUtc = [string]$startRaw
+                    EndUtc   = $NowUtc.ToString('o')
+                })
+        }
+    }
+
+    # Prune intervals that ended before the retain window.
+    $pruneBefore = $NowUtc.AddSeconds(-$RetainSeconds)
+    $kept = New-Object System.Collections.ArrayList
+    foreach ($iv in @($intervals)) {
+        try {
+            $e = [datetime]::Parse([string]$iv.EndUtc, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+            if ($e -ge $pruneBefore) {
+                [void]$kept.Add($iv)
+            }
+        }
+        catch {
+            [void]$kept.Add($iv)
+        }
+    }
+
+    $curStart = $null
+    if (-not $Unlocked) {
+        try { $curStart = $State.CurrentLockStartUtc } catch { $curStart = $null }
+        if ([string]::IsNullOrWhiteSpace([string]$curStart)) {
+            $curStart = $NowUtc.ToString('o')
+        }
+    }
+
+    return (New-LoggerStateFrom -State $State -Set @{
+            CurrentLockStartUtc = $curStart
+            LockIntervals       = @($kept)
+        })
 }
 
 function ConvertFrom-DurationText {
@@ -1278,19 +1483,11 @@ function Save-DisableForcedBreakToStateFile {
     }
     catch { $already = $false }
 
-    $pendingUq = $null
-    try { $pendingUq = $state.PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
-
-    $state = New-LoggerStateObject `
-        -Date $(if ([string]::IsNullOrWhiteSpace([string]$state.Date)) { $today } else { [string]$state.Date }) `
-        -UnlockedSecondsToday $state.UnlockedSecondsToday `
-        -LastUnlocked $state.LastUnlocked `
-        -LastTransitionUtc $state.LastTransitionUtc `
-        -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
-        -InstalledCommitSha $state.InstalledCommitSha `
-        -ForcedBreakDisabledDate $today `
-        -ForcedBreakRemainingSeconds 0 `
-        -PendingUnlockQuotaEnabled $pendingUq
+    $state = New-LoggerStateFrom -State $state -Set @{
+        Date                        = $(if ([string]::IsNullOrWhiteSpace([string]$state.Date)) { $today } else { [string]$state.Date })
+        ForcedBreakDisabledDate     = $today
+        ForcedBreakRemainingSeconds = 0
+    }
 
     Write-State -Path $statePath -State $state
     $script:DisableForcedBreakDiskSaved = $true
@@ -1337,19 +1534,10 @@ function Apply-PendingDisableForcedBreak {
     try { $diskSaved = [bool]$script:DisableForcedBreakDiskSaved } catch { $diskSaved = $false }
     $script:DisableForcedBreakDiskSaved = $false
 
-    $pendingUq = $null
-    try { $pendingUq = $State.PendingUnlockQuotaEnabled } catch { $pendingUq = $null }
-
-    $State = New-LoggerStateObject `
-        -Date $State.Date `
-        -UnlockedSecondsToday $State.UnlockedSecondsToday `
-        -LastUnlocked $State.LastUnlocked `
-        -LastTransitionUtc $State.LastTransitionUtc `
-        -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
-        -InstalledCommitSha $State.InstalledCommitSha `
-        -ForcedBreakDisabledDate $Today `
-        -ForcedBreakRemainingSeconds 0 `
-        -PendingUnlockQuotaEnabled $pendingUq
+    $State = New-LoggerStateFrom -State $State -Set @{
+        ForcedBreakDisabledDate     = $Today
+        ForcedBreakRemainingSeconds = 0
+    }
 
     if (-not $diskSaved) {
         # Fallback when exchange could not persist (or pending-only path).
@@ -1399,16 +1587,9 @@ function Save-UnlockQuotaEnabledPendingToStateFile {
             -UnlockQuotaMinutes $quotaMinutes
     }
 
-    $state = New-LoggerStateObject `
-        -Date $state.Date `
-        -UnlockedSecondsToday $state.UnlockedSecondsToday `
-        -LastUnlocked $state.LastUnlocked `
-        -LastTransitionUtc $state.LastTransitionUtc `
-        -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
-        -InstalledCommitSha $state.InstalledCommitSha `
-        -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-        -ForcedBreakRemainingSeconds $state.ForcedBreakRemainingSeconds `
-        -PendingUnlockQuotaEnabled ([bool]$Enabled)
+    $state = New-LoggerStateFrom -State $state -Set @{
+        PendingUnlockQuotaEnabled = [bool]$Enabled
+    }
 
     Write-State -Path $statePath -State $state
     Write-LoggerEvent ("setUnlockQuotaEnabled {0} persisted to state.json (pending config.json write)." -f `
@@ -1496,16 +1677,10 @@ function Apply-PendingUnlockQuotaEnabled {
     }
 
     # Clear pending from state.json after config.json write succeeded.
-    $State = New-LoggerStateObject `
-        -Date $State.Date `
-        -UnlockedSecondsToday $State.UnlockedSecondsToday `
-        -LastUnlocked $State.LastUnlocked `
-        -LastTransitionUtc $State.LastTransitionUtc `
-        -LastUnlockQuotaBucket $State.LastUnlockQuotaBucket `
-        -InstalledCommitSha $State.InstalledCommitSha `
-        -ForcedBreakDisabledDate $State.ForcedBreakDisabledDate `
-        -ForcedBreakRemainingSeconds $breakRemain `
-        -PendingUnlockQuotaEnabled $null
+    $State = New-LoggerStateFrom -State $State -Set @{
+        ForcedBreakRemainingSeconds = $breakRemain
+        PendingUnlockQuotaEnabled   = $null
+    }
 
     $line = '{0:yyyy-MM-dd HH:mm:ss} | SET_UNLOCK_QUOTA_ENABLED | enabled={1} | cumulative_today={2}' -f `
         (Get-Date), $(if ($enabled) { 'true' } else { 'false' }), (Format-Duration $State.UnlockedSecondsToday)
@@ -2094,10 +2269,19 @@ while ($true) {
             if ($state.UnlockedSecondsToday -gt 0 -or $state.LastUnlocked) {
                 Write-DayRollover -Config $config -State $state -EndedDate $state.Date
             }
-            # Preserve setUnlockQuotaEnabled pending across day rollover until config.json write.
+            # Preserve pending config write + recent lock intervals across day rollover.
             $pendingUqRoll = $null
             try { $pendingUqRoll = $state.PendingUnlockQuotaEnabled } catch { $pendingUqRoll = $null }
-            $state = New-LoggerStateObject -Date $today -PendingUnlockQuotaEnabled $pendingUqRoll
+            $state = New-LoggerStateFrom -State $state -Set @{
+                Date                        = $today
+                UnlockedSecondsToday        = 0
+                LastUnlocked                = $false
+                LastTransitionUtc           = $null
+                LastUnlockQuotaBucket       = 0
+                ForcedBreakDisabledDate     = ''
+                ForcedBreakRemainingSeconds = 0
+                PendingUnlockQuotaEnabled   = $pendingUqRoll
+            }
         }
 
         $wallElapsed = ($nowUtc - $lastPollUtc).TotalSeconds
@@ -2129,16 +2313,9 @@ while ($true) {
         $breakRemain = Get-ForcedBreakRemainingSeconds -State $state
         if ($forcedBreakDisabled -and $breakRemain -gt 0) {
             $breakRemain = 0.0
-            $state = New-LoggerStateObject `
-                -Date $state.Date `
-                -UnlockedSecondsToday $state.UnlockedSecondsToday `
-                -LastUnlocked $state.LastUnlocked `
-                -LastTransitionUtc $state.LastTransitionUtc `
-                -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
-                -InstalledCommitSha $state.InstalledCommitSha `
-                -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                -ForcedBreakRemainingSeconds 0 `
-                -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
+            $state = New-LoggerStateFrom -State $state -Set @{
+                ForcedBreakRemainingSeconds = 0
+            }
         }
         $inMinBreak = (-not $forcedBreakDisabled -and $breakRemain -gt 0)
 
@@ -2182,16 +2359,9 @@ while ($true) {
             else {
                 # Count real locked wall time (sleep/hibernate still counts as rest).
                 $breakRemain = [Math]::Max(0.0, $breakRemain - $wallElapsed)
-                $state = New-LoggerStateObject `
-                    -Date $state.Date `
-                    -UnlockedSecondsToday $state.UnlockedSecondsToday `
-                    -LastUnlocked $state.LastUnlocked `
-                    -LastTransitionUtc $state.LastTransitionUtc `
-                    -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
-                    -InstalledCommitSha $state.InstalledCommitSha `
-                    -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                    -ForcedBreakRemainingSeconds $breakRemain `
-                    -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
+                $state = New-LoggerStateFrom -State $state -Set @{
+                    ForcedBreakRemainingSeconds = $breakRemain
+                }
                 if ($breakRemain -le 0) {
                     Write-LoggerEvent (
                         "Unlock-quota: min break satisfied ({0} min locked)." -f $minBreakMinutes)
@@ -2211,46 +2381,72 @@ while ($true) {
                 if ($newBucket -gt [int]$state.LastUnlockQuotaBucket -and
                     [datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
                     $elapsedMinutes = [int]($newBucket * [int]$config.UnlockQuotaMinutes)
-                    $launched = $false
-                    try {
-                        $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
-                                -Config $config `
-                                -WarningScriptPath $warnScript `
-                                -ElapsedMinutes $elapsedMinutes `
-                                -UnlockedSeconds ([double]$state.UnlockedSecondsToday))
-                    }
-                    catch {
-                        $launched = $false
-                        $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UnlockQuota' -Context (
-                            'Unlock-quota warning/lock launch failed')
-                    }
-                    if ($launched) {
-                        $state.LastUnlockQuotaBucket = $newBucket
-                        $breakRemain = [double]($minBreakMinutes * 60)
-                        $state = New-LoggerStateObject `
-                            -Date $state.Date `
-                            -UnlockedSecondsToday $state.UnlockedSecondsToday `
-                            -LastUnlocked $state.LastUnlocked `
-                            -LastTransitionUtc $state.LastTransitionUtc `
-                            -LastUnlockQuotaBucket $state.LastUnlockQuotaBucket `
-                            -InstalledCommitSha $state.InstalledCommitSha `
-                            -ForcedBreakDisabledDate $state.ForcedBreakDisabledDate `
-                            -ForcedBreakRemainingSeconds $breakRemain `
-                            -PendingUnlockQuotaEnabled $state.PendingUnlockQuotaEnabled
+                    $quotaWindowSeconds = [double]([int]$config.UnlockQuotaMinutes * 60)
+                    $lockedInQuotaWindow = Get-LockedSecondsInWindow -State $state -NowUtc $nowUtc `
+                        -WindowSeconds $quotaWindowSeconds
+                    $minBreakSeconds = [double]($minBreakMinutes * 60)
+                    if ($lockedInQuotaWindow -ge $minBreakSeconds) {
+                        # Already rested enough in the last UnlockQuotaMinutes; skip forced break.
+                        $state = New-LoggerStateFrom -State $state -Set @{
+                            LastUnlockQuotaBucket = $newBucket
+                        }
                         $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+                        $skipLine = ('{0:yyyy-MM-dd HH:mm:ss} | UNLOCK_QUOTA_SKIPPED | ' +
+                            'cumulative_today={1} | locked_last_quota={2} | quota_min={3} | min_break={4}') -f `
+                            $nowLocal,
+                        (Format-Duration $state.UnlockedSecondsToday),
+                        (Format-Duration $lockedInQuotaWindow),
+                        [int]$config.UnlockQuotaMinutes,
+                        (Format-Duration $minBreakSeconds)
+                        try { Write-DailyLogLine -Path $dailyPath -Line $skipLine } catch { }
                         Write-LoggerEvent (
-                            "Unlock-quota: min locked break started ({0} min required)." -f `
-                                $minBreakMinutes)
+                            ("Unlock-quota: skipped break (locked {0} in last {1} min >= {2} min)." -f `
+                                (Format-Duration $lockedInQuotaWindow),
+                            [int]$config.UnlockQuotaMinutes,
+                            $minBreakMinutes))
                         Write-State -Path $statePath -State $state
                     }
                     else {
-                        $script:UnlockQuotaRetryAfterUtc = [datetime]::UtcNow.AddSeconds(60)
+                        $launched = $false
+                        try {
+                            $launched = [bool](Invoke-UnlockQuotaWarningAndLock `
+                                    -Config $config `
+                                    -WarningScriptPath $warnScript `
+                                    -ElapsedMinutes $elapsedMinutes `
+                                    -UnlockedSeconds ([double]$state.UnlockedSecondsToday))
+                        }
+                        catch {
+                            $launched = $false
+                            $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'UnlockQuota' -Context (
+                                'Unlock-quota warning/lock launch failed')
+                        }
+                        if ($launched) {
+                            $breakRemain = [double]($minBreakMinutes * 60)
+                            $state = New-LoggerStateFrom -State $state -Set @{
+                                LastUnlockQuotaBucket       = $newBucket
+                                ForcedBreakRemainingSeconds = $breakRemain
+                            }
+                            $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+                            Write-LoggerEvent (
+                                "Unlock-quota: min locked break started ({0} min required)." -f `
+                                    $minBreakMinutes)
+                            Write-State -Path $statePath -State $state
+                        }
+                        else {
+                            $script:UnlockQuotaRetryAfterUtc = [datetime]::UtcNow.AddSeconds(60)
+                        }
                     }
                 }
             }
         }
 
         if ($unlocked -ne $state.LastUnlocked) {
+            $retainSec = 7200.0
+            if ($null -ne $config.UnlockQuotaMinutes -and [int]$config.UnlockQuotaMinutes -gt 0) {
+                $retainSec = [Math]::Max(7200.0, [double]([int]$config.UnlockQuotaMinutes * 60))
+            }
+            $state = Update-StateLockTracking -State $state -Unlocked $unlocked -NowUtc $nowUtc `
+                -RetainSeconds $retainSec
             $eventName = if ($unlocked) { 'UNLOCKED_ACTIVE' } else { 'LOCKED_OR_AWAY' }
             $lockSource = '(unknown)'
             $wtsFlags = -1
