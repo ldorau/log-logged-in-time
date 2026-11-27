@@ -2343,8 +2343,32 @@ while ($true) {
 
         if ($inMinBreak) {
             # Require actual locked time: countdown only while locked; re-lock if awake.
+            # Exception: if locked time in the rolling UnlockQuotaMinutes window already
+            # meets UnlockQuotaMinBreakMinutes, clear the min-break and do not re-show
+            # the dialog (same rule as UNLOCK_QUOTA_SKIPPED at quota fire).
+            $minBreakSeconds = [double]($minBreakMinutes * 60)
+            $quotaWindowSecondsForBreak = 3600.0
+            if ($null -ne $config.UnlockQuotaMinutes -and [int]$config.UnlockQuotaMinutes -gt 0) {
+                $quotaWindowSecondsForBreak = [double]([int]$config.UnlockQuotaMinutes * 60)
+            }
+            $lockedInQuotaWindowForBreak = Get-LockedSecondsInWindow -State $state `
+                -NowUtc $nowUtc -WindowSeconds $quotaWindowSecondsForBreak
+
             if ($unlocked) {
-                if ([datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
+                if ($lockedInQuotaWindowForBreak -ge $minBreakSeconds) {
+                    $state = New-LoggerStateFrom -State $state -Set @{
+                        ForcedBreakRemainingSeconds = 0
+                    }
+                    $script:UnlockQuotaRetryAfterUtc = [datetime]::MinValue
+                    Write-LoggerEvent (
+                        ("Unlock-quota: min break cleared on unlock " +
+                            "(locked {0} in last {1} min >= {2} min); no re-prompt.") -f `
+                            (Format-Duration $lockedInQuotaWindowForBreak),
+                        [int]($quotaWindowSecondsForBreak / 60.0),
+                        $minBreakMinutes)
+                    Write-State -Path $statePath -State $state
+                }
+                elseif ([datetime]::UtcNow -ge $script:UnlockQuotaRetryAfterUtc) {
                     $launched = $false
                     try {
                         $remainMin = [Math]::Max(1, [int][Math]::Ceiling($breakRemain / 60.0))
@@ -2371,6 +2395,11 @@ while ($true) {
             else {
                 # Count real locked wall time (sleep/hibernate still counts as rest).
                 $breakRemain = [Math]::Max(0.0, $breakRemain - $wallElapsed)
+                # Also finish early when the rolling locked window already meets min break
+                # (e.g. prior rests in the same UnlockQuotaMinutes window).
+                if ($lockedInQuotaWindowForBreak -ge $minBreakSeconds) {
+                    $breakRemain = 0.0
+                }
                 $state = New-LoggerStateFrom -State $state -Set @{
                     ForcedBreakRemainingSeconds = $breakRemain
                 }
