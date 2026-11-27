@@ -28,6 +28,8 @@ $script:PendingDisableForcedBreak = $false
 $script:DisableForcedBreakDiskSaved = $false
 # Remote "setUnlockQuotaEnabled [t|f]" — persist UnlockQuotaEnabled ($null = none).
 $script:PendingUnlockQuotaEnabled = $null
+# Remote "download-config" — reload runtime config.json on next poll.
+$script:PendingConfigReload = $false
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -2591,6 +2593,24 @@ while ($true) {
             catch {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
                     'Apply-PendingUnlockQuotaEnabled failed')
+            }
+        }
+
+        # Remote commands.txt "download-config" — reload runtime config.json into live $config.
+        $configReloadPending = $false
+        try { $configReloadPending = [bool]$script:PendingConfigReload } catch { $configReloadPending = $false }
+        if ($configReloadPending) {
+            try {
+                $config = Get-Config -Path $ConfigPath
+                $script:PendingConfigReload = $false
+                $reloadLine = ('{0:yyyy-MM-dd HH:mm:ss} | CONFIG_RELOADED | path={1}' -f `
+                        $nowLocal, $ConfigPath)
+                try { Write-DailyLogLine -Path $dailyPath -Line $reloadLine } catch { }
+                Write-LoggerEvent ("download-config: reloaded runtime config from '{0}'." -f $ConfigPath)
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'PendingConfigReload (download-config) failed')
             }
         }
 

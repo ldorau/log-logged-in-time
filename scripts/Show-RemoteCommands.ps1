@@ -61,6 +61,16 @@ $commands = @(
         Arguments   = '[t|f]'
         Description = 'Persist UnlockQuotaEnabled in the installed runtime config.json and apply it live (no restart). Omitting the argument defaults to t (true). f turns off hourly Twoje-oczy forced locks until set to t again (also cancels any in-progress minimum-break window). Pending value is written to state.json immediately so update/restart in the same commands.txt batch cannot drop it; cleared from state.json after config.json is updated. Unlike disable-break, the config setting itself survives day rollover.'
     }
+    [pscustomobject]@{
+        Command     = 'upload-config'
+        Arguments   = '(none)'
+        Description = 'Upload the installed runtime config.json (AdministratorProfile\LoginTimeLogger\config.json) to ScpRemoteDirectory/config.json on the SCP host so it can be inspected or edited remotely.'
+    }
+    [pscustomobject]@{
+        Command     = 'download-config'
+        Arguments   = '(none)'
+        Description = 'Download ScpRemoteDirectory/config.json from the SCP host and replace the installed runtime config.json (validated as JSON; ACL preserved when possible). The monitor reloads settings on the next poll (or on restart if update/restart is also queued).'
+    }
 )
 
 Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
@@ -89,5 +99,7 @@ Write-Host '  disable-break'
 Write-Host '  setUnlockQuotaEnabled'
 Write-Host '  setUnlockQuotaEnabled f'
 Write-Host '  setUnlockQuotaEnabled t'
+Write-Host '  upload-config'
+Write-Host '  download-config'
 Write-Host '  update'
 Write-Host '  reset 0'

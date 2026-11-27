@@ -25,6 +25,8 @@ $script:DisableForcedBreakDiskSaved = $false
 # Remote commands.txt "setUnlockQuotaEnabled [t|f]" — persist UnlockQuotaEnabled.
 # $null = none pending; otherwise [bool] to apply on the next monitor poll.
 $script:PendingUnlockQuotaEnabled = $null
+# Remote commands.txt "download-config" — reload runtime config.json on next poll.
+$script:PendingConfigReload = $false
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
@@ -2859,15 +2861,233 @@ function Apply-PendingCumulativeResets {
     return $State
 }
 
+function Resolve-RuntimeConfigJsonPath {
+    <#
+      Local runtime settings path: Config.ConfigPath, else
+      AdministratorProfile\LoginTimeLogger\config.json.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    $path = ''
+    try { $path = [string]$Config.ConfigPath } catch { $path = '' }
+    if (-not [string]::IsNullOrWhiteSpace($path)) {
+        return $path
+    }
+    $adminHome = ''
+    try { $adminHome = [string]$Config.AdministratorProfile } catch { $adminHome = '' }
+    if (-not [string]::IsNullOrWhiteSpace($adminHome)) {
+        return (Join-Path $adminHome 'LoginTimeLogger\config.json')
+    }
+    return ''
+}
+
+function Invoke-ScpRuntimeConfigTransfer {
+    <#
+      upload-config: put local runtime config.json -> ScpRemoteDirectory/config.json
+      download-config: get remote config.json -> local runtime path (validated JSON).
+      Returns @{ Ok; Detail; LocalPath; RemoteTarget }.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][ValidateSet('Upload', 'Download')][string]$Direction,
+        [string]$TraceLogPath = '',
+        [string]$ScpExe = ''
+    )
+
+    $localPath = Resolve-RuntimeConfigJsonPath -Config $Config
+    if ([string]::IsNullOrWhiteSpace($localPath)) {
+        return @{
+            Ok           = $false
+            Detail       = 'Runtime ConfigPath / AdministratorProfile unresolved'
+            LocalPath    = ''
+            RemoteTarget = ''
+        }
+    }
+
+    $remoteDir = ''
+    try { $remoteDir = ([string]$Config.ScpRemoteDirectory).Trim() } catch { $remoteDir = '' }
+    $scpHost = ''
+    try { $scpHost = ([string]$Config.ScpHost).Trim() } catch { $scpHost = '' }
+    $scpUser = ''
+    try { $scpUser = ([string]$Config.ScpUser).Trim() } catch { $scpUser = '' }
+    if ([string]::IsNullOrWhiteSpace($remoteDir) -or
+        [string]::IsNullOrWhiteSpace($scpHost) -or
+        [string]::IsNullOrWhiteSpace($scpUser)) {
+        return @{
+            Ok           = $false
+            Detail       = 'ScpHost/ScpUser/ScpRemoteDirectory incomplete'
+            LocalPath    = $localPath
+            RemoteTarget = ''
+        }
+    }
+    if (-not $remoteDir.EndsWith('/')) {
+        $remoteDir = $remoteDir + '/'
+    }
+    $remoteTarget = '{0}@{1}:{2}config.json' -f $scpUser, $scpHost, $remoteDir
+
+    $port = 22
+    try {
+        if ($null -ne $Config.ScpPort -and [int]$Config.ScpPort -gt 0) {
+            $port = [int]$Config.ScpPort
+        }
+    }
+    catch { $port = 22 }
+
+    if ([string]::IsNullOrWhiteSpace($ScpExe)) {
+        $ScpExe = Find-ScpExecutable
+    }
+    if ([string]::IsNullOrWhiteSpace($ScpExe)) {
+        return @{
+            Ok           = $false
+            Detail       = 'scp.exe not found'
+            LocalPath    = $localPath
+            RemoteTarget = $remoteTarget
+        }
+    }
+
+    $tempPath = $null
+    $transferLocal = $localPath
+    if ($Direction -eq 'Upload') {
+        if (-not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+            return @{
+                Ok           = $false
+                Detail       = ("local config.json missing: '{0}'" -f $localPath)
+                LocalPath    = $localPath
+                RemoteTarget = $remoteTarget
+            }
+        }
+    }
+    else {
+        $tempPath = Join-Path $env:TEMP (
+            'LoginTimeLogger-config-download-{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $transferLocal = $tempPath
+    }
+
+    $argList = New-Object System.Collections.Generic.List[string]
+    Add-ScpCommonSshOptions -ArgumentList $argList `
+        -IdentityFile ([string]$Config.ScpIdentityFile) `
+        -Port $port `
+        -KnownHostsFile ([string]$Config.ScpKnownHostsFile) `
+        -ConnectTimeoutSeconds 20 `
+        -VerboseSsh
+    if ($Direction -eq 'Upload') {
+        $argList.Add($localPath)
+        $argList.Add($remoteTarget)
+    }
+    else {
+        $argList.Add($remoteTarget)
+        $argList.Add($tempPath)
+    }
+
+    $verb = if ($Direction -eq 'Upload') { 'put' } else { 'get' }
+    if (-not [string]::IsNullOrWhiteSpace($TraceLogPath)) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            "scp config {0}: {1} <-> {2}" -f $verb, $localPath, $remoteTarget)
+    }
+
+    $outFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-config-{0}.out' -f [guid]::NewGuid().ToString('N'))
+    $errFile = Join-Path $env:TEMP ('LoginTimeLogger-scp-config-{0}.err' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $argLine = ConvertTo-ScpArgumentLine -Arguments $argList.ToArray()
+        $run = Invoke-ScpProcessWithTimeout -ScpExe $ScpExe -ArgumentList $argLine `
+            -StdOutPath $outFile -StdErrPath $errFile -TimeoutSeconds 60
+        $stderr = ''
+        if (Test-Path -LiteralPath $errFile) {
+            $stderr = [string](Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        }
+        $failed = [bool]$run.TimedOut -or
+            (Test-ScpCopyFailed -ExitCode $run.ExitCode -StdErr "$stderr" -TimedOut $false)
+
+        if ($failed -and $Direction -eq 'Download' -and (Test-ScpRemotePathMissing -StdErr "$stderr")) {
+            return @{
+                Ok           = $false
+                Detail       = ("remote config.json not present: {0}" -f $remoteTarget)
+                LocalPath    = $localPath
+                RemoteTarget = $remoteTarget
+            }
+        }
+        if ($failed) {
+            $reportedExit = $run.ExitCode
+            if ($run.TimedOut) { $reportedExit = 'timeout' }
+            return @{
+                Ok           = $false
+                Detail       = ("scp config {0} failed (exit {1}): {2}" -f `
+                        $verb, $reportedExit, ("$stderr").Trim())
+                LocalPath    = $localPath
+                RemoteTarget = $remoteTarget
+            }
+        }
+
+        if ($Direction -eq 'Download') {
+            if (-not (Test-Path -LiteralPath $tempPath -PathType Leaf)) {
+                return @{
+                    Ok           = $false
+                    Detail       = 'download produced no local file'
+                    LocalPath    = $localPath
+                    RemoteTarget = $remoteTarget
+                }
+            }
+            $rawText = Get-Content -LiteralPath $tempPath -Raw -Encoding UTF8 -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($rawText)) {
+                return @{
+                    Ok           = $false
+                    Detail       = 'downloaded config.json is empty'
+                    LocalPath    = $localPath
+                    RemoteTarget = $remoteTarget
+                }
+            }
+            try {
+                $null = $rawText | ConvertFrom-Json -ErrorAction Stop
+            }
+            catch {
+                return @{
+                    Ok           = $false
+                    Detail       = ("downloaded config.json is not valid JSON: {0}" -f `
+                            $_.Exception.Message)
+                    LocalPath    = $localPath
+                    RemoteTarget = $remoteTarget
+                }
+            }
+
+            $destDir = Split-Path -Parent $localPath
+            if (-not [string]::IsNullOrWhiteSpace($destDir) -and
+                -not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            }
+            if (Get-Command Write-JsonFilePreserveAcl -ErrorAction SilentlyContinue) {
+                Write-JsonFilePreserveAcl -DestPath $localPath -JsonText $rawText
+            }
+            else {
+                Set-Content -LiteralPath $localPath -Value $rawText -Encoding UTF8
+            }
+            $script:PendingConfigReload = $true
+        }
+
+        return @{
+            Ok           = $true
+            Detail       = ("config.json {0} OK" -f $verb)
+            LocalPath    = $localPath
+            RemoteTarget = $remoteTarget
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($tempPath)) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Invoke-ScpRemoteCommandsFile {
     <#
       Read LogDirectory\commands\commands.txt line by line, interpret/execute
       supported commands (update, restart, reset, break, disable-break,
-      setUnlockQuotaEnabled), write a set -x style transcript, email the
-      transcript, then delete the downloaded file. Returns: WantUpdate /
-      WantRestart / WantBreak / WantDisableForcedBreak /
-      UnlockQuotaEnabledValue / ResetSpecs (terminating actions deferred until
-      after remote empty-PUT and email).
+      setUnlockQuotaEnabled, upload-config, download-config), write a set -x
+      style transcript, email the transcript, then delete the downloaded file.
+      Returns: WantUpdate / WantRestart / WantBreak / WantDisableForcedBreak /
+      UnlockQuotaEnabledValue / ResetSpecs / ConfigTransfers (terminating
+      actions deferred until after remote empty-PUT and email).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -2876,13 +3096,14 @@ function Invoke-ScpRemoteCommandsFile {
     )
 
     $result = [pscustomobject]@{
-        WantUpdate             = $false
-        WantRestart            = $false
-        WantBreak              = $false
-        WantDisableForcedBreak = $false
+        WantUpdate              = $false
+        WantRestart             = $false
+        WantBreak               = $false
+        WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
-        ResetSpecs             = New-Object System.Collections.ArrayList
-        RanAny                 = $false
+        ResetSpecs              = New-Object System.Collections.ArrayList
+        ConfigTransfers         = New-Object System.Collections.ArrayList
+        RanAny                  = $false
     }
 
     if (-not (Test-Path -LiteralPath $InboxFile -PathType Leaf)) {
@@ -3036,6 +3257,26 @@ function Invoke-ScpRemoteCommandsFile {
                         "commands.txt line {0}: verb=setUnlockQuotaEnabled queued ({1})" -f `
                             $lineNo, $(if ($enabled) { 't' } else { 'f' }))
                 }
+            }
+            'upload-config' {
+                if ($args.Count -gt 0) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: upload-config ignores args (expected none)" -f $lineNo)
+                }
+                $result.RanAny = $true
+                [void]$result.ConfigTransfers.Add('Upload')
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: upload-config (local runtime config.json -> remote config.json)')
+            }
+            'download-config' {
+                if ($args.Count -gt 0) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: download-config ignores args (expected none)" -f $lineNo)
+                }
+                $result.RanAny = $true
+                [void]$result.ConfigTransfers.Add('Download')
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: download-config (remote config.json -> local runtime config.json)')
             }
             default {
                 Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
@@ -3455,6 +3696,7 @@ function Invoke-ScpCommandsFileExchange {
         WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
         ResetSpecs              = New-Object System.Collections.ArrayList
+        ConfigTransfers         = New-Object System.Collections.ArrayList
         RanAny                  = $false
     }
     if ($downloaded -and -not $remoteMissing -and $downloadedBytes -gt 0) {
@@ -3640,6 +3882,65 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
+    # upload-config / download-config: transfer runtime config.json (file order).
+    $configTransferSummaries = New-Object System.Collections.ArrayList
+    $configTransfersEnum = @()
+    if ($null -ne $cmdResult.PSObject.Properties['ConfigTransfers'] -and
+        $null -ne $cmdResult.ConfigTransfers) {
+        if ($cmdResult.ConfigTransfers -is [System.Collections.ArrayList] -or
+            $cmdResult.ConfigTransfers -is [System.Array]) {
+            $configTransfersEnum = @($cmdResult.ConfigTransfers)
+        }
+        elseif ($cmdResult.ConfigTransfers.PSObject.Methods['ToArray']) {
+            $configTransfersEnum = @($cmdResult.ConfigTransfers.ToArray())
+        }
+        else {
+            $configTransfersEnum = @($cmdResult.ConfigTransfers)
+        }
+    }
+    foreach ($xferDir in $configTransfersEnum) {
+        if ([string]::IsNullOrWhiteSpace([string]$xferDir)) { continue }
+        $direction = [string]$xferDir
+        try {
+            $xfer = Invoke-ScpRuntimeConfigTransfer `
+                -Config $Config `
+                -Direction $direction `
+                -TraceLogPath $traceLogPath `
+                -ScpExe $ScpExe
+            if ([bool]$xfer.Ok) {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    "execute: {0}-config OK ({1} -> {2})" -f `
+                        $direction.ToLowerInvariant(), $xfer.LocalPath, $xfer.RemoteTarget)
+                [void]$configTransferSummaries.Add(
+                    ("{0}: OK ({1})" -f $direction, $xfer.LocalPath))
+                if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+                    Write-LoggerEvent (
+                        ("commands.txt {0}-config OK: {1}" -f `
+                            $direction.ToLowerInvariant(), $xfer.Detail))
+                }
+            }
+            else {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                    "execute: {0}-config failed: {1}" -f `
+                        $direction.ToLowerInvariant(), $xfer.Detail)
+                [void]$configTransferSummaries.Add(
+                    ("{0}: FAIL ({1})" -f $direction, $xfer.Detail))
+                Invoke-ScpCommandsFatal -Message (
+                    ("{0}-config failed: {1}" -f $direction.ToLowerInvariant(), $xfer.Detail)) `
+                    -Context 'SCP commands config transfer'
+            }
+        }
+        catch {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                "execute: {0}-config threw: {1}" -f `
+                    $direction.ToLowerInvariant(), $_.Exception.Message)
+            [void]$configTransferSummaries.Add(
+                ("{0}: FAIL ({1})" -f $direction, $_.Exception.Message))
+            Invoke-ScpCommandsFatal -Message $_.Exception.Message `
+                -Context ('SCP commands {0}-config' -f $direction.ToLowerInvariant())
+        }
+    }
+
     # Refresh summary lines so the email body matches the queue/skip decision.
     $emailBody = @(
         'LoginTimeLogger remote commands.txt was processed.'
@@ -3671,6 +3972,12 @@ function Invoke-ScpCommandsFileExchange {
             if ($null -eq $setUnlockQuotaValue) { '(none)' }
             elseif ($setUnlockQuotaValue) { 't' }
             else { 'f' }))
+        ('ConfigTransfers: {0}' -f $(
+            if ($configTransferSummaries.Count -gt 0) {
+                ($configTransferSummaries -join '; ')
+            }
+            else { '(none)' }))
+        ('PendingConfigReload: {0}' -f [bool]$script:PendingConfigReload)
         ('ResetCount: {0}' -f $resetCount)
     ) -join [Environment]::NewLine
 
