@@ -27,6 +27,9 @@ $script:DisableForcedBreakDiskSaved = $false
 $script:PendingUnlockQuotaEnabled = $null
 # Remote commands.txt "download-config" — reload runtime config.json on next poll.
 $script:PendingConfigReload = $false
+# Remote commands.txt "hibernate [HH:MM]" — hibernate when cumulative >= threshold.
+# $null = none pending; otherwise [double] seconds of UnlockedSecondsToday required.
+$script:PendingHibernateAfterSeconds = $null
 # Throttle connect-timeout noise (errors.log / email) when the remote is down.
 $script:LastScpConnectFailLogUtc = $null
 $script:LastScpAllowReconcileUtc = $null
@@ -2627,6 +2630,70 @@ function ConvertFrom-RemoteCumulativeTimeText {
     return $null
 }
 
+function ConvertFrom-HibernateThresholdText {
+    <#
+      Parses hibernate threshold HH:MM (hours may exceed 24) into whole seconds.
+      Returns $null when invalid.
+    #>
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+    $trimmed = $Text.Trim()
+    if ($trimmed -match '^(?<h>\d+):(?<m>[0-5]?\d)$') {
+        try {
+            return [double](([int]$Matches['h'] * 3600) + ([int]$Matches['m'] * 60))
+        }
+        catch {
+            return $null
+        }
+    }
+    return $null
+}
+
+function Format-HibernateThresholdHhMm {
+    param([Parameter(Mandatory)][double]$Seconds)
+    $sec = [Math]::Max(0, [Math]::Floor($Seconds))
+    $h = [int][Math]::Floor($sec / 3600)
+    $m = [int](($sec % 3600) / 60)
+    return ('{0:00}:{1:00}' -f $h, $m)
+}
+
+function Get-UnlockedSecondsTodayFromStateFile {
+    <#
+      Best-effort read of UnlockedSecondsToday from LogDirectory\state.json.
+    #>
+    param([Parameter(Mandatory)]$Config)
+
+    try {
+        $logDir = [string]$Config.LogDirectory
+        if ([string]::IsNullOrWhiteSpace($logDir)) {
+            return $null
+        }
+        $statePath = Join-Path $logDir 'state.json'
+        if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+            return $null
+        }
+        $raw = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $secRaw = $null
+        if (Get-Command Get-OptionalPropertyValue -ErrorAction SilentlyContinue) {
+            $secRaw = Get-OptionalPropertyValue -InputObject $raw -Name 'UnlockedSecondsToday'
+        }
+        else {
+            try { $secRaw = $raw.UnlockedSecondsToday } catch { $secRaw = $null }
+        }
+        if ($null -eq $secRaw) {
+            return 0.0
+        }
+        return [double]$secRaw
+    }
+    catch {
+        return $null
+    }
+}
+
 function Format-RemoteCumulativeDuration {
     param([Parameter(Mandatory)][double]$Seconds)
     if (Get-Command Format-Duration -ErrorAction SilentlyContinue) {
@@ -3101,6 +3168,8 @@ function Invoke-ScpRemoteCommandsFile {
         WantUpdate              = $false
         WantRestart             = $false
         WantHibernate           = $false
+        # $null = hibernate immediately; otherwise cumulative UnlockedSecondsToday threshold.
+        HibernateAfterSeconds   = $null
         WantBreak               = $false
         WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
@@ -3175,14 +3244,38 @@ function Invoke-ScpRemoteCommandsFile {
                     'queue execute: restart (deferred until after remote clear + email)')
             }
             'hibernate' {
-                if ($args.Count -gt 0) {
+                $afterSeconds = $null
+                if ($args.Count -gt 1) {
                     Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
-                        "interpret line {0}: hibernate ignores args (expected none)" -f $lineNo)
+                        "interpret line {0}: hibernate ignores extra args after HH:MM" -f $lineNo)
+                }
+                if ($args.Count -ge 1) {
+                    $afterSeconds = ConvertFrom-HibernateThresholdText -Text ([string]$args[0])
+                    if ($null -eq $afterSeconds) {
+                        Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                            "interpret line {0}: hibernate rejected arg '{1}' (expected HH:MM)" -f `
+                                $lineNo, $args[0])
+                        continue
+                    }
+                }
+                if ([bool]$result.WantHibernate) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        ("interpret line {0}: multiple hibernate lines; " +
+                            "overwriting previous queued hibernate") -f $lineNo)
                 }
                 $result.RanAny = $true
                 $result.WantHibernate = $true
-                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
-                    'queue execute: hibernate (deferred until after remote clear + email)')
+                $result.HibernateAfterSeconds = $afterSeconds
+                if ($null -eq $afterSeconds) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                        'queue execute: hibernate now (deferred until after remote clear + email)')
+                }
+                else {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                        ("queue execute: hibernate when cumulative_today >= {0} " +
+                            "(deferred until threshold on poll)") -f `
+                            (Format-HibernateThresholdHhMm -Seconds $afterSeconds))
+                }
             }
             'reset' {
                 $timeArg = ''
@@ -3742,6 +3835,7 @@ function Invoke-ScpCommandsFileExchange {
         WantUpdate              = $false
         WantRestart             = $false
         WantHibernate           = $false
+        HibernateAfterSeconds   = $null
         WantBreak               = $false
         WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
@@ -4007,6 +4101,12 @@ function Invoke-ScpCommandsFileExchange {
                 [bool]$cmdResult.WantHibernate
             }
             else { $false }))
+        ('HibernateAfter: {0}' -f $(
+            if (-not [bool]$cmdResult.WantHibernate) { '(none)' }
+            elseif ($null -eq $cmdResult.HibernateAfterSeconds) { 'immediate' }
+            else {
+                Format-HibernateThresholdHhMm -Seconds ([double]$cmdResult.HibernateAfterSeconds)
+            }))
         ('WantBreak: {0}' -f $(
             if ($null -ne $cmdResult.PSObject.Properties['WantBreak']) {
                 [bool]$cmdResult.WantBreak
@@ -4139,28 +4239,93 @@ function Invoke-ScpCommandsFileExchange {
     }
     catch { $wantHibernate = $false }
 
+    $hibernateAfterSeconds = $null
+    try {
+        if ($null -ne $cmdResult.PSObject.Properties['HibernateAfterSeconds']) {
+            $hibernateAfterSeconds = $cmdResult.HibernateAfterSeconds
+        }
+    }
+    catch { $hibernateAfterSeconds = $null }
+
     if ($wantHibernate) {
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: hibernate'
-        if ($cmdResult.WantRestart) {
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                'execute hibernate: skipping restart (hibernate takes precedence)')
+        $scheduleOnly = $false
+        if ($null -ne $hibernateAfterSeconds) {
+            $threshold = [double]$hibernateAfterSeconds
+            $currentCum = Get-UnlockedSecondsTodayFromStateFile -Config $Config
+            if ($null -eq $currentCum) { $currentCum = 0.0 }
+            if ($currentCum -lt $threshold) {
+                $scheduleOnly = $true
+                $script:PendingHibernateAfterSeconds = $threshold
+                if (Get-Command Save-PendingHibernateAfterToStateFile -ErrorAction SilentlyContinue) {
+                    try {
+                        $null = Save-PendingHibernateAfterToStateFile `
+                            -Config $Config `
+                            -AfterSeconds $threshold
+                        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                            ("execute: hibernate scheduled for cumulative_today >= {0} " +
+                                "(now={1}; persisted to state.json)") -f `
+                                (Format-HibernateThresholdHhMm -Seconds $threshold),
+                            (Format-HibernateThresholdHhMm -Seconds $currentCum))
+                    }
+                    catch {
+                        Write-ScpCommandsTrace -LogPath $traceLogPath -Level WARN -Message (
+                            "execute: hibernate schedule state.json persist failed: {0}" -f `
+                                $_.Exception.Message)
+                    }
+                }
+                else {
+                    Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                        ("execute: hibernate scheduled for cumulative_today >= {0} " +
+                            "(now={1}; in-memory until poll)") -f `
+                            (Format-HibernateThresholdHhMm -Seconds $threshold),
+                        (Format-HibernateThresholdHhMm -Seconds $currentCum))
+                }
+                if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+                    Write-LoggerEvent (
+                        ("commands.txt hibernate: scheduled at cumulative >= {0} (now {1})." -f `
+                            (Format-HibernateThresholdHhMm -Seconds $threshold),
+                        (Format-HibernateThresholdHhMm -Seconds $currentCum)))
+                }
+            }
+            else {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    ("execute: hibernate threshold {0} already met (cumulative={1}); " +
+                        "hibernating now") -f `
+                        (Format-HibernateThresholdHhMm -Seconds $threshold),
+                    (Format-HibernateThresholdHhMm -Seconds $currentCum))
+            }
         }
-        if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
-            Write-LoggerEvent 'commands.txt hibernate: requesting system hibernate (shutdown /h).'
+
+        if (-not $scheduleOnly) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: hibernate'
+            if ($cmdResult.WantRestart) {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    'execute hibernate: skipping restart (hibernate takes precedence)')
+            }
+            $script:PendingHibernateAfterSeconds = $null
+            if (Get-Command Clear-PendingHibernateAfterFromStateFile -ErrorAction SilentlyContinue) {
+                try { $null = Clear-PendingHibernateAfterFromStateFile -Config $Config } catch { }
+            }
+            if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+                Write-LoggerEvent 'commands.txt hibernate: requesting system hibernate (shutdown /h).'
+            }
+            $hib = Invoke-ComputerHibernate
+            if ([bool]$hib.Ok) {
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                    "execute hibernate: OK ({0})" -f $hib.Detail)
+                Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'
+                return
+            }
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+                "execute hibernate: failed: {0}" -f $hib.Detail)
+            Invoke-ScpCommandsFatal -Message ("hibernate failed: {0}" -f $hib.Detail) `
+                -Context 'SCP commands hibernate'
+            # Fall through so a queued restart can still run if hibernate failed.
         }
-        $hib = Invoke-ComputerHibernate
-        if ([bool]$hib.Ok) {
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
-                "execute hibernate: OK ({0})" -f $hib.Detail)
-            # Machine should power down to hibernate; do not continue to restart.
-            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'
-            return
+        else {
+            # Scheduled for later; do not skip a queued restart.
+            $wantHibernate = $false
         }
-        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
-            "execute hibernate: failed: {0}" -f $hib.Detail)
-        Invoke-ScpCommandsFatal -Message ("hibernate failed: {0}" -f $hib.Detail) `
-            -Context 'SCP commands hibernate'
-        # Fall through so a queued restart can still run if hibernate failed.
     }
 
     if ($cmdResult.WantRestart -and -not $wantHibernate) {

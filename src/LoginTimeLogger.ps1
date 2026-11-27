@@ -30,6 +30,8 @@ $script:DisableForcedBreakDiskSaved = $false
 $script:PendingUnlockQuotaEnabled = $null
 # Remote "download-config" — reload runtime config.json on next poll.
 $script:PendingConfigReload = $false
+# Remote "hibernate [HH:MM]" — hibernate when UnlockedSecondsToday >= threshold.
+$script:PendingHibernateAfterSeconds = $null
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -587,7 +589,11 @@ function New-LoggerStateObject {
         # ISO UTC when the current locked period began (null while unlocked).
         [AllowNull()]$CurrentLockStartUtc = $null,
         # Completed lock intervals @{ StartUtc; EndUtc } for rolling locked-time window.
-        [AllowNull()]$LockIntervals = $null
+        [AllowNull()]$LockIntervals = $null,
+        # Remote hibernate HH:MM threshold (UnlockedSecondsToday); $null = none.
+        [AllowNull()]$PendingHibernateAfterSeconds = $null,
+        # True after the 5-minute pre-hibernate warning was shown for this schedule.
+        [bool]$PendingHibernateWarnShown = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($Date)) {
@@ -605,6 +611,16 @@ function New-LoggerStateObject {
         $lockStart = [string]$CurrentLockStartUtc
     }
     $intervals = @(Normalize-LockIntervals -Raw $LockIntervals)
+    $pendingHib = $null
+    if ($null -ne $PendingHibernateAfterSeconds) {
+        try {
+            $ph = [double]$PendingHibernateAfterSeconds
+            if ($ph -ge 0) { $pendingHib = $ph }
+        }
+        catch { $pendingHib = $null }
+    }
+    $hibWarnShown = $false
+    try { $hibWarnShown = [bool]$PendingHibernateWarnShown } catch { $hibWarnShown = $false }
 
     return [pscustomobject]@{
         Date                     = [string]$Date
@@ -621,6 +637,8 @@ function New-LoggerStateObject {
         PendingUnlockQuotaEnabled = $pendingUq
         CurrentLockStartUtc      = $lockStart
         LockIntervals            = $intervals
+        PendingHibernateAfterSeconds = $pendingHib
+        PendingHibernateWarnShown = [bool]$hibWarnShown
     }
 }
 
@@ -642,9 +660,11 @@ function New-LoggerStateFrom {
         InstalledCommitSha          = $State.InstalledCommitSha
         ForcedBreakDisabledDate     = $State.ForcedBreakDisabledDate
         ForcedBreakRemainingSeconds = $State.ForcedBreakRemainingSeconds
-        PendingUnlockQuotaEnabled   = $State.PendingUnlockQuotaEnabled
-        CurrentLockStartUtc         = $State.CurrentLockStartUtc
-        LockIntervals               = $State.LockIntervals
+        PendingUnlockQuotaEnabled    = $State.PendingUnlockQuotaEnabled
+        CurrentLockStartUtc          = $State.CurrentLockStartUtc
+        LockIntervals                = $State.LockIntervals
+        PendingHibernateAfterSeconds = $State.PendingHibernateAfterSeconds
+        PendingHibernateWarnShown    = $State.PendingHibernateWarnShown
     }
     if ($null -ne $Set) {
         foreach ($k in $Set.Keys) {
@@ -766,6 +786,21 @@ function ConvertTo-LoggerStateObject {
     $lockIntervals = Normalize-LockIntervals `
         -Raw (Get-OptionalPropertyValue -InputObject $State -Name 'LockIntervals')
 
+    $pendingHib = $null
+    $pendingHibRaw = Get-OptionalPropertyValue -InputObject $State -Name 'PendingHibernateAfterSeconds'
+    if ($null -ne $pendingHibRaw -and -not [string]::IsNullOrWhiteSpace([string]$pendingHibRaw)) {
+        try {
+            $ph = [double]$pendingHibRaw
+            if ($ph -ge 0) { $pendingHib = $ph }
+        }
+        catch { $pendingHib = $null }
+    }
+    $hibWarnShown = $false
+    $hibWarnRaw = Get-OptionalPropertyValue -InputObject $State -Name 'PendingHibernateWarnShown'
+    if ($null -ne $hibWarnRaw) {
+        try { $hibWarnShown = [bool]$hibWarnRaw } catch { $hibWarnShown = $false }
+    }
+
     return (New-LoggerStateObject `
             -Date $date `
             -UnlockedSecondsToday $seconds `
@@ -777,7 +812,9 @@ function ConvertTo-LoggerStateObject {
             -ForcedBreakRemainingSeconds $breakRemain `
             -PendingUnlockQuotaEnabled $pendingUq `
             -CurrentLockStartUtc $lockStart `
-            -LockIntervals $lockIntervals)
+            -LockIntervals $lockIntervals `
+            -PendingHibernateAfterSeconds $pendingHib `
+            -PendingHibernateWarnShown $hibWarnShown)
 }
 
 function Get-LockedSecondsInWindow {
@@ -1022,11 +1059,17 @@ function Publish-UnlockQuotaWarningForUserLaunch {
       Prefer Public (world-readable), then target LocalAppData, then
       ProgramData\LoginTimeLogger\ui. Exit 0xFFFD0000 in ~200ms is the usual
       symptom when -File points at a path the interactive user cannot read.
+      -DestFileName selects the staged leaf (quota UI or hibernate warning).
     #>
     param(
         [Parameter(Mandatory)][string]$SourceScriptPath,
-        [Parameter(Mandatory)]$Config
+        [Parameter(Mandatory)]$Config,
+        [string]$DestFileName = 'Show-UnlockQuotaWarning.ps1'
     )
+
+    if ([string]::IsNullOrWhiteSpace($DestFileName)) {
+        $DestFileName = 'Show-UnlockQuotaWarning.ps1'
+    }
 
     if (-not (Test-Path -LiteralPath $SourceScriptPath)) {
         return ''
@@ -1078,7 +1121,7 @@ function Publish-UnlockQuotaWarningForUserLaunch {
         if ($seenDirs.ContainsKey($dirKey)) { continue }
         $seenDirs[$dirKey] = $true
 
-        $dest = Join-Path $uiDirFull 'Show-UnlockQuotaWarning.ps1'
+        $dest = Join-Path $uiDirFull $DestFileName
         try {
             if (-not (Test-Path -LiteralPath $uiDirFull)) {
                 New-Item -ItemType Directory -Path $uiDirFull -Force | Out-Null
@@ -1566,6 +1609,250 @@ function Apply-PendingDisableForcedBreak {
         "disable-break applied to live state; ForcedBreakDisabledDate={0}; diskSaved={1}" -f `
             $Today, $diskSaved)
     return $State
+}
+
+function Format-HibernateThresholdHhMmLocal {
+    param([Parameter(Mandatory)][double]$Seconds)
+    if (Get-Command Format-HibernateThresholdHhMm -ErrorAction SilentlyContinue) {
+        return (Format-HibernateThresholdHhMm -Seconds $Seconds)
+    }
+    $sec = [Math]::Max(0, [Math]::Floor($Seconds))
+    $h = [int][Math]::Floor($sec / 3600)
+    $m = [int](($sec % 3600) / 60)
+    return ('{0:00}:{1:00}' -f $h, $m)
+}
+
+function Save-PendingHibernateAfterToStateFile {
+    <#
+      Persist remote hibernate HH:MM threshold into state.json (survives update/restart).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][double]$AfterSeconds
+    )
+
+    $logDir = ''
+    try { $logDir = [string]$Config.LogDirectory } catch { $logDir = '' }
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        throw 'LogDirectory missing; cannot persist hibernate schedule to state.json.'
+    }
+
+    $statePath = Get-StatePath -LogDirectory $logDir
+    $quotaMinutes = 60
+    try {
+        if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
+            $quotaMinutes = [int]$Config.UnlockQuotaMinutes
+        }
+    }
+    catch { $quotaMinutes = 60 }
+
+    $state = New-LoggerStateObject
+    if (Get-Command Read-State -ErrorAction SilentlyContinue) {
+        $state = ConvertTo-LoggerStateObject `
+            -State (Read-State -Path $statePath -UnlockQuotaMinutes $quotaMinutes) `
+            -UnlockQuotaMinutes $quotaMinutes
+    }
+    $state = New-LoggerStateFrom -State $state -Set @{
+        PendingHibernateAfterSeconds = [double]$AfterSeconds
+        PendingHibernateWarnShown    = $false
+    }
+    Write-State -Path $statePath -State $state
+    $script:PendingHibernateAfterSeconds = [double]$AfterSeconds
+    return $true
+}
+
+function Clear-PendingHibernateAfterFromStateFile {
+    param([Parameter(Mandatory)]$Config)
+
+    $logDir = ''
+    try { $logDir = [string]$Config.LogDirectory } catch { $logDir = '' }
+    if ([string]::IsNullOrWhiteSpace($logDir)) {
+        return $false
+    }
+    $statePath = Get-StatePath -LogDirectory $logDir
+    $quotaMinutes = 60
+    try {
+        if ($null -ne $Config.UnlockQuotaMinutes -and [int]$Config.UnlockQuotaMinutes -ge 1) {
+            $quotaMinutes = [int]$Config.UnlockQuotaMinutes
+        }
+    }
+    catch { $quotaMinutes = 60 }
+
+    $state = New-LoggerStateObject
+    if (Get-Command Read-State -ErrorAction SilentlyContinue) {
+        $state = ConvertTo-LoggerStateObject `
+            -State (Read-State -Path $statePath -UnlockQuotaMinutes $quotaMinutes) `
+            -UnlockQuotaMinutes $quotaMinutes
+    }
+    $state = New-LoggerStateFrom -State $state -Set @{
+        PendingHibernateAfterSeconds = $null
+        PendingHibernateWarnShown    = $false
+    }
+    Write-State -Path $statePath -State $state
+    $script:PendingHibernateAfterSeconds = $null
+    return $true
+}
+
+function Invoke-HibernateWarningInUserSession {
+    <#
+      Fire-and-forget topmost OK dialog in the target session (waitTimeoutMs=0).
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$WarningScriptPath,
+        [double]$RemainingSeconds = 300
+    )
+
+    if (-not (Test-Path -LiteralPath $WarningScriptPath)) {
+        Write-LoggerEvent -Level WARN -Message (
+            "hibernate warning script missing: {0}" -f $WarningScriptPath)
+        return $false
+    }
+
+    $launchScript = Publish-UnlockQuotaWarningForUserLaunch `
+        -SourceScriptPath $WarningScriptPath `
+        -Config $Config `
+        -DestFileName 'Show-HibernateWarning.ps1'
+    if ([string]::IsNullOrWhiteSpace($launchScript) -or -not (Test-Path -LiteralPath $launchScript)) {
+        Write-LoggerEvent -Level WARN -Message 'hibernate warning: could not stage user-readable UI script.'
+        return $false
+    }
+
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) {
+        return $false
+    }
+
+    $remainSec = [Math]::Max(0.0, [double]$RemainingSeconds)
+    $uiDebugLog = Join-Path (Split-Path -Parent $launchScript) 'debug-ui-hibernate.log'
+    $arguments = (
+        '-NoProfile -NoLogo -STA -ExecutionPolicy Bypass -File "{0}" -RemainingSeconds {1} -DebugLogPath "{2}"' -f `
+            $launchScript,
+        ([string]([Math]::Round($remainSec, 3))),
+        $uiDebugLog)
+
+    $launchError = ''
+    # waitTimeoutMs=0: do not block the monitor; OK dismisses the dialog independently.
+    $ok = [SessionQuery]::LaunchInUserSession(
+        $Config.TargetUsername, $psExe, $arguments, [ref]$launchError, $true, 0)
+    if (-not $ok) {
+        Write-LoggerEvent -Level WARN -Message (
+            "hibernate warning launch failed: {0}" -f $launchError)
+        return $false
+    }
+    Write-LoggerEvent (
+        ('hibernate: showed warning dialog in user session (remaining {0:N0}s).' -f $remainSec))
+    return $true
+}
+
+function Apply-PendingHibernate {
+    <#
+      For scheduled hibernate HH:MM:
+        - when cumulative reaches threshold-5min, show OK warning once
+        - when cumulative >= threshold, hibernate (shutdown /h) and clear pending
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$DailyLogPath,
+        [string]$WarningScriptPath = ''
+    )
+
+    $threshold = $null
+    if ($null -ne $script:PendingHibernateAfterSeconds) {
+        try { $threshold = [double]$script:PendingHibernateAfterSeconds } catch { $threshold = $null }
+    }
+    if ($null -eq $threshold) {
+        try {
+            if ($null -ne $State.PendingHibernateAfterSeconds) {
+                $threshold = [double]$State.PendingHibernateAfterSeconds
+            }
+        }
+        catch { $threshold = $null }
+    }
+    if ($null -eq $threshold) {
+        return @{ State = $State; Hibernating = $false }
+    }
+
+    $cumulative = 0.0
+    try { $cumulative = [double]$State.UnlockedSecondsToday } catch { $cumulative = 0.0 }
+    $warnShown = $false
+    try { $warnShown = [bool]$State.PendingHibernateWarnShown } catch { $warnShown = $false }
+
+    $warnLeadSeconds = 300.0
+    $warnAt = [Math]::Max(0.0, $threshold - $warnLeadSeconds)
+
+    if ($cumulative -lt $threshold) {
+        if (-not $warnShown -and $cumulative -ge $warnAt) {
+            $warned = $false
+            $remainSec = [Math]::Max(0.0, $threshold - $cumulative)
+            if (-not [string]::IsNullOrWhiteSpace($WarningScriptPath) -and
+                (Get-Command Invoke-HibernateWarningInUserSession -ErrorAction SilentlyContinue)) {
+                try {
+                    $warned = [bool](Invoke-HibernateWarningInUserSession `
+                            -Config $Config `
+                            -WarningScriptPath $WarningScriptPath `
+                            -RemainingSeconds $remainSec)
+                }
+                catch {
+                    $warned = $false
+                    $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'Hibernate' `
+                        -Context 'hibernate warning launch failed'
+                }
+            }
+            # Mark shown even on launch failure to avoid dialog spam every poll.
+            $warnShown = $true
+            $line = ('{0:yyyy-MM-dd HH:mm:ss} | HIBERNATE_WARN | cumulative_today={1} | threshold={2} | launched={3}' -f `
+                    (Get-Date), (Format-Duration $cumulative),
+                (Format-HibernateThresholdHhMmLocal -Seconds $threshold), $warned)
+            try { Write-DailyLogLine -Path $DailyLogPath -Line $line } catch { }
+        }
+
+        $State = New-LoggerStateFrom -State $State -Set @{
+            PendingHibernateAfterSeconds = [double]$threshold
+            PendingHibernateWarnShown    = [bool]$warnShown
+        }
+        $script:PendingHibernateAfterSeconds = [double]$threshold
+        return @{ State = $State; Hibernating = $false }
+    }
+
+    $threshLabel = Format-HibernateThresholdHhMmLocal -Seconds $threshold
+    $cumLabel = Format-HibernateThresholdHhMmLocal -Seconds $cumulative
+    $line = ('{0:yyyy-MM-dd HH:mm:ss} | HIBERNATE | cumulative_today={1} | threshold={2}' -f `
+            (Get-Date), (Format-Duration $cumulative), $threshLabel)
+    try { Write-DailyLogLine -Path $DailyLogPath -Line $line } catch { }
+
+    $State = New-LoggerStateFrom -State $State -Set @{
+        PendingHibernateAfterSeconds = $null
+        PendingHibernateWarnShown    = $false
+    }
+    $script:PendingHibernateAfterSeconds = $null
+    Write-LoggerEvent (
+        ("hibernate: cumulative {0} >= {1}; requesting shutdown /h." -f $cumLabel, $threshLabel))
+
+    if (Get-Command Invoke-ComputerHibernate -ErrorAction SilentlyContinue) {
+        $hib = Invoke-ComputerHibernate
+        if (-not [bool]$hib.Ok) {
+            Write-LoggerEvent -Level ERROR -Message (
+                "hibernate: shutdown /h failed: {0}" -f $hib.Detail)
+            # Re-arm so the next poll can retry (keep warn-shown so no re-dialog).
+            $State = New-LoggerStateFrom -State $State -Set @{
+                PendingHibernateAfterSeconds = [double]$threshold
+                PendingHibernateWarnShown    = $true
+            }
+            $script:PendingHibernateAfterSeconds = [double]$threshold
+            return @{ State = $State; Hibernating = $false }
+        }
+        return @{ State = $State; Hibernating = $true }
+    }
+
+    Write-LoggerEvent -Level ERROR -Message 'hibernate: Invoke-ComputerHibernate not loaded.'
+    $State = New-LoggerStateFrom -State $State -Set @{
+        PendingHibernateAfterSeconds = [double]$threshold
+        PendingHibernateWarnShown    = $true
+    }
+    $script:PendingHibernateAfterSeconds = [double]$threshold
+    return @{ State = $State; Hibernating = $false }
 }
 
 function Save-UnlockQuotaEnabledPendingToStateFile {
@@ -2207,11 +2494,32 @@ try {
                     "Could not pre-stage unlock/break UI from '{0}'." -f $warnSrc)
             }
         }
+        $hibSrc = Join-Path $scriptDir 'Show-HibernateWarning.ps1'
+        if (Test-Path -LiteralPath $hibSrc) {
+            $stagedHib = Publish-UnlockQuotaWarningForUserLaunch `
+                -SourceScriptPath $hibSrc `
+                -Config $config `
+                -DestFileName 'Show-HibernateWarning.ps1'
+            if (-not [string]::IsNullOrWhiteSpace($stagedHib)) {
+                Write-LoggerEvent ("Staged hibernate warning UI for user launch: {0}" -f $stagedHib)
+            }
+        }
     }
     catch {
         Write-LoggerEvent -Level WARN -Message (
             "Unlock/break UI pre-stage skipped: {0}" -f $_.Exception.Message)
     }
+
+    # Replay scheduled hibernate HH:MM from state.json (survives update/restart).
+    try {
+        if ($null -ne $state.PendingHibernateAfterSeconds) {
+            $script:PendingHibernateAfterSeconds = [double]$state.PendingHibernateAfterSeconds
+            Write-LoggerEvent (
+                ("Pending hibernate from state.json: cumulative_today >= {0}." -f `
+                    (Format-HibernateThresholdHhMmLocal -Seconds $script:PendingHibernateAfterSeconds)))
+        }
+    }
+    catch { }
 
     # Replay setUnlockQuotaEnabled pending from state.json (survives update/restart).
     if ($null -ne $state.PendingUnlockQuotaEnabled -and
@@ -2287,12 +2595,16 @@ while ($true) {
             # do not invent a lock->unlock transition at midnight.
             $pendingUqRoll = $null
             try { $pendingUqRoll = $state.PendingUnlockQuotaEnabled } catch { $pendingUqRoll = $null }
+            # Day-scoped: drop scheduled hibernate (threshold is vs today's cumulative).
+            $script:PendingHibernateAfterSeconds = $null
             $state = New-LoggerStateFrom -State $state -Set @{
-                Date                      = $today
-                UnlockedSecondsToday      = 0
-                LastUnlockQuotaBucket     = 0
-                ForcedBreakDisabledDate   = ''
-                PendingUnlockQuotaEnabled = $pendingUqRoll
+                Date                         = $today
+                UnlockedSecondsToday         = 0
+                LastUnlockQuotaBucket        = 0
+                ForcedBreakDisabledDate      = ''
+                PendingUnlockQuotaEnabled    = $pendingUqRoll
+                PendingHibernateAfterSeconds = $null
+                PendingHibernateWarnShown    = $false
             }
         }
 
@@ -2661,6 +2973,40 @@ while ($true) {
             catch {
                 $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpBHistory' -Context (
                     'Unexpected SCP BHistory failure')
+            }
+        }
+
+        # Remote commands.txt "hibernate HH:MM" — when cumulative reaches threshold.
+        $hibThresholdPending = $false
+        try {
+            $hibThresholdPending = ($null -ne $script:PendingHibernateAfterSeconds)
+        }
+        catch { $hibThresholdPending = $false }
+        if (-not $hibThresholdPending) {
+            try {
+                $hibThresholdPending = ($null -ne $state.PendingHibernateAfterSeconds)
+            }
+            catch { $hibThresholdPending = $false }
+        }
+        if ($hibThresholdPending -and (Get-Command Apply-PendingHibernate -ErrorAction SilentlyContinue)) {
+            try {
+                $hibWarnScript = Join-Path $scriptDir 'Show-HibernateWarning.ps1'
+                $hibApplied = Apply-PendingHibernate `
+                    -State $state `
+                    -Config $config `
+                    -DailyLogPath $dailyPath `
+                    -WarningScriptPath $hibWarnScript
+                $state = $hibApplied.State
+                if ([bool]$hibApplied.Hibernating) {
+                    Write-State -Path $statePath -State $state
+                    # Machine should enter hibernate; stop this poll cycle.
+                    $lastPollUtc = $nowUtc
+                    continue
+                }
+            }
+            catch {
+                $null = Write-VerboseError -ErrorRecord $_ -Level Warning -Source 'ScpCommands' -Context (
+                    'Apply-PendingHibernate failed')
             }
         }
 

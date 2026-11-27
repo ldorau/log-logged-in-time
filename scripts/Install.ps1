@@ -555,6 +555,7 @@ function Test-InstallPrerequisites {
         'LockSignalWatcher.ps1'  = (Join-Path $RepoRoot 'src\LockSignalWatcher.ps1')
         'LockSignalLauncher.ps1' = (Join-Path $RepoRoot 'src\LockSignalLauncher.ps1')
         'Show-UnlockQuotaWarning.ps1' = (Join-Path $RepoRoot 'src\Show-UnlockQuotaWarning.ps1')
+        'Show-HibernateWarning.ps1'   = (Join-Path $RepoRoot 'src\Show-HibernateWarning.ps1')
     }
     foreach ($entry in $requiredFiles.GetEnumerator()) {
         $exists = Test-Path -LiteralPath $entry.Value
@@ -1429,6 +1430,10 @@ SystemDrive: $env:SystemDrive
         $unlockQuotaWarnSrc = Join-Path $repoRoot 'src\Show-UnlockQuotaWarning.ps1'
         if (Test-Path -LiteralPath $unlockQuotaWarnSrc) {
             Copy-Item -LiteralPath $unlockQuotaWarnSrc -Destination (Join-Path $installSrc 'Show-UnlockQuotaWarning.ps1') -Force
+        }
+        $hibernateWarnSrc = Join-Path $repoRoot 'src\Show-HibernateWarning.ps1'
+        if (Test-Path -LiteralPath $hibernateWarnSrc) {
+            Copy-Item -LiteralPath $hibernateWarnSrc -Destination (Join-Path $installSrc 'Show-HibernateWarning.ps1') -Force
         }
         $useCommonErrorSrc = Join-Path $repoRoot 'src\Use-CommonError.ps1'
         if (Test-Path -LiteralPath $useCommonErrorSrc) {

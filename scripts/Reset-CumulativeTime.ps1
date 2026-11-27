@@ -316,6 +316,8 @@ try {
     $pendingUnlockQuotaEnabled = $null
     $currentLockStartUtc = $null
     $lockIntervals = @()
+    $pendingHibernateAfterSeconds = $null
+    $pendingHibernateWarnShown = $false
     if (Test-Path -LiteralPath $statePath) {
         try {
             $existing = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -355,6 +357,22 @@ try {
             if ($null -ne $intervalsRaw) {
                 $lockIntervals = @($intervalsRaw)
             }
+            $pendingHibRaw = Get-OptionalPropertyValue -InputObject $existing `
+                -Name 'PendingHibernateAfterSeconds'
+            if ($null -ne $pendingHibRaw -and -not [string]::IsNullOrWhiteSpace([string]$pendingHibRaw)) {
+                try {
+                    $ph = [double]$pendingHibRaw
+                    if ($ph -ge 0) { $pendingHibernateAfterSeconds = $ph }
+                }
+                catch { $pendingHibernateAfterSeconds = $null }
+            }
+            $hibWarnRaw = Get-OptionalPropertyValue -InputObject $existing `
+                -Name 'PendingHibernateWarnShown'
+            if ($null -ne $hibWarnRaw) {
+                try { $pendingHibernateWarnShown = [bool]$hibWarnRaw } catch {
+                    $pendingHibernateWarnShown = $false
+                }
+            }
         }
         catch {
             Write-Host ("WARNING: could not parse existing state.json; treating previous as 0. {0}" -f `
@@ -393,9 +411,11 @@ try {
         InstalledCommitSha          = $(if ($null -eq $installedCommitSha) { '' } else { [string]$installedCommitSha })
         ForcedBreakDisabledDate     = [string]$forcedBreakDisabledDate
         ForcedBreakRemainingSeconds = [double]$forcedBreakRemainingSeconds
-        PendingUnlockQuotaEnabled   = $pendingUnlockQuotaEnabled
-        CurrentLockStartUtc         = $currentLockStartUtc
-        LockIntervals               = @($lockIntervals)
+        PendingUnlockQuotaEnabled    = $pendingUnlockQuotaEnabled
+        CurrentLockStartUtc          = $currentLockStartUtc
+        LockIntervals                = @($lockIntervals)
+        PendingHibernateAfterSeconds = $pendingHibernateAfterSeconds
+        PendingHibernateWarnShown    = [bool]$pendingHibernateWarnShown
     }
 
     Write-StateFileAtomic -Path $statePath -State $newState

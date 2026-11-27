@@ -74,7 +74,12 @@ $commands = @(
     [pscustomobject]@{
         Command     = 'hibernate'
         Arguments   = '(none)'
-        Description = 'Hibernate the local computer (shutdown.exe /h) after the commands exchange finishes (remote clear + email). Requires hibernation to be enabled on the machine. When queued with restart, hibernate takes precedence (restart is skipped unless hibernate fails).'
+        Description = 'Hibernate the local computer immediately (shutdown.exe /h) after the commands exchange finishes (remote clear + email). Requires hibernation to be enabled. When queued with restart, hibernate takes precedence (restart is skipped unless hibernate fails).'
+    }
+    [pscustomobject]@{
+        Command     = 'hibernate'
+        Arguments   = 'HH:MM'
+        Description = 'Schedule hibernate when today''s cumulative unlocked time (UnlockedSecondsToday) reaches HH:MM (hours may exceed 24, e.g. 04:00 or 10:30). Persisted to state.json so it survives update/restart; cleared at day rollover. When within five minutes of unlocked time of the threshold, shows a topmost dialog ("UWAGA: za MM:SS minut:sekund komputer zostanie zahibernowany !!!") with the real remaining unlocked time and OK to dismiss. If cumulative is already >= HH:MM when the command runs, hibernates immediately (no warning). A later hibernate with no argument hibernates now and clears any schedule.'
     }
 )
 
@@ -107,5 +112,6 @@ Write-Host '  setUnlockQuotaEnabled t'
 Write-Host '  upload-config'
 Write-Host '  download-config'
 Write-Host '  hibernate'
+Write-Host '  hibernate 04:00'
 Write-Host '  update'
 Write-Host '  reset 0'
