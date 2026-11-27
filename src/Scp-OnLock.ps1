@@ -3082,12 +3082,14 @@ function Invoke-ScpRuntimeConfigTransfer {
 function Invoke-ScpRemoteCommandsFile {
     <#
       Read LogDirectory\commands\commands.txt line by line, interpret/execute
-      supported commands (update, restart, reset, break, disable-break,
-      setUnlockQuotaEnabled, upload-config, download-config), write a set -x
-      style transcript, email the transcript, then delete the downloaded file.
-      Returns: WantUpdate / WantRestart / WantBreak / WantDisableForcedBreak /
-      UnlockQuotaEnabledValue / ResetSpecs / ConfigTransfers (terminating
-      actions deferred until after remote empty-PUT and email).
+      supported commands (update, restart, hibernate, reset, break,
+      disable-break, setUnlockQuotaEnabled, upload-config, download-config),
+      write a set -x style transcript, email the transcript, then delete the
+      downloaded file.
+      Returns: WantUpdate / WantRestart / WantHibernate / WantBreak /
+      WantDisableForcedBreak / UnlockQuotaEnabledValue / ResetSpecs /
+      ConfigTransfers (terminating actions deferred until after remote
+      empty-PUT and email).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -3098,6 +3100,7 @@ function Invoke-ScpRemoteCommandsFile {
     $result = [pscustomobject]@{
         WantUpdate              = $false
         WantRestart             = $false
+        WantHibernate           = $false
         WantBreak               = $false
         WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
@@ -3170,6 +3173,16 @@ function Invoke-ScpRemoteCommandsFile {
                 $result.WantRestart = $true
                 Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
                     'queue execute: restart (deferred until after remote clear + email)')
+            }
+            'hibernate' {
+                if ($args.Count -gt 0) {
+                    Write-ScpCommandsTrace -LogPath $TraceLogPath -Level WARN -Message (
+                        "interpret line {0}: hibernate ignores args (expected none)" -f $lineNo)
+                }
+                $result.RanAny = $true
+                $result.WantHibernate = $true
+                Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+                    'queue execute: hibernate (deferred until after remote clear + email)')
             }
             'reset' {
                 $timeArg = ''
@@ -3289,8 +3302,44 @@ function Invoke-ScpRemoteCommandsFile {
         Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
             'note: both update and restart queued; update will restart when it applies changes, else restart runs after')
     }
+    if ($result.WantHibernate -and $result.WantRestart) {
+        Write-ScpCommandsTrace -LogPath $TraceLogPath -Message (
+            'note: both hibernate and restart queued; hibernate runs after email (restart skipped)')
+    }
 
     return $result
+}
+
+function Invoke-ComputerHibernate {
+    <#
+      Hibernate this machine via shutdown.exe /h (requires hibernation enabled
+      and SeShutdownPrivilege — available when the monitor runs as SYSTEM).
+      Does not wait for resume (Start-Process without -Wait).
+      Returns @{ Ok; Detail }.
+    #>
+    $shutdownExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+    if (-not (Test-Path -LiteralPath $shutdownExe)) {
+        return @{
+            Ok     = $false
+            Detail = ("shutdown.exe not found: '{0}'" -f $shutdownExe)
+        }
+    }
+
+    try {
+        $p = Start-Process -FilePath $shutdownExe -ArgumentList '/h' `
+            -PassThru -WindowStyle Hidden -ErrorAction Stop
+        return @{
+            Ok     = $true
+            Detail = ("shutdown /h started (pid={0})" -f $(
+                    if ($null -ne $p) { $p.Id } else { '?' }))
+        }
+    }
+    catch {
+        return @{
+            Ok     = $false
+            Detail = ("shutdown /h failed: {0}" -f $_.Exception.Message)
+        }
+    }
 }
 
 function Send-ScpCommandsRunAlert {
@@ -3692,6 +3741,7 @@ function Invoke-ScpCommandsFileExchange {
     $cmdResult = [pscustomobject]@{
         WantUpdate              = $false
         WantRestart             = $false
+        WantHibernate           = $false
         WantBreak               = $false
         WantDisableForcedBreak  = $false
         UnlockQuotaEnabledValue = $null
@@ -3952,6 +4002,11 @@ function Invoke-ScpCommandsFileExchange {
         ('RemoteMissing: {0}' -f $remoteMissing)
         ('WantUpdate: {0}' -f $cmdResult.WantUpdate)
         ('WantRestart: {0}' -f $cmdResult.WantRestart)
+        ('WantHibernate: {0}' -f $(
+            if ($null -ne $cmdResult.PSObject.Properties['WantHibernate']) {
+                [bool]$cmdResult.WantHibernate
+            }
+            else { $false }))
         ('WantBreak: {0}' -f $(
             if ($null -ne $cmdResult.PSObject.Properties['WantBreak']) {
                 [bool]$cmdResult.WantBreak
@@ -4076,7 +4131,39 @@ function Invoke-ScpCommandsFileExchange {
         }
     }
 
-    if ($cmdResult.WantRestart) {
+    $wantHibernate = $false
+    try {
+        if ($null -ne $cmdResult.PSObject.Properties['WantHibernate']) {
+            $wantHibernate = [bool]$cmdResult.WantHibernate
+        }
+    }
+    catch { $wantHibernate = $false }
+
+    if ($wantHibernate) {
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: hibernate'
+        if ($cmdResult.WantRestart) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                'execute hibernate: skipping restart (hibernate takes precedence)')
+        }
+        if (Get-Command Write-LoggerEvent -ErrorAction SilentlyContinue) {
+            Write-LoggerEvent 'commands.txt hibernate: requesting system hibernate (shutdown /h).'
+        }
+        $hib = Invoke-ComputerHibernate
+        if ([bool]$hib.Ok) {
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+                "execute hibernate: OK ({0})" -f $hib.Detail)
+            # Machine should power down to hibernate; do not continue to restart.
+            Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'
+            return
+        }
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Level ERROR -Message (
+            "execute hibernate: failed: {0}" -f $hib.Detail)
+        Invoke-ScpCommandsFatal -Message ("hibernate failed: {0}" -f $hib.Detail) `
+            -Context 'SCP commands hibernate'
+        # Fall through so a queued restart can still run if hibernate failed.
+    }
+
+    if ($cmdResult.WantRestart -and -not $wantHibernate) {
         Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'execute: restart'
         if ([string]::IsNullOrWhiteSpace($ctx.InstallRoot) -or
             [string]::IsNullOrWhiteSpace([string]$Config.ConfigPath)) {
@@ -4099,6 +4186,18 @@ function Invoke-ScpCommandsFileExchange {
         Restart-LoginTimeLoggerProcess `
             -ConfigPath ([string]$Config.ConfigPath) `
             -InstallRoot $ctx.InstallRoot
+    }
+    elseif ($cmdResult.WantRestart -and $wantHibernate) {
+        # Hibernate failed above; still honor restart.
+        Write-ScpCommandsTrace -LogPath $traceLogPath -Message (
+            'execute: restart (after hibernate failure)')
+        if (-not [string]::IsNullOrWhiteSpace($ctx.InstallRoot) -and
+            -not [string]::IsNullOrWhiteSpace([string]$Config.ConfigPath) -and
+            (Get-Command Restart-LoginTimeLoggerProcess -ErrorAction SilentlyContinue)) {
+            Restart-LoginTimeLoggerProcess `
+                -ConfigPath ([string]$Config.ConfigPath) `
+                -InstallRoot $ctx.InstallRoot
+        }
     }
 
     Write-ScpCommandsTrace -LogPath $traceLogPath -Message 'end commands exchange'

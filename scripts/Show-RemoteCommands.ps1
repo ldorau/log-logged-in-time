@@ -71,6 +71,11 @@ $commands = @(
         Arguments   = '(none)'
         Description = 'Download ScpRemoteDirectory/config.json from the SCP host and replace the installed runtime config.json (validated as JSON; ACL preserved when possible). The monitor reloads settings on the next poll (or on restart if update/restart is also queued).'
     }
+    [pscustomobject]@{
+        Command     = 'hibernate'
+        Arguments   = '(none)'
+        Description = 'Hibernate the local computer (shutdown.exe /h) after the commands exchange finishes (remote clear + email). Requires hibernation to be enabled on the machine. When queued with restart, hibernate takes precedence (restart is skipped unless hibernate fails).'
+    }
 )
 
 Write-Host 'Remote commands.txt verbs (one command per line on the remote host)' -ForegroundColor Cyan
@@ -101,5 +106,6 @@ Write-Host '  setUnlockQuotaEnabled f'
 Write-Host '  setUnlockQuotaEnabled t'
 Write-Host '  upload-config'
 Write-Host '  download-config'
+Write-Host '  hibernate'
 Write-Host '  update'
 Write-Host '  reset 0'
