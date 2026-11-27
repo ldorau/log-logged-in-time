@@ -148,7 +148,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Reset-CumulativeTime.ps1 01:30:00     # set to 1h30m
 .\scripts\Reset-CumulativeTime.ps1 +00:15:00    # add 15m
 .\scripts\Reset-CumulativeTime.ps1 '-00:10:00'  # subtract 10m (quote the leading '-')
-.\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + CSVs + state
+.\scripts\Copy-LogsViaScp.ps1 -Force  # manual SCP of all day logs + errors + CSVs + state + config.json
 ```
 
 **Unlocked-time logs** (when the target user was logged in with the screen unlocked):

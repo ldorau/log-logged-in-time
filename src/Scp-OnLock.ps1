@@ -1964,10 +1964,12 @@ function Get-ScpManualSourceFiles {
       Collects a fuller set for manual SCP: every unlocked-time-*.log under
       LogDirectory, all error logs, debug.log, state.json, every *.csv under
       LogDirectory (recursive, including bhist history CSVs and
-      unlocked-time-summary.csv), and any raw History DB copies already under
-      LogDirectory (log-history-* without a .csv extension). Refreshes today's
-      history CSVs via New-BHistoryCsvExports when available. Does not include
-      service.log or stage live BH (callers use New-ScpBHistoryUploadFiles).
+      unlocked-time-summary.csv), any raw History DB copies already under
+      LogDirectory (log-history-* without a .csv extension), and the runtime
+      LoginTimeLogger config.json (ConfigPath / AdministratorProfile).
+      Refreshes today's history CSVs via New-BHistoryCsvExports when available.
+      Does not include service.log or stage live BH (callers use
+      New-ScpBHistoryUploadFiles).
     #>
     param(
         [Parameter(Mandatory)]$Config,
@@ -2044,6 +2046,25 @@ function Get-ScpManualSourceFiles {
     if (Get-Command Get-ErrorLogPath -ErrorAction SilentlyContinue) {
         try { & $addFile (Get-ErrorLogPath) } catch { }
     }
+
+    # Runtime settings used by the monitor on this machine.
+    $configPath = ''
+    try {
+        $configPath = [string](Get-OptionalPropertyValue -InputObject $Config -Name 'ConfigPath')
+    }
+    catch { $configPath = '' }
+    if ([string]::IsNullOrWhiteSpace($configPath)) {
+        $adminHome = ''
+        try {
+            $adminHome = [string](Get-OptionalPropertyValue -InputObject $Config `
+                    -Name 'AdministratorProfile')
+        }
+        catch { $adminHome = '' }
+        if (-not [string]::IsNullOrWhiteSpace($adminHome)) {
+            $configPath = Join-Path $adminHome 'LoginTimeLogger\config.json'
+        }
+    }
+    & $addFile $configPath
 
     return @($files)
 }

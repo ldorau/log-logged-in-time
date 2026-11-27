@@ -8,6 +8,7 @@
     - all error logs (errors.log / *error*.log, plus Get-ErrorLogPath)
     - debug.log (break / unlock-warn traces under LogDirectory)
     - state.json
+    - runtime config.json (AdministratorProfile\LoginTimeLogger\config.json)
     - every *.csv under LogDirectory (recursive), including
       unlocked-time-summary.csv and LogDirectory\bhist\ history CSVs
       (today's history CSVs are refreshed via convert before collect)
@@ -705,15 +706,17 @@ try {
     }
 
     $runtimeCfg = [pscustomobject]@{
-        ScpOnLockEnabled   = $true
-        ScpHost            = $cfg.ScpHost
-        ScpUser            = $cfg.ScpUser
-        ScpRemoteDirectory = $cfg.ScpRemoteDirectory
-        ScpPort            = $cfg.ScpPort
-        ScpIdentityFile    = $cfg.ScpIdentityFile
-        ScpKnownHostsFile  = $cfg.ScpKnownHostsFile
-        LogDirectory       = $cfg.LogDirectory
-        TargetUsername     = $cfg.TargetUsername
+        ScpOnLockEnabled     = $true
+        ScpHost              = $cfg.ScpHost
+        ScpUser              = $cfg.ScpUser
+        ScpRemoteDirectory   = $cfg.ScpRemoteDirectory
+        ScpPort              = $cfg.ScpPort
+        ScpIdentityFile      = $cfg.ScpIdentityFile
+        ScpKnownHostsFile    = $cfg.ScpKnownHostsFile
+        LogDirectory         = $cfg.LogDirectory
+        TargetUsername       = $cfg.TargetUsername
+        AdministratorProfile = $cfg.AdministratorProfile
+        ConfigPath           = $cfg.ConfigPath
     }
 
     Write-ScpCopyLine ''
@@ -741,6 +744,39 @@ try {
         if (-not [string]::IsNullOrWhiteSpace([string]$f)) {
             $fileList.Add([string]$f)
         }
+    }
+    # Ensure runtime config.json is included even if helper omitted it.
+    if (-not [string]::IsNullOrWhiteSpace([string]$cfg.ConfigPath) -and
+        (Test-Path -LiteralPath $cfg.ConfigPath)) {
+        $already = $false
+        try {
+            $cfgFull = [System.IO.Path]::GetFullPath([string]$cfg.ConfigPath)
+            foreach ($existing in $fileList) {
+                try {
+                    if ([System.IO.Path]::GetFullPath([string]$existing).Equals(
+                            $cfgFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $already = $true
+                        break
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { $already = $false }
+        if (-not $already) {
+            $fileList.Add([string]$cfg.ConfigPath)
+        }
+        Write-Check -Name 'Runtime config.json' -Ok $true -Detail $cfg.ConfigPath
+    }
+    else {
+        Write-Check -Name 'Runtime config.json' -Ok $true -Status WARN -Detail $(
+            if ([string]::IsNullOrWhiteSpace([string]$cfg.ConfigPath)) {
+                'ConfigPath empty'
+            }
+            else {
+                "not found: $($cfg.ConfigPath)"
+            }
+        )
     }
     # Always stage raw History DBs (every log-history-op-* + log-history-ch-*).
     # Important: wrap with @() first; do NOT pipe the bare return into
